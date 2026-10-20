@@ -1,0 +1,23 @@
+# Personal settings and logs (created next to the app at runtime)
+saylight_settings.json
+saylight_settings.json.tmp
+saylight_settings.json.bad
+*.log
+*.log.*
+saylight.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+dist/
+*.zip
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
