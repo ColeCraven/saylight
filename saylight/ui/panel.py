@@ -6,10 +6,14 @@ wheel all work while the user's own app keeps the foreground (so Ctrl+C still re
 More opens the flyout (Open a file, Save as audio, Pronunciations, Settings); a right-click on the reading page
 opens it at the pointer. A file dropped on the panel opens it. The card carries the chips that open files,
 continue one, enter a PDF's password or try again; the header info carries short notes for a few seconds.
+
+Read from screen has a transport button between Type and Clear, and chips on the Ready and Nothing-selected
+cards. Finding the text, a long scan's page choice and the OCR notices are drawn from the engine's info.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from ctypes import wintypes
@@ -21,9 +25,9 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 from .. import win32
 from ..engine import span_fraction
 from .controls import (ACTION_PARTS, G_BACK, G_CLEAR, G_COLLAPSE, G_DOCUMENT, G_ERROR, G_EXPAND, G_HIDE, G_LOCK,
-                       G_MORE, G_NEXT, G_NOTHING, G_OFFLINE, G_PAUSE, G_PLAY, G_PREV, G_RETRY, G_TYPE, FadeLabel,
-                       IconButton, Indicator, Part, PlayButton, ProgressBar, SpeedStepper, VolumeSlider,
-                       measure_parts, paint_stop_square, volume_glyph)
+                       G_MORE, G_NEXT, G_NOTHING, G_OFFLINE, G_PAUSE, G_PLAY, G_PREV, G_RETRY, G_SCAN, G_SCREEN,
+                       G_TYPE, FadeLabel, IconButton, Indicator, Part, PlayButton, ProgressBar, SpeedStepper,
+                       VolumeSlider, icon, measure_parts, paint_stop_square, volume_glyph)
 from .flyout import Flyout, MoreButton, menu_items
 from .general_page import GeneralPage, shortcut_parts
 from .motion import MEDIUM, SLOW, Tween, decelerate, exit_curve, with_alpha
@@ -39,7 +43,7 @@ PANEL_FLAGS = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.Windo
 WM_MOUSEACTIVATE, MA_NOACTIVATE = 0x0021, 3
 SYSTEM_CHANGE_MESSAGES = {0x001A, 0x0015, 0x031A, 0x0320}  # SETTINGCHANGE, SYSCOLORCHANGE, THEMECHANGED, DWMCOLOR
 
-COMPACT_W, EXPANDED_W = 440, 640   # base widths: ~36 and ~56 characters per line at the default reading size
+COMPACT_W, EXPANDED_W = 476, 640   # base widths: ~39 and ~56 characters per line at the default reading size
 # Larger text widens the reading page to keep the line length (up to the caps), instead of collapsing it.
 WIDTH_SAMPLE = "reading comprehension in adults with dyslexia "
 COMPACT_CPL, EXPANDED_CPL = 36, 56
@@ -59,19 +63,30 @@ def K(*parts: Part) -> list[Part]:
 
 READY_LINE = K(("text", "Highlight text anywhere, then press "), ("key", "Ctrl"), ("key", "`"))
 READY_ACTIONS = K(("text", "or "), ("action", "type"), ("text", "  "), ("action", "open"))
+SCREEN_LINE = K(("text", "or "), ("action", "screen"))
+READY_ACTIONS_ALL = READY_ACTIONS + K(("text", "  "), ("action", "screen"))  # the larger view has room for all three
 READY_TIP = K(("text", "With nothing highlighted, it shows or hides this panel."))
 CONTINUE_LINE = K(("text", "or "), ("action", "continue"))
-READY_HINT = [READY_LINE, READY_ACTIONS, READY_TIP]
+# The compact card has room for three lines: the three ways in, each in the text colour.
+READY_HINT = [READY_LINE, READY_ACTIONS, SCREEN_LINE]
 READY_MORE = [K(("key", "`"), ("text", " is the key below Esc, left of 1.")),
               K(("text", "Click a sentence to jump to it. Right-click a word to change how it's said.")),
               K(("text", "You can also drop a PDF, Word or text file here."))]
-READY_SETTINGS = K(("text", "Text size and background are in Settings, under "), ("glyph", G_MORE), ("text", "."))
-READY_HINT_EXPANDED = READY_HINT + READY_MORE + [READY_SETTINGS]
-READY_SECONDARY_FROM = 2  # the two lines that say what to do are in the text colour, the notes below them dimmed
+READY_SETTINGS = K(("text", "Text size, background and the reading ruler are in Settings, under "), ("glyph", G_MORE),
+                   ("text", "."))
+READY_HINT_EXPANDED = [READY_LINE, READY_ACTIONS_ALL, READY_TIP] + READY_MORE + [READY_SETTINGS]
+READY_SECONDARY_FROM = 3       # the lines that say what to do are in the text colour, the notes below them dimmed
+READY_SECONDARY_EXPANDED = 2
 CLEARED_HINT = [K(("text", "Text cleared. "), ("action", "undo"))]
 # Chips on the card's message lines, and what follows `can_type` (the rest work whenever they show).
-CARD_ACTIONS = ("type", "open", "continue", "undo", "password", "retry")
+CARD_ACTIONS = ("type", "open", "continue", "undo", "password", "retry", "screen", "screen_retry", "scan_retry",
+                "lang_settings", "scan_first", "scan_all", "scan_choose")
 TYPING_ACTIONS = ("type", "open", "continue")
+# The 1.4 chips take hover and press only from themselves, and the card's outline and the Type chip's hover stay
+# off over them. "screen" works when Type does (never while copying or opening).
+OWN_ACTIONS = ("screen", "screen_retry", "scan_retry", "lang_settings", "scan_first", "scan_all", "scan_choose")
+SCREEN_TIP = "Read text from the screen{keys}. Works on pictures and scans too."
+SCREEN_TIP_ACTIVE = "Read text from the screen{keys}. This reading pauses while you choose."
 OPEN_TIP = "Open a PDF, Word, text or Markdown file. You can also drop one here."
 # The open notices: the indicator's look for each kind (engine.OPEN_LABELS has the labels).
 NOTICE_LOOK = {"password": ("Caution", G_LOCK), "protected": ("Caution", G_LOCK), "scanned": ("Caution", G_NOTHING),
@@ -100,6 +115,81 @@ NOTHING_TEXT = {
     "busy": [K(("text", "The clipboard was busy. Please try again."))],
 }
 NOTHING_TEXT["line_copy"] = NOTHING_TEXT["empty"]
+# What Nothing selected adds for the screen: a third line when the card can't open Type or paste (else the Type
+# line offers both).
+NOTHING_SCREEN = {"empty": K(("text", "Can't highlight it? Try "), ("action", "screen"), ("text", ".")),
+                  "console": K(("text", "or "), ("action", "screen"))}
+NOTHING_SCREEN["line_copy"] = NOTHING_SCREEN["empty"]
+TYPE_SCREEN_LINE = K(("text", "Or "), ("action", "type"), ("text", "  "), ("action", "screen"))
+# The OCR notices: the indicator's look, and the card's lines (all in the text colour).
+OCR_LOOK = {"caution": ("Caution", G_NOTHING), "critical": ("Critical", G_ERROR)}
+SCAN_CARD_MS = 1000     # the scan's progress card replaces "Opening …" after this long
+LOW_DPI_NOTE = "Some words may be wrong in this scan"
+SKIPPED_NOTE = "Scanned pages skipped"
+MOVED_NOTE = "Page moved · highlight hidden"
+SCAN_NOTE_MS = 8000     # the two scan notes show this long
+MOVED_NOTE_MS = 4000
+# A header note gives way only to one of equal or higher rank (the low-resolution warning first).
+NOTE_RANK = {LOW_DPI_NOTE: 3, SKIPPED_NOTE: 2, MOVED_NOTE: 1}
+
+
+def ocr_lines(kind: str, detail: str = "") -> list[list[Part]]:
+    """An OCR notice's card lines: at most three, in the text colour."""
+    language = [K(("text", "Windows needs a language pack to find text.")),
+                K(("text", "Add English (United States) in language settings."))]
+    error = [K(("text", "Something went wrong while finding the text.")), K(("text", "Details are in saylight.log."))]
+    if kind == "screen_nothing":
+        first = ("Saylight found nothing to read in that area." if detail == "nothing_speakable"
+                 else "Saylight found no text in that area.")
+        return [K(("text", first)), K(("text", "Try a larger area, or zoom in first.")), K(("action", "screen_retry"))]
+    if kind == "screen_too_large":
+        return [K(("text", "That area is too large to read at once.")),
+                K(("text", "Select a smaller area, then try again.")), K(("action", "screen_retry"))]
+    if kind in ("screen_language", "scan_language"):
+        retry = "screen_retry" if kind == "screen_language" else "scan_retry"
+        return language + [K(("action", "lang_settings"), ("text", "  "), ("action", retry))]
+    if kind == "scan_nothing":
+        return [K(("text", "Saylight found no text in this scan.")),
+                K(("text", "It may be handwriting, or blank pages."))]
+    return error + [K(("action", "scan_retry" if kind == "scan_error" else "screen_retry"))]
+
+
+def estimate_text(seconds: int) -> str:
+    """How long finding the text in a scan takes: "under a minute", "about 2 min", "about 1 h 5 min"."""
+    if seconds < 60:
+        return "under a minute"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"about {minutes} min"
+    return f"about {minutes // 60} h {minutes % 60} min"
+
+
+def ocr_left_text(seconds: int) -> str:
+    """The OCR phase's time left: "20 s left" (up in tens under a minute), "2 min left", "1 h 5 min left"."""
+    if seconds < 0:
+        return ""
+    if seconds < 60:
+        tens = math.ceil(seconds / 10) * 10
+        return f"{tens} s left" if tens < 60 else "1 min left"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min left"
+    return f"{minutes // 60} h {minutes % 60} min left"
+
+
+def scan_progress_lines(total: int) -> tuple[list[list[Part]], int]:
+    return [K(("text", f"Finding the text in {total:,} scanned page{'s' if total != 1 else ''},")),
+            K(("text", "here on your PC.")),
+            K(("text", f"Reading starts when all {total:,} pages are done." if total != 1
+                       else "Reading starts when the page is done."))], 2
+
+
+def scan_choice_lines(scanned: int, pages: int, est_s: int) -> list[list[Part]]:
+    first = (f"This PDF is a scan of {pages:,} pages." if scanned >= pages
+             else f"{scanned:,} of the {pages:,} pages in this PDF are scans.")
+    return [K(("text", first)), K(("text", f"Finding the text in all of them takes {estimate_text(est_s)}.")),
+            K(("action", "scan_first"), ("text", "  "), ("action", "scan_all"), ("text", "  "),
+              ("action", "scan_choose"))]
 
 
 def notice_lines(kind: str, title: str, ext: str = "", keys: list[Part] | None = None) -> tuple[list[list[Part]], int]:
@@ -230,6 +320,8 @@ class Panel(QWidget):
         self.btn_stop.painter_glyph = paint_stop_square(t)
         self.btn_type = IconButton(t, tips, G_TYPE, size=32, parent=self, tooltip=self._type_tip,
                                    name="Type or paste text")
+        self.btn_screen = IconButton(t, tips, icon(t, G_SCREEN), size=32, parent=self, tooltip=self._screen_tip,
+                                     name="Read from screen")
         self.btn_clear = IconButton(t, tips, G_CLEAR, size=32, parent=self, tooltip=self._clear_tip,
                                     name="Clear text")
         self.stepper = SpeedStepper(t, tips, self)
@@ -247,7 +339,7 @@ class Panel(QWidget):
         self.update_bar.changed.connect(self.relayout)
         self._reading_widgets = [self.indicator, self.status, self.btn_expand, self.btn_more, self.view,
                                  self.progress, self.btn_prev, self.play, self.btn_next, self.btn_stop, self.btn_type,
-                                 self.btn_clear, self.stepper, self.btn_volume]
+                                 self.btn_screen, self.btn_clear, self.stepper, self.btn_volume]
         self.drop_outline = _DropOutline(t, self)
         self.setAcceptDrops(True)
 
@@ -273,6 +365,10 @@ class Panel(QWidget):
         self._page_timer = QTimer(self)
         self._page_timer.setSingleShot(True)
         self._page_timer.timeout.connect(self._show_page_info)
+        self._scan_card = False  # the scan's progress card may show (SCAN_CARD_MS into the OCR phase)
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setSingleShot(True)
+        self._scan_timer.timeout.connect(self._show_scan_card)
         self._view_tip = ""
         # The top-right chip: "start_over", "back", "nudge" or "remembered" (see _sync_corner).
         self._corner_kind: str | None = None
@@ -331,6 +427,7 @@ class Panel(QWidget):
         self.btn_next.clicked.connect(lambda: (self._drop_resume_chips(), e.next()))
         self.btn_stop.clicked.connect(e.stop)
         self.btn_type.clicked.connect(lambda: self.ctl.open_compose("button"))
+        self.btn_screen.clicked.connect(lambda: self.ctl.read_from_screen("button"))
         self.btn_clear.clicked.connect(self.ctl.clear_box)
         self.progress.jumpRequested.connect(lambda i: (self._drop_resume_chips(), e.jump_to(i)))
         self.stepper.stepped.connect(self._step_speed)
@@ -376,6 +473,7 @@ class Panel(QWidget):
 
     def _on_theme(self) -> None:
         win32.dwm_set_dark(self.hwnd, self.theme.dark)
+        self.btn_screen.set_glyph(icon(self.theme, G_SCREEN))
         for w in self.findChildren(QWidget):
             relayout = getattr(w, "relayout", None)
             if relayout:
@@ -471,7 +569,8 @@ class Panel(QWidget):
             self.btn_next.move(px(96), yt + px(2))
             self.btn_stop.move(px(140), yt + px(2))
             self.btn_type.move(px(192), yt + px(4))   # 32 DIP plates on the transport centre line (yt + 20)
-            self.btn_clear.move(px(228), yt + px(4))
+            self.btn_screen.move(px(228), yt + px(4))
+            self.btn_clear.move(px(264), yt + px(4))
             self.btn_volume.move(W - px(EDGE) - px(36), yt + px(2))
             self.stepper.move(self.btn_volume.x() - px(4) - self.stepper.width(), yt + px(4))
             self.slider.move(self.stepper.pos())
@@ -634,16 +733,24 @@ class Panel(QWidget):
             self._page_timer.start(PAGE_INFO_MS)
         elif state != "opening":
             self._page_timer.stop()
+        if info.get("open_phase") != "ocr":
+            self._scan_card = False
+            self._scan_timer.stop()
+        elif not self._scan_card and not self._scan_timer.isActive():
+            self._scan_timer.start(SCAN_CARD_MS)
         if self.page == "settings":
             return
         reduced = self.theme.reduced_motion
         look = NOTICE_LOOK.get(info.get("kind", ""), ("Critical", G_ERROR))
+        ocr_look = OCR_LOOK.get(info.get("severity", ""), ("Critical", G_ERROR))
+        choice = state == "opening" and info.get("open_phase") == "choice"
         ind = {
             "ready": ("idle", "TextSecondary", ""),
             "ready_offline": ("glyph", "TextSecondary", G_OFFLINE),
             "copying": ("wave", "Accent", ""),
-            "opening": ("wave", "Accent", ""),
+            "opening": ("glyph", "TextSecondary", G_SCAN) if choice else ("wave", "Accent", ""),
             "open_failed": ("glyph", look[0], look[1]),
+            "ocr_notice": ("glyph", ocr_look[0], ocr_look[1]),
             "preparing": ("wave", "Accent", ""),
             "waiting": ("wave", "Accent", ""),
             "reading": ("live", "Accent", ""),
@@ -666,13 +773,16 @@ class Panel(QWidget):
         self.play.setEnabled(action != "none")
         retry_tip = ("Try again. If it keeps failing, see saylight.log in the Saylight folder."
                      if state == "error_service" else "Try again")
+        finding = state == "opening" and (info.get("open_kind") == "screen" or info.get("open_phase") == "ocr")
         if state == "opening":
-            self.play.set_tooltip("Opening a file…" if info.get("open_kind") == "file" else "Preparing audio…")
+            self.play.set_tooltip("Finding the text…" if finding else "Choose which pages to read" if choice
+                                  else "Opening a file…" if info.get("open_kind") == "file" else "Preparing audio…")
         else:
             self.play.set_tooltip({"pause": "Pause (Ctrl+` with nothing highlighted)",
                                    "resume": "Resume (Ctrl+` with nothing highlighted)",
                                    "retry": retry_tip}.get(action, "Read the highlighted text (Ctrl+`)"))
-        self.btn_stop.set_tooltip("Stop opening" if state == "opening" else "Stop")
+        self.btn_stop.set_tooltip("Stop finding the text" if finding else "Stop opening" if state == "opening"
+                                  else "Stop")
         self.play.set_buffering(state in ("preparing", "waiting") and info.get("show_ring", True) and not reduced)
 
         prev_action = info.get("prev_action", "none")
@@ -699,19 +809,34 @@ class Panel(QWidget):
             v.show_messages(*self._drop)
         elif self._undo_card:
             v.show_messages(self._cleared_lines())
+        elif state == "opening" and info.get("open_phase") == "choice":
+            scanned, pages = info.get("scan_scanned") or 0, info.get("scan_pages") or 0
+            v.set_action_label("scan_all", f"All {pages:,} pages")
+            lines = scan_choice_lines(scanned, pages, info.get("scan_est") or 0)
+            v.show_messages(lines, secondary_from=len(lines))
+        elif state == "opening" and info.get("open_phase") == "ocr" and self._scan_card:
+            v.show_messages(*scan_progress_lines(info.get("ocr_total") or 0))
+        elif state == "opening" and info.get("open_kind") == "screen" and self.doc is None:
+            v.show_messages(*self._ready_lines())  # the reading under it, or the Ready hint (as for Copying)
         elif state == "opening" and (info.get("open_kind") == "file" or self.doc is None):
             v.show_messages(self._opening_lines(info), secondary_from=1)
         elif state == "open_failed":
             v.show_messages(*self._notice_lines(info))
+        elif state == "ocr_notice":
+            lines = ocr_lines(info.get("notice", ""), info.get("notice_detail", ""))
+            v.show_messages(lines, secondary_from=len(lines))
         elif state in ("ready",) or (state == "copying" and self.doc is None):
             v.show_messages(*self._ready_lines())
         elif state == "ready_offline":
             lines = [K(("text", "No internet connection.")), K(("text", "Reading aloud needs internet."))]
             v.show_messages(lines, secondary_from=len(lines))
         elif state == "nothing_selected":
-            lines = NOTHING_TEXT.get(info.get("reason", "empty"), NOTHING_TEXT["empty"])
+            reason = info.get("reason", "empty")
+            lines = NOTHING_TEXT.get(reason, NOTHING_TEXT["empty"])
             if self._card_can_type():
-                lines = lines + [TYPE_LINE]
+                lines = lines + [TYPE_SCREEN_LINE if reason in NOTHING_SCREEN else TYPE_LINE]
+            elif reason in NOTHING_SCREEN:
+                lines = lines + [NOTHING_SCREEN[reason]]
             v.show_messages(lines, secondary_from=len(lines))
         elif state == "shortcut_unavailable":
             lines = [K(("text", "Another app is using "), ("key", "Ctrl"), ("key", "`"), ("text", ".")),
@@ -760,12 +885,15 @@ class Panel(QWidget):
         point = getattr(self.ctl, "continue_point", lambda: None)()
         v = self.view
         if point is None:
-            return (READY_HINT_EXPANDED if self.expanded else READY_HINT), READY_SECONDARY_FROM
+            if self.expanded:
+                return READY_HINT_EXPANDED, READY_SECONDARY_EXPANDED
+            return READY_HINT, READY_SECONDARY_FROM
         title, page = point
         tail = f" from page {page}" if page else " where you stopped"
         fixed = measure_parts(self.theme, CONTINUE_LINE, role="message", labels={"continue": f"Continue “”{tail}"})
         v.set_action_label("continue", f"Continue “{self._elide(title, fixed)}”{tail}")
-        lines = [READY_LINE, READY_ACTIONS, CONTINUE_LINE]
+        # The compact card's third line continues the file (the Screen button is in the row below).
+        lines = [READY_LINE, READY_ACTIONS_ALL if self.expanded else READY_ACTIONS, CONTINUE_LINE]
         if self.expanded:
             lines += [READY_TIP] + READY_MORE
         return lines, 3
@@ -826,6 +954,14 @@ class Panel(QWidget):
                     f"{info.get('sentence', 0) + 1} / {info.get('total', 0)}" if info.get("total") else "")
             left = self._format_left(self._time_left, minutes=info.get("source") == "file")
             return [("text", " · ".join(x for x in (counter, left) if x))], "TextSecondary"
+        if state == "opening" and info.get("open_phase") == "choice":
+            pages = info.get("scan_pages") or 0
+            return [("text", f"{pages:,} pages" if pages else "")], "TextSecondary"
+        if state == "opening" and info.get("open_phase") == "ocr":
+            page, total = info.get("ocr_page") or 0, info.get("ocr_total") or 0
+            left = ocr_left_text(info.get("ocr_left", -1))
+            counter = f"Page {page:,} of {total:,}" if total else ""
+            return [("text", " · ".join(x for x in (counter, left) if x))], "TextSecondary"
         if state == "opening":
             done, total = info.get("open_done") or 0, info.get("open_total") or 0
             if total and done >= total:
@@ -854,7 +990,7 @@ class Panel(QWidget):
         elif note is not None and self.info.content_width([("text", note["text"])]) <= self._info_room():
             if note["shown"] is None:
                 note["shown"] = time.monotonic()
-                self._note_timer.start(NOTE_MS)
+                self._note_timer.start(note.get("ms", NOTE_MS))
             self.info.set_text(note["text"], note["color"])
         else:
             parts, color = self._info_parts()
@@ -867,11 +1003,16 @@ class Panel(QWidget):
         right_edge = (self.btn_hide.x() if self.page == "settings" else self.btn_expand.x()) - px(8)
         return right_edge - (self.status.x() + status_w + px(12))
 
-    def show_note(self, text: str, color: str = "TextSecondary") -> None:
-        """A note in the header info for 6 s: "Audio saved", "Continuing from page 14". It waits up to 3 s for
-        room (while "Preparing audio…" leaves too little), then it is dropped."""
-        self._note = {"text": text, "color": color, "shown": None}
-        self._note_timer.start(NOTE_WAIT_MS)
+    def show_note(self, text: str, color: str = "TextSecondary", *, ms: int = NOTE_MS,
+                  wait_ms: int = NOTE_WAIT_MS) -> None:
+        """A note in the header info for `ms` (6 s): "Audio saved", "Continuing from page 14". It waits up to
+        `wait_ms` (3 s) for room (while "Preparing audio…" leaves too little), then it is dropped. A note never
+        replaces one of a higher NOTE_RANK that is still waiting or showing."""
+        current = self._note
+        if current is not None and NOTE_RANK.get(current["text"], 0) > NOTE_RANK.get(text, 0):
+            return
+        self._note = {"text": text, "color": color, "shown": None, "ms": ms}
+        self._note_timer.start(wait_ms)
         self._present_info()
 
     def _end_note(self) -> None:
@@ -881,6 +1022,11 @@ class Panel(QWidget):
     def _show_page_info(self) -> None:
         self._page_info = True
         self._present_info()
+
+    def _show_scan_card(self) -> None:
+        if self.state == "opening" and self.info_dict.get("open_phase") == "ocr":
+            self._scan_card = True
+            self._present_card()
 
     def relayout_header(self) -> None:
         t = self.theme
@@ -908,10 +1054,16 @@ class Panel(QWidget):
     # --- Type or paste, Clear and the empty card ------------------------------------------------
 
     def _box_state(self) -> str:
-        """The state Type and Clear follow: under the Nothing-selected overlay, the one beneath it."""
-        if self.state == "nothing_selected":
+        """The state Type, Screen and Clear follow: under the Nothing-selected overlay or an OCR notice, the one
+        beneath it."""
+        if self.state in ("nothing_selected", "ocr_notice"):
             return self.info_dict.get("underlying") or "ready"
         return self.state
+
+    def _screen_tip(self) -> str:
+        chord = getattr(self.ctl, "screen_shortcut", lambda: "")()
+        keys = f" ({chord})" if chord else ""
+        return (SCREEN_TIP_ACTIVE if self._box_state() in SESSION else SCREEN_TIP).format(keys=keys)
 
     def _can_clear(self) -> bool:
         """Clear works on the box's text, or on typed text alone; never while copying."""
@@ -939,8 +1091,10 @@ class Panel(QWidget):
     def refresh_box_actions(self) -> None:
         """Re-evaluate Type and Clear (also when the typed text changes)."""
         self.btn_type.setEnabled(bool(self.info_dict.get("can_type")))
+        self.btn_screen.setEnabled(self.state not in ("copying", "opening"))
         self.btn_clear.setEnabled(self._can_clear())
         self.btn_type.set_tooltip(self._type_tip)  # also refreshes the accessible description
+        self.btn_screen.set_tooltip(self._screen_tip)
         self.btn_clear.set_tooltip(self._clear_tip)
 
     def set_cleared(self, on: bool, title: str = "") -> None:
@@ -981,14 +1135,14 @@ class Panel(QWidget):
         """What a click at `pos` on the clickable card is for: an action chip, or "card" for the rest of it. After
         a Clear, and on a notice, only the chips count, so a near miss never opens the box."""
         hit = self.view.action_at(pos)
-        if hit in TYPING_ACTIONS and not self.info_dict.get("can_type"):
+        if hit in TYPING_ACTIONS + ("screen",) and not self.info_dict.get("can_type"):
             hit = None
         return hit or "card" if self._typing_card() else hit
 
     def _set_card_pointer(self, where: str | None) -> None:
         """Where the pointer is on the clickable card: None (not on a target), "card", or the action chip under it."""
         was, self._card_pointer = self._card_pointer, where
-        self.view.set_card_hover(where is not None and self._typing_card())
+        self.view.set_card_hover(where is not None and where not in OWN_ACTIONS and self._typing_card())
         if where in ACTION_PARTS:
             self.view.setCursor(Qt.CursorShape.PointingHandCursor)
         elif not self._typing_card():
@@ -1012,7 +1166,8 @@ class Panel(QWidget):
                 hover, pressed = where in ("card", "type"), press in ("card", "type")
             else:
                 hover, pressed = where == key, press == key
-            self.view.set_action_state(key, hover, pressed, can_type if key in TYPING_ACTIONS else True)
+            self.view.set_action_state(key, hover, pressed,
+                                       can_type if key in TYPING_ACTIONS or key == "screen" else True)
 
     def _card_action(self, key: str) -> None:
         """A click on the card: right here in the click, since Windows lets a window take the foreground only
@@ -1030,6 +1185,17 @@ class Panel(QWidget):
             ctl.open_password("card")
         elif key == "retry":
             ctl.retry_open()
+        elif key in ("screen", "screen_retry"):
+            ctl.read_from_screen("retry" if key == "screen_retry" else "card")
+        elif key == "scan_retry":
+            ctl.retry_scan()
+        elif key == "lang_settings":
+            ctl.open_language_settings()
+        elif key in ("scan_first", "scan_all"):
+            pages = int(self.info_dict.get("scan_pages") or 0)
+            ctl.continue_scan(1, min(50, pages) if key == "scan_first" else pages)
+        elif key == "scan_choose":
+            ctl.open_page_range()
 
     # --- Show / hide motion -------------------------------------------------------------------
 
@@ -1309,11 +1475,20 @@ class Panel(QWidget):
             if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
                 self._release(event.globalPosition().toPoint())
                 return True
+            if et == QEvent.Type.Enter:
+                self._hold_card(True)
             if et == QEvent.Type.Leave:
                 self.view.track_pointer(None)
                 self._set_card_pointer(None)
                 self._set_view_tip("")
+                self._hold_card(False)
         return super().eventFilter(obj, event)
+
+    def _hold_card(self, on: bool) -> None:
+        """Nothing selected and the caution notices wait while the pointer is over the card."""
+        hold = getattr(self.ctl.engine, "hold_overlay", None)
+        if hold is not None:
+            hold(on)
 
     def _set_view_tip(self, tip: str) -> None:
         """The tooltip for dimmed text, a word read differently or a chip under the pointer."""
@@ -1620,6 +1795,7 @@ class Panel(QWidget):
 
     def hideEvent(self, event) -> None:
         self._slider_timer.stop()
+        self._hold_card(False)
         self.tabs.set_active(False)
         self.close_flyout(now=True)
         super().hideEvent(event)

@@ -18,6 +18,7 @@ from .base import EDGE, VoiceInfo, make_voice_id
 log = logging.getLogger("saylight.voices.catalog")
 
 ONLINE_DETAIL = "Natural · online"
+WINDOWS_DETAIL = "Windows voice · offline"
 LOCALES = ("en-US", "en-GB", "en-AU", "en-CA", "en-IE", "en-IN", "en-NZ", "en-ZA")
 LOCALE_NAMES = {
     "en-US": "English (United States)", "en-GB": "English (United Kingdom)", "en-AU": "English (Australia)",
@@ -123,10 +124,10 @@ class VoiceCatalog(QObject):
         return self._status
 
     def voices(self, *, all_languages: bool = False) -> list[VoiceInfo]:
-        """Local voices first (from other backends), then the online voices: the built-in English list,
-        or every language once refresh_online() has loaded them."""
+        """The online voices (the built-in English list, or every language once refresh_online() has loaded
+        them), then the voices on this PC from other backends, such as Windows' own voices."""
         online = self._online if all_languages and self._online is not None else list(CURATED)
-        return [*self._local(), *online]
+        return [*online, *self._local()]
 
     def find(self, voice_id: str) -> VoiceInfo | None:
         """The listed voice with this ID, if any."""

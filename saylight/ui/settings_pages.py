@@ -11,7 +11,7 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
-from .controls import FadeLabel, Segmented, SwatchRow
+from .controls import FadeLabel, Segmented, SwatchRow, ToggleRow
 from .motion import MEDIUM, Tween, decelerate, with_alpha
 
 EDGE = 12        # the plate inset
@@ -34,6 +34,18 @@ HIGHLIGHTS = (("word", "Word", 13, "Highlight the sentence and the word being re
               ("sentence", "Sentence", 13, "Highlight only the sentence being read"),
               ("off", "Off", 13, "No highlight"))
 TINT_SHORT = {"auto": "Automatic", "cream": "Cream", "peach": "Peach", "blue": "Soft blue", "dark": "Soft dark"}
+# On your screen: the marks over a reading from the screen, and the reading ruler.
+SCREEN_CAPTION = "On your screen · drawn over your other apps"
+SCREEN_MARKS_TIP = ("When Saylight reads from the screen, also mark the sentence and word on the screen itself. "
+                    "Uses the Highlight style above.")
+SCREEN_MARKS_OFF_TIP = "Turn on Highlight to use this."
+RULERS = (("off", "Off", 13, "No reading ruler (default)"), ("small", "Small", 13, "A clear band about one line tall"),
+          ("medium", "Medium", 13, "A clear band about three lines tall"),
+          ("large", "Large", 13, "A clear band about five lines tall"))
+DIMS = (("light", "Light", 13, "Dim the rest of the screen a little"),
+        ("medium", "Medium", 13, "Dim the rest of the screen (default)"),
+        ("strong", "Strong", 13, "Dim the rest of the screen strongly"))
+DIM_HC_TIP = "High contrast shows the ruler as two lines, without dimming."
 
 
 class SettingsPage:
@@ -77,8 +89,9 @@ class DisplayPage(SettingsPage):
     """Reading display: text size, font, spacing, highlight and background. (What's read aloud is on Voice.)"""
 
     title = "Reading display"
-    tooltip = "Text size, font, spacing, highlight and background"
-    KEYS = ("text_size", "reading_font", "spacing", "highlight", "reading_tint")
+    tooltip = "Text size, font, spacing, highlight, background and the reading ruler"
+    KEYS = ("text_size", "reading_font", "spacing", "highlight", "reading_tint", "screen.highlight", "ruler.enabled",
+            "ruler.height", "ruler.dim", "hotkeys.ruler")
 
     def __init__(self, host: QWidget, ctl) -> None:
         super().__init__(host, ctl)
@@ -100,13 +113,47 @@ class DisplayPage(SettingsPage):
         for key, _lbl, seg, opts in self.option_rows:
             seg.selected.connect(lambda i, key=key, opts=opts: s.set(key, opts[i][0]))
         self.swatches.selected.connect(lambda key: s.set("reading_tint", key))
-        s.changed.connect(lambda key: self.sync() if key in self.KEYS else None)
+        # On your screen
+        self.lbl_screen = FadeLabel(t, "small", "TextSecondary", host)
+        self.lbl_screen.set_text(SCREEN_CAPTION, animate=False)
+        self.row_marks = ToggleRow(t, tips, "Highlight on screen", host, tooltip=self._marks_tip)
+        self.row_marks.toggled.connect(lambda on: s.set("screen.highlight", on))
+        self.lbl_ruler = self.label("Ruler")
+        self.seg_ruler = Segmented(t, tips, [opt[1:] for opt in RULERS], host, name="Ruler")
+        self.seg_ruler.set_tooltip(self._ruler_tip)
+        self.seg_ruler.selected.connect(self._set_ruler)
+        self.lbl_dim = self.label("Dim")
+        self.seg_dim = segmented(DIMS, "Dim")
+        self.seg_dim.set_tooltip(lambda: DIM_HC_TIP if not self.seg_dim.isEnabled() else self.seg_dim._tip())
+        self.seg_dim.selected.connect(lambda i: s.set("ruler.dim", DIMS[i][0]))
+        s.changed.connect(lambda key: self.sync() if key in self.KEYS or key == "hotkeys" else None)
 
     def widgets(self) -> list[QWidget]:
         out: list[QWidget] = []
         for _key, lbl, seg, _opts in self.option_rows:
             out += [lbl, seg]
-        return out + [self.lbl_bg, self.swatches, self.lbl_bg_name]
+        return out + [self.lbl_bg, self.swatches, self.lbl_bg_name, self.lbl_screen, self.row_marks, self.lbl_ruler,
+                      self.seg_ruler, self.lbl_dim, self.seg_dim]
+
+    def _marks_tip(self) -> str:
+        return SCREEN_MARKS_TIP if self.row_marks.isEnabled() else SCREEN_MARKS_OFF_TIP
+
+    def _ruler_tip(self) -> str:
+        i = self.seg_ruler._hover_i
+        if i is None:
+            return ""
+        chord = getattr(self.ctl, "ruler_shortcut", lambda: "")() if i == 0 else ""
+        return RULERS[i][3] + (f" ({chord})" if chord else "")
+
+    def _set_ruler(self, i: int) -> None:
+        s = self.settings
+        if i > 0:
+            s.set("ruler.height", RULERS[i][0])
+        s.set("ruler.enabled", i > 0)
+
+    def _band_only(self) -> bool:
+        ruler = getattr(self.ctl, "ruler", None)
+        return bool(getattr(ruler, "band_only", False))
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
         px = self.theme.px
@@ -123,6 +170,23 @@ class DisplayPage(SettingsPage):
         name_x = self.swatches.x() + sw_w + px(8)
         self.lbl_bg_name.setGeometry(name_x, y + px(12), x + right - name_x, px(16))
         y += px(PITCH)
+        # On your screen: a hairline, the caption, then the rows
+        self.rules = [y + px(4)]
+        y += px(9)
+        self.lbl_screen.setGeometry(x + px(OPTICAL), y, w - 2 * px(OPTICAL), px(20))
+        y += px(22)
+        self.row_marks.setGeometry(x + px(EDGE), y, w - 2 * px(EDGE), px(40))
+        y += px(PITCH)
+        rows = [(self.lbl_ruler, self.seg_ruler)]
+        if self._band_only():  # band-only mode draws two lines and never dims
+            self.lbl_dim.hide()
+            self.seg_dim.hide()
+        else:
+            rows.append((self.lbl_dim, self.seg_dim))
+        for lbl, seg in rows:
+            lbl.setGeometry(x + px(OPTICAL), y + px(10), col - px(OPTICAL), px(20))
+            seg.setGeometry(x + col, y + px(3), right - col, px(34))
+            y += px(PITCH)
         return y - px(2) + px(EDGE) - top
 
     def sync(self) -> None:
@@ -133,6 +197,16 @@ class DisplayPage(SettingsPage):
             seg.set_index(keys.index(value) if value in keys else 0)
         self.swatches.set_items(self.ctl.tint_items(), s.get("reading_tint"))
         self.lbl_bg_name.set_text(TINT_SHORT.get(s.get("reading_tint"), ""))
+        highlight_on = s.get("highlight") != "off"
+        self.row_marks.setEnabled(highlight_on)
+        self.row_marks.set_checked(bool(s.get("screen.highlight")) and highlight_on)
+        self.row_marks.set_tooltip(self._marks_tip)
+        heights = [o[0] for o in RULERS]
+        height = s.get("ruler.height")
+        self.seg_ruler.set_index(heights.index(height) if s.get("ruler.enabled") and height in heights else 0)
+        dims = [o[0] for o in DIMS]
+        self.seg_dim.set_index(dims.index(s.get("ruler.dim")) if s.get("ruler.dim") in dims else 1)
+        self.seg_dim.setEnabled(not self.theme.high_contrast)
 
 
 class TabBar(Segmented):

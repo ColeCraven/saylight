@@ -31,6 +31,8 @@ READING_TINTS = ("auto", "cream", "peach", "blue", "dark")  # keep in step with 
 READING_FONTS = ("verdana", "segoe", "calibri", "sitka")
 SPACINGS = ("standard", "wide", "extra")
 HIGHLIGHTS = ("word", "sentence", "off")
+RULER_HEIGHTS = ("small", "medium", "large")  # keep in step with theme.RULER_BAND (tested)
+RULER_DIMS = ("light", "medium", "strong")    # keep in step with theme.RULER_DIM (tested)
 SNAP_X = ("left", "center", "right")
 SNAP_Y = ("top", "bottom")
 RESUME_OFFERS = 3  # "Remember this page next time" is offered at most this many times, ever
@@ -181,6 +183,8 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "hotkeys.toggle_panel": ("", _hotkey),
     "hotkeys.pause_resume": ("", _hotkey),
     "hotkeys.compose": ("", _hotkey),
+    "hotkeys.read_screen": ("Ctrl+Alt+`", _hotkey),
+    "hotkeys.ruler": ("", _hotkey),
     "first_hide_tip_shown": (False, _bool),
     "skip_citations": (True, _bool),
     "skip_urls": (True, _bool),
@@ -195,6 +199,10 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "reading_font": ("verdana", _choice(*READING_FONTS)),
     "spacing": ("wide", _choice(*SPACINGS)),
     "highlight": ("word", _choice(*HIGHLIGHTS)),
+    "screen.highlight": (True, _bool),
+    "ruler.enabled": (False, _bool),
+    "ruler.height": ("medium", _choice(*RULER_HEIGHTS)),
+    "ruler.dim": ("medium", _choice(*RULER_DIMS)),
     "updates.check": (True, _bool),
     "updates.last_check": (0.0, _timestamp),
     "updates.etag": ("", _str),

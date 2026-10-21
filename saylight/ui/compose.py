@@ -80,7 +80,7 @@ NOTES = {  # kind: (text, beep)
 }
 
 # Why the box closed, and what that closing does (the App acts on these).
-FOCUS_REASONS = frozenset({"read", "esc", "back", "hotkey", "screen"})                # hand focus back
+FOCUS_REASONS = frozenset({"read", "esc", "back", "hotkey", "screen", "screen_read"})  # hand focus back
 RESUME_REASONS = frozenset({"esc", "back", "away", "tray", "hotkey", "screen"})      # resume a pause it caused
 # Input pop-ups that come to the front while you type (clipboard history, emoji panel, IME candidates) and must
 # not close the box. Shell windows are already ignored.

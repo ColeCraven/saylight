@@ -2,6 +2,7 @@
 
 Highlight text anywhere and press Ctrl+` to hear it in Ava's voice, with a control panel.
 Press Ctrl+` with nothing highlighted to show or hide the panel (or to pause and resume while reading).
+Press Ctrl+Alt+` (or the panel's Read from screen button) to read an area of the screen with Windows OCR.
 
     pythonw saylight_app.py              run in the background
     python saylight_app.py --install     start automatically at sign-in and start now
@@ -381,27 +382,38 @@ def show_start_failure(path: str) -> None:
 # --- The app controller ----------------------------------------------------------------------------
 
 def _build_app_class():
+    import dataclasses
+
     from PySide6.QtCore import QObject, QRect, QStandardPaths, Qt, QTimer, Signal
     from PySide6.QtGui import QColor, QGuiApplication
 
     from saylight import win32
+    from saylight.documents import pdf_ocr
     from saylight.documents.loader import SUPPORTED, DocumentLoader
-    from saylight.engine import ACTIVE, COPYING, OPENING, Engine
+    from saylight.documents.model import DocSource
+    from saylight.engine import ACTIVE, COPYING, OCR_LABELS, OPENING, Engine
     from saylight.export import FAIL_DETAILS, AudioExporter, remaining_label
     from saylight.foreground import ForegroundTracker
-    from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, InputThread
+    from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, HK_READ_SCREEN, HK_RULER, InputThread
+    from saylight.ocr import layout
+    from saylight.ocr.engine import OcrWorker
+    from saylight.ocr.model import OcrText
     from saylight.player import PlayerThread
     from saylight.pronunciations import PronunciationStore, base_spoken
     from saylight.resume import ResumeStore, same_path
+    from saylight.screen_reader import ScreenReader, notice_for
     from saylight.settings import Settings
     from saylight.single_instance import OpenServer
     from saylight.text_model import BuildOptions, Document
     from saylight.theme import READING_PRESETS, TINT_NAMES, Theme
     from saylight.ui.compose import FOCUS_REASONS, ComposeWindow, reading_prefill, should_resume
-    from saylight.ui.controls import G_DONE, G_ERROR, G_NOTHING
+    from saylight.ui.controls import G_DONE, G_ERROR, G_NOTHING, G_SCAN
     from saylight.ui.hud import Hud
     from saylight.ui.motion import Clock
-    from saylight.ui.panel import NOTICE_LOOK, Panel
+    from saylight.ui.panel import (LOW_DPI_NOTE, MOVED_NOTE, MOVED_NOTE_MS, NOTICE_LOOK, SCAN_NOTE_MS, SKIPPED_NOTE,
+                                   Panel)
+    from saylight.ui.reading_ruler import ReadingRuler
+    from saylight.ui.screen_highlight import ScreenHighlight
     from saylight.ui.sheet import DialogHost
     from saylight.ui.tip import TipManager
     from saylight.ui.tray import Tray, speed_label
@@ -412,6 +424,11 @@ def _build_app_class():
     from saylight.voices.preview import VoicePreview
 
     SHEET_FOCUS_REASONS = FOCUS_REASONS | {"saved"}   # closes that hand the foreground back
+    LANGUAGE_SETTINGS = "ms-settings:regionlanguage"
+    UNCOVER_LATE_MS = 150      # where the overlay can't be left out of a capture, the grab comes 40 ms after it
+    LOW_DPI_WAIT_MS = 60_000   # the low-resolution note waits this long for Reading or Paused to leave it room
+    # The HUD's detail for each caution OCR notice; the critical ones point at the panel.
+    OCR_HUD_DETAIL = {"screen_nothing": "Try a larger area", "screen_too_large": "Select a smaller area"}
     KEPT_MS = 10 * 60 * 1000   # "Show saved audio in folder" and a failed save's Try again stay this long
     OPEN_FILTERS = ["Files Saylight can read (*.pdf *.docx *.txt *.md *.markdown)", "All files (*.*)"]
     SECTION_KEYS = {"notes": "read_asides", "refs": "read_references"}
@@ -431,6 +448,12 @@ def _build_app_class():
 
     class App(QObject):
         """The controller every view talks to (`ctl`).
+
+        Reading from the screen: read_from_screen() pauses, covers the panel and opens the selection overlay
+        (ScreenReader); the result is read like any other text, with the words marked on the screen
+        (ScreenHighlight). Scanned PDFs: the loader's OCR progress and page choice go to the engine, and
+        continue_scan() and open_page_range() answer the choice. The reading ruler (ReadingRuler) holds still over
+        own_rects().
 
         For the settings pages: `version`, `router` (the engine's synth), `catalog` (the voice list), `preview`
         (voice samples), `updates` (the update check) and `pronunciations` (the list), plus set_voice(),
@@ -458,6 +481,25 @@ def _build_app_class():
             self.pronunciations = PronunciationStore(paths.pronunciations_path(), self)
             self.resume = ResumeStore(paths.resume_path())
             self.loader = DocumentLoader(self)
+            # Reading from the screen and the ruler. Nothing captured is ever saved: the picture stays in memory
+            # and the text only as long as the reading.
+            self.ocr = OcrWorker(self)
+            self.highlight = ScreenHighlight(self.theme, self.settings, self)
+            self.highlight.set_own_rects(self.own_rects)
+            self.screen_reader = ScreenReader(self.theme, self.settings, self.ocr, input_thread=self.input,
+                                              build=self.build_document, highlight=self.highlight, parent=self)
+            self.ruler = ReadingRuler(self.theme, self.settings, self.own_rects, self)
+            self._page_window = None         # the Choose pages window, made on first use
+            self._screen_token: int | None = None   # the engine's opening while the text is found
+            self._screen_paused = None       # the reading read_from_screen paused (resumed if the overlay cancels)
+            self._screen_covered = False     # read_from_screen covered the panel
+            self._capture_excluded = True    # the overlay is left out of captures (Windows 10 2004 and later)
+            self._mapped_doc = None          # the screen reading whose word boxes match its sentences
+            self._marks_source = None        # the ScreenText the on-screen marks show
+            self._marks_live = False
+            self._moved_noted = None         # the reading "Page moved" was said for (once per reading)
+            self._scan: dict | None = None   # the scanned PDF waiting for its pages: token, pages, scanned
+            self._hotkey_ok: dict[int, bool] = {}  # what Windows said about the optional shortcuts
             self._overrides: dict[str, bool] = {}  # this file's section chips, in memory only
             self._override_raw = None             # ...for this file's LoadedDocument
             self.engine = Engine(synth=self.router, player=self.player, input_thread=self.input,
@@ -490,6 +532,7 @@ def _build_app_class():
             self._info: dict = {}
             self._suppressed = False
             self._override = False
+            self._fullscreen_settle = False  # skip the next full-screen check: the overlay has just closed
             self._hud_preparing = False
             self._network = None
             self._compose_hotkey = False  # hotkeys.compose is registered
@@ -544,7 +587,19 @@ def _build_app_class():
             self.loader.progress.connect(self._on_open_progress)
             self.loader.built.connect(self._on_built)
             self.loader.failed.connect(self._on_open_failed)
+            self.loader.scanProgress.connect(self._on_scan_progress)
+            self.loader.scanChoice.connect(self._on_scan_choice)
             e.openingCancelled.connect(self.loader.cancel)
+            e.openingCancelled.connect(self._on_opening_cancelled)
+            # Reading from the screen
+            sr = self.screen_reader
+            sr.stateChanged.connect(self._on_screen_state)
+            sr.textReady.connect(self._on_screen_text)
+            sr.failed.connect(self._on_screen_failed)
+            e.position.connect(lambda s, lo, hi, *_: self.highlight.set_word(s, lo, hi))
+            self.highlight.pageMoved.connect(self._on_page_moved)
+            self.highlight.shown.connect(self._raise_own)
+            self.ruler.shown.connect(self._on_ruler_shown)
             e.resumeApplied.connect(self._on_resumed)
             self.server.openRequested.connect(lambda path: self.open_path(path, "open with"))
             self.server.openRejected.connect(self._on_open_rejected)
@@ -566,6 +621,7 @@ def _build_app_class():
 
         def start(self) -> None:
             self.engine.start()
+            self.ocr.start()  # so the OCR languages are known by the time the shortcut is pressed
             self.input.start()
             self.foreground.start()
             self._start_network_monitor()
@@ -600,12 +656,17 @@ def _build_app_class():
             log.info("Shutting down")
             self.close_compose("quit")  # hides it at once; typed text and the undo stash go with the process
             self.close_sheets("quit")
+            self._screen_paused = None  # quitting mid-selection never resumes the reading it paused
+            self.screen_reader.cancel("app")
+            self.highlight.forget()
+            self.ruler.shutdown()
             self._fullscreen_timer.stop()
             self.server.close()
             self.exporter.shutdown()    # an unfinished save is cancelled and its .part file deleted
             self.preview.shutdown()
             self.engine.shutdown()      # saves a file's place first, when Pick up where you left off is on
             self.loader.shutdown()
+            self.ocr.shutdown()
             self.input.stop(3.0)
             self.foreground.stop()
             self.settings.flush()
@@ -670,6 +731,14 @@ def _build_app_class():
         def _check_fullscreen(self) -> None:
             if self.compose.isVisible() or self._sheet_open():
                 return
+            # Windows counts the selection overlay (topmost, the size of the screen) as a full-screen app, until
+            # a moment after it closes: keep the panel as it was, and skip one check after.
+            if self.screen_reader.selecting():
+                self._fullscreen_settle = True
+                return
+            if self._fullscreen_settle:
+                self._fullscreen_settle = False
+                return
             busy = win32.query_user_notification_state() in SUPPRESS_STATES
             if busy and not self._override and self.panel_visible():
                 self._suppressed = True
@@ -686,7 +755,13 @@ def _build_app_class():
             self._state, self._info = state, info
             self.panel.present(state, info)
             self.tray.set_state(state, info)
-            if state == "opening" and info.get("open_kind") == "file" and self._hud_allowed():
+            self._sync_marks(state, info)
+            finding = state == "opening" and (info.get("open_kind") == "screen" or info.get("open_phase") == "ocr")
+            if state == "opening" and info.get("open_phase") == "choice":
+                pass  # the scan_choice notice flashes the HUD once
+            elif finding and self._hud_allowed():
+                self._flash_finding(info)
+            elif state == "opening" and info.get("open_kind") == "file" and self._hud_allowed():
                 self._flash_opening(info)
             elif state in ("preparing", "copying", "opening") and self._hud_allowed():
                 self._flash_preparing()
@@ -704,10 +779,31 @@ def _build_app_class():
             detail = f"page {max(1, done)} of {total}" if total and done < total else ""
             self.hud.flash(self._hud_anchor(), "wave", "Accent", "Opening…", detail, seconds=0)
 
+        def _flash_finding(self, info: dict) -> None:
+            """Finding the text, kept up and updated in place: a scan's page count as its detail."""
+            self._hud_preparing = True
+            page, total = info.get("ocr_page") or 0, info.get("ocr_total") or 0
+            detail = f"Page {page:,} of {total:,}" if total else ""
+            self.hud.flash(self._hud_anchor(), "wave", "Accent", "Finding the text…", detail, seconds=0)
+
         def _on_notice(self, kind: str) -> None:
             if not self._hud_allowed():
                 return
             info = self._info
+            if kind == "ocr_notice":
+                self._hud_preparing = False
+                notice = info.get("notice", "")
+                caution = info.get("severity") == "caution"
+                self.hud.flash(self._hud_anchor(), "glyph", "Caution" if caution else "Critical",
+                               OCR_LABELS.get(notice, info.get("label", "")),
+                               OCR_HUD_DETAIL.get(notice, "") if caution else "Open the panel for help",
+                               glyph=G_NOTHING if caution else G_ERROR, seconds=2.5 if caution else 5.0)
+                return
+            if kind == "scan_choice":
+                self._hud_preparing = False
+                self.hud.flash(self._hud_anchor(), "glyph", "TextSecondary", "Scanned PDF",
+                               "Open the panel to choose pages", glyph=G_SCAN, seconds=5.0)
+                return
             counter = f"{info.get('sentence', 0) + 1} of {info.get('total', 0)}" if info.get("total") else ""
             if kind == "open_failed":  # the notice's label with its glyph; it waits on the panel
                 self._hud_preparing = False
@@ -736,6 +832,7 @@ def _build_app_class():
 
         def _hud_allowed(self) -> bool:
             return (not self.panel_visible() and not self.compose.isVisible() and not self._sheet_open()
+                    and not self.screen_reader.selecting()  # never over the overlay, where a drag would read it
                     and bool(self.settings.get("hud_when_hidden"))
                     and win32.query_user_notification_state() not in SUPPRESS_STATES)
 
@@ -860,10 +957,33 @@ def _build_app_class():
         def _on_session(self, doc) -> None:
             if doc is not None:  # a new reading (or the cleared one coming back) ends the undo window
                 self._end_undo()
+            self._remap_screen(doc)
             self._forget_prefill()  # a purge, or a newer reading replacing the one the box was filled from
             if self.engine.raw is not self._override_raw:  # a section chip is for its own file only
                 self._overrides, self._override_raw = {}, None
             self._refresh_continue()  # the file that closed may be the one to offer next
+
+        def _remap_screen(self, doc) -> None:
+            """A reading from the screen built again (a pronunciation or skip setting changed): its sentences may
+            have moved, so its words are placed on the screen again."""
+            if self._moved_noted is not doc:
+                self._moved_noted = None
+            if doc is not self._mapped_doc:
+                self._mapped_doc = None  # set again below for a reading from the screen
+            if doc is None:
+                self._screen_paused = None  # the engine has let the reading go (Clear, the purge): so do we
+            source = getattr(doc, "source", None)
+            raw = self.engine.raw
+            if (doc is None or doc is self._mapped_doc or getattr(source, "kind", "") != "screen"
+                    or getattr(source, "screen", None) is None or not isinstance(raw, OcrText)):
+                return
+            self._mapped_doc = doc
+            try:
+                boxes = layout.map_boxes(doc, raw)
+            except Exception as e:
+                log.warning("Screen: couldn't place the words again (%s)", type(e).__name__)
+                boxes = {}
+            doc.source = DocSource("screen", screen=dataclasses.replace(source.screen, boxes=boxes))
 
         def _forget_prefill(self) -> None:
             """The hidden box holds a reading's text no longer than the engine does (the privacy purge reaches it
@@ -886,8 +1006,13 @@ def _build_app_class():
                 self.compose.read_from_shortcut()
 
         def _on_app_hotkey(self, hk_id: int) -> None:
-            """The Type or paste shortcut, and the panel shortcut while the box is open (which closes it)."""
-            if hk_id == HK_COMPOSE:
+            """The Type or paste shortcut, Read from screen and the ruler's shortcuts, and the panel shortcut while
+            the box is open (which closes it)."""
+            if hk_id == HK_READ_SCREEN:
+                self.read_from_screen("hotkey")
+            elif hk_id == HK_RULER:
+                self.toggle_ruler()
+            elif hk_id == HK_COMPOSE:
                 if self.composing():
                     self.close_compose("hotkey")
                 else:
@@ -919,7 +1044,8 @@ def _build_app_class():
         # --- Sheets: Pronunciations, Save as audio, the PDF password ------------------------------
 
         def _sheets(self) -> list:
-            return [s for s in (self._pron_sheet, self._save_sheet, self._password_sheet) if s is not None]
+            return [s for s in (self._pron_sheet, self._save_sheet, self._password_sheet, self._page_window)
+                    if s is not None]
 
         def _sheet_open(self) -> bool:
             return any(s.is_open for s in self._sheets())
@@ -1030,6 +1156,8 @@ def _build_app_class():
 
         def build_document(self, raw):
             options = self.build_options(raw)
+            if isinstance(raw, OcrText):  # a reading from the screen: its text, built as typed text is
+                raw = raw.text
             if isinstance(raw, str):
                 return Document.from_raw(raw, skip_citations=options.skip_citations, skip_urls=options.skip_urls,
                                          pronunciations=options.pronunciations)
@@ -1077,6 +1205,63 @@ def _build_app_class():
                 self.close_sheet(self._password_sheet, "read")  # the password worked
             self.engine.opening_progress(token, done, total)
 
+        def _on_scan_progress(self, token: int, done: int, total: int) -> None:
+            if self._pending is not None and token == self._pending["token"]:
+                self.close_sheet(self._password_sheet, "read")
+            self.engine.opening_progress(token, done, total, phase="ocr")
+
+        def _on_scan_choice(self, token: int, scanned: int, pages: int) -> None:
+            """A long scan: the card asks which pages to read, and nothing runs until the person chooses."""
+            if self._pending is None or token != self._pending["token"]:
+                return
+            self.close_sheet(self._password_sheet, "read")
+            self._scan = {"token": token, "pages": pages, "scanned": scanned}
+            self.engine.opening_choice(token, scanned, pages, pdf_ocr.estimate_s(scanned))
+
+        def continue_scan(self, first: int, last: int) -> None:
+            """Read pages first..last of the scanned PDF waiting in the card (1-based, inclusive)."""
+            scan = self._scan
+            if scan is None or self.engine.state != OPENING:
+                return
+            first, last = sorted((max(1, int(first)), min(scan["pages"], int(last))))
+            token = scan["token"]
+            n = self.loader.scanned_in(token, first, last)
+            self.close_sheet(self._page_window, "read")
+            log.info("Scan: pages %d-%d chosen", first, last)
+            self.loader.continue_scan(token, first, last)
+            self.engine.opening_progress(token, 0, n, phase="ocr")
+
+        def retry_scan(self) -> None:
+            """[Try again] on a scan notice: open the same file again (its path is in memory only)."""
+            if self._last_open:
+                self.open_path(self._last_open, "retry")
+
+        def _pages(self):
+            if self._page_window is None:
+                from saylight.ui.page_range import PageRangeWindow
+                w = self._page_window = PageRangeWindow(self)
+                w.rangeChosen.connect(self.continue_scan)
+                w.closeRequested.connect(lambda reason: self.close_sheet(w, reason))
+            return self._page_window
+
+        def open_page_range(self) -> None:
+            """[Choose pages…]: the small window for a page range, from the chip's click."""
+            scan = self._scan
+            if scan is None or self.engine.state != OPENING:
+                return
+            w = self._pages()
+            token = scan["token"]
+            w.prepare(scan["pages"], lambda a, b: self.loader.scanned_in(token, a, b))
+            self._open_sheet(w, "card")
+
+        def _on_opening_cancelled(self, token: int) -> None:
+            if token == self._screen_token:  # Stop while finding the text: the frame goes at once, and the
+                self._screen_token = self._screen_paused = None  # reading under it stays as it was
+                self.screen_reader.cancel("stop")
+            if self._scan is not None and token == self._scan["token"]:
+                self._scan = None
+                self.close_sheet(self._page_window, "switch")
+
         def _on_built(self, token: int, doc, raw) -> None:
             pending = self._pending if self._pending is not None and token == self._pending["token"] else None
             if pending is not None:
@@ -1086,13 +1271,22 @@ def _build_app_class():
                 log.info("Open: %s, %s%s characters, %s ms", pending["ext"][1:],
                          f"{pages:,} page{'s' if pages != 1 else ''}, " if pages else "", f"{len(doc.text):,}",
                          f"{round((time.perf_counter() - pending['t0']) * 1000):,}")
+            if self._scan is not None and token == self._scan["token"]:
+                self._scan = None
+                self.close_sheet(self._page_window, "read")
             if not self.engine.read_document(doc, raw, token=token) or pending is None:
                 return
-            scanned = len(getattr(raw, "scanned_pages", None) or ())
-            if scanned:
-                self.panel.show_note(f"{scanned} scanned page{'s' if scanned != 1 else ''} skipped")
+            dpi = int(getattr(raw, "scan_dpi", 0) or 0)
+            if 0 < dpi < pdf_ocr.LOW_DPI:  # the only warning, in the first moments of the reading
+                log.info("Scan: low resolution (about %d dpi)", dpi)
+                self.panel.show_note(LOW_DPI_NOTE, "Caution", ms=SCAN_NOTE_MS, wait_ms=LOW_DPI_WAIT_MS)
+            elif getattr(raw, "scanned_pages", None):
+                self.panel.show_note(SKIPPED_NOTE, "Caution", ms=SCAN_NOTE_MS)
 
         def _on_open_failed(self, token: int, kind: str) -> None:
+            if self._scan is not None and token == self._scan["token"]:
+                self._scan = None
+                self.close_sheet(self._page_window, "switch")
             pending = self._pending if self._pending is not None and token == self._pending["token"] else None
             if pending is not None:
                 self._pending = None
@@ -1156,6 +1350,174 @@ def _build_app_class():
         def _file_chosen(self, path: str, source: str) -> None:
             self._open_folder = os.path.dirname(path)
             self.open_path(path, source)
+
+        # --- Reading from the screen ---------------------------------------------------------------------
+
+        def read_from_screen(self, source: str) -> None:
+            """Choose an area of the screen and read it: from the shortcut ("hotkey"), the button, a card chip
+            ("card", "retry") or the tray. Call it right in the click or hotkey handler."""
+            sr = self.screen_reader
+            if sr.selecting():  # the shortcut again cancels; nothing else does anything
+                if source == "hotkey":
+                    sr.cancel("hotkey")
+                return
+            if self.engine.state in (COPYING, OPENING) or sr.busy():
+                log.info("Screen: refused while %s", "finding the text" if sr.busy() else "opening")
+                return
+            if not sr.language_ready(refresh=source == "retry"):  # Try again asks Windows afresh
+                log.info("Screen: no OCR language")
+                self.engine.ocr_notice("screen_language")
+                return
+            handed = self.compose.session.paused_doc if self.composing() else None
+            self.close_compose("screen_read")  # hands its pause over instead of resuming
+            self.close_sheets("screen_read")
+            p = self.panel
+            p.close_flyout()
+            self._screen_paused = self.engine.document if self.engine.pause() else handed
+            self.tips.press(p)
+            p.set_volume_open(False, animate=False)
+            self._hud_preparing = False
+            self.hud.dismiss()
+            self.hud.hide()  # at once: nothing of Saylight's shows while you choose
+            self.highlight.hide(animate=False)
+            self._marks_live = False
+            self.ruler.suppress("overlay", True)
+            self._screen_covered = self.panel_visible()
+            if self._screen_covered:
+                p.set_covered(True)  # opacity 0: text under it can be chosen, and it is never captured
+            if source == "tray":  # after the menu has given the foreground back
+                QTimer.singleShot(0, lambda: self._begin_selection(source))
+            else:
+                self._begin_selection(source)
+
+        def _begin_selection(self, source: str) -> None:
+            self.screen_reader.begin(return_to=self._return_to())
+            if self.screen_reader.selecting():
+                log.info("Screen: overlay opened (%s)", source)
+
+        def _end_cover(self) -> None:
+            """The overlay has closed: the panel and the ruler come back as they were."""
+            if self._screen_covered and not self.composing() and not self._sheet_open():
+                self.panel.set_covered(False)
+            self._screen_covered = False
+            self._fullscreen_settle = True
+            self.tray.set_selecting(False)
+            self.ruler.suppress("overlay", False)
+
+        def _on_screen_state(self, state: str) -> None:
+            if state == "selecting":
+                self.tray.set_selecting(True)
+                self._capture_excluded = self.screen_reader.overlay.capture_excluded()  # asked while it's open
+            elif state == "recognizing":  # captured: the panel shows Finding the text after 150 ms
+                if self._capture_excluded:
+                    self._end_cover()
+                else:  # older Windows captures a moment later: the panel stays invisible until then
+                    QTimer.singleShot(UNCOVER_LATE_MS, self._end_cover)
+                self._screen_token = self.engine.begin_opening("", "screen")
+            else:
+                self.tray.set_selecting(False)
+
+        def _on_screen_text(self, doc, text) -> None:
+            token, self._screen_token = self._screen_token, None
+            self._mapped_doc = doc
+            self._screen_paused = None  # the overlay has done its job
+            if self.panel.page == "settings":
+                self.panel.set_page("reading")
+            if token is None:
+                token = self.engine.begin_opening("", "screen")
+            self.engine.read_document(doc, text, token=token)
+
+        def _on_screen_failed(self, kind: str) -> None:
+            token, self._screen_token = self._screen_token, None
+            self._end_cover()
+            if kind == "cancelled":
+                if token is not None:  # stopped while finding the text: the state before comes back as it was
+                    self.engine.opening_failed(token, "cancelled")
+                    return
+                paused, self._screen_paused = self._screen_paused, None
+                if paused is not None and paused is self.engine.document and self.engine.state == "paused":
+                    self.engine.resume()  # leaving the overlay resumes the reading it paused
+                self._sync_marks(self._state, self._info)  # its marks come back, even if nothing changed
+                return
+            self._screen_paused = None
+            notice = notice_for(kind)
+            if notice is not None:  # it never starts audio by itself
+                self.engine.ocr_notice(notice, "nothing_speakable" if kind == "nothing_speakable" else "")
+
+        def open_language_settings(self) -> None:
+            """[Open language settings]: Windows' Language & region page, where an OCR language is added."""
+            try:
+                os.startfile(LANGUAGE_SETTINGS)
+            except OSError as e:
+                log.warning("Couldn't open the language settings (%s)", type(e).__name__)
+
+        # --- The on-screen marks and the ruler ------------------------------------------------------
+
+        def _sync_marks(self, state: str, info: dict) -> None:
+            """Show the words of a reading from the screen where they are, while it reads, waits or is paused."""
+            if self.screen_reader.selecting():
+                return  # nothing of Saylight's shows while you choose (a cancel syncs them again)
+            source = getattr(self.engine.document, "source", None)
+            screen = getattr(source, "screen", None) if getattr(source, "kind", "") == "screen" else None
+            if screen is None:
+                if self._marks_source is not None:
+                    self.highlight.forget()  # a new reading, or Clear: nothing about the old area stays
+                    self._marks_source, self._marks_live = None, False
+                return
+            base = info.get("underlying") or state if state in ("nothing_selected", "open_failed",
+                                                                 "ocr_notice") else state
+            if base in ("reading", "waiting", "paused"):
+                if screen is not self._marks_source or not self._marks_live:
+                    self._marks_source, self._marks_live = screen, True
+                    self.highlight.show_for(screen)
+                self.highlight.set_paused(base == "paused")
+            elif base not in ("preparing", "opening") and self._marks_live:  # stopped, finished, an error
+                self._marks_live = False
+                self.highlight.hide()
+
+        def _on_page_moved(self, hidden: bool) -> None:
+            doc = self.engine.document
+            if hidden and doc is not None and self._moved_noted is not doc:
+                self._moved_noted = doc
+                self.panel.show_note(MOVED_NOTE, ms=MOVED_NOTE_MS)
+
+        def toggle_ruler(self, on: bool | None = None) -> None:
+            """The reading ruler on or off (the tray and its shortcut); it keeps its height."""
+            self.ruler.set_enabled(not self.ruler.enabled if on is None else bool(on))
+
+        def _on_ruler_shown(self) -> None:
+            """The ruler goes under everything of Saylight's: the marks first, then the windows."""
+            mark = self.highlight.window_id() if self.highlight.is_visible() else 0
+            if mark:
+                win32.set_topmost(mark)
+            self._raise_own()
+
+        def _own_windows(self) -> list:
+            # bottom to top: the panel, what opens over it, then the HUD and the tooltip
+            windows = [self.panel, getattr(self.panel, "flyout", None), self.compose, *self._sheets(), self.hud,
+                       getattr(self.tips, "window", None)]
+            return [w for w in windows if w is not None]
+
+        def _raise_own(self) -> None:
+            """Put Saylight's visible windows back on top of the marks and the ruler."""
+            for w in self._own_windows():
+                try:
+                    if w.isVisible():
+                        win32.set_topmost(int(w.winId()))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+
+        def own_rects(self) -> list[QRect]:
+            """The visible Saylight windows, in global logical px: the ruler holds still over them, and the
+            on-screen marks' page check ignores what they cover."""
+            rects = []
+            for w in self._own_windows():
+                try:
+                    if w.isVisible() and w.windowOpacity() > 0:
+                        rects.append(QRect(w.frameGeometry()))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            return rects
 
         def toggle_section(self, name: str) -> None:
             """A section chip: read (or skip again) this file's notes or reference list. For this file only."""
@@ -1406,13 +1768,37 @@ def _build_app_class():
         def _hotkey_map(self) -> dict[int, str]:
             h = self.settings.get("hotkeys") or {}
             return {HK_READ: h.get("read", "Ctrl+`"), HK_PANEL: h.get("toggle_panel", ""),
-                    HK_PAUSE: h.get("pause_resume", ""), HK_COMPOSE: h.get("compose", "")}
+                    HK_PAUSE: h.get("pause_resume", ""), HK_COMPOSE: h.get("compose", ""),
+                    HK_READ_SCREEN: h.get("read_screen", ""), HK_RULER: h.get("ruler", "")}
 
         def compose_shortcut(self) -> str:
             """The Type or paste shortcut while it is registered, else ""."""
             return (self.settings.get("hotkeys") or {}).get("compose", "") if self._compose_hotkey else ""
 
+        def _shortcut(self, hk_id: int, key: str) -> str:
+            chord = (self.settings.get("hotkeys") or {}).get(key, "")
+            return chord if chord and self._hotkey_ok.get(hk_id) else ""
+
+        def screen_shortcut(self) -> str:
+            """The Read from screen shortcut while it is registered, else ""."""
+            return self._shortcut(HK_READ_SCREEN, "read_screen")
+
+        def ruler_shortcut(self) -> str:
+            """The reading ruler's shortcut while it is registered, else ""."""
+            return self._shortcut(HK_RULER, "ruler")
+
+        def shortcut_failed(self, key: str) -> bool:
+            """An optional shortcut ("read_screen" or "ruler") is set, but Windows wouldn't register it."""
+            hk_id = {"read_screen": HK_READ_SCREEN, "ruler": HK_RULER}.get(key)
+            return hk_id is not None and self._hotkey_ok.get(hk_id) is False
+
         def _on_registered(self, hk_id: int, ok: bool) -> None:
+            if hk_id in (HK_READ_SCREEN, HK_RULER):
+                self._hotkey_ok[hk_id] = bool(ok)
+                if not ok:
+                    log.info("%s shortcut unavailable", "Read from screen" if hk_id == HK_READ_SCREEN else "Ruler")
+                self.panel.refresh_box_actions()  # the Screen tooltip names the shortcut
+                self.panel.tabs.sync()
             if hk_id == HK_COMPOSE:
                 self._compose_hotkey = ok
                 self.panel.refresh_box_actions()  # the Type tooltip names the shortcut
@@ -1420,6 +1806,7 @@ def _build_app_class():
         def _on_setting(self, key: str) -> None:
             if key.startswith("hotkeys"):
                 self._compose_hotkey = False  # an unset shortcut is never reported back
+                self._hotkey_ok.clear()
                 self.panel.refresh_box_actions()
                 self.input.set_hotkeys(self._hotkey_map())
             elif key == "reading_tint":
@@ -1454,7 +1841,7 @@ def _build_app_class():
         def _busy(self) -> bool:
             """A reading is running (paused included), a selection is being copied, a file opened, or audio
             saved: no update check now."""
-            return self.engine.state in ACTIVE or self.exporter.busy
+            return self.engine.state in ACTIVE or self.exporter.busy or self.screen_reader.busy()
 
         def notices_path(self) -> str:
             """THIRD_PARTY_NOTICES.txt next to Saylight.exe (from source: the repository's notices)."""

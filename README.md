@@ -33,6 +33,17 @@ tables move to a dimmed *Notes* section after the main text, and the reference l
 reading stops where the paper does. One click on *Read the notes too* or *Read the references too* reads them
 for that file.
 
+**Read from screen** (<kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>`</kbd> or the ⬚ button): drag over any text, even in a
+picture or a scanned PDF, and Saylight reads it aloud and marks each word where it is. It uses the text
+recognition built into Windows, so it works offline and nothing leaves your PC to find the text.
+
+**Scanned PDFs.** A PDF that's only pictures of pages is read the same way, page by page, with a page count and
+the time left while it works. For a long scan Saylight asks first: the first 50 pages, all of them, or the pages
+you choose. If a scan's resolution is low, the panel says some words may be wrong.
+
+**Reading ruler.** A clear band follows your pointer and dims the rest of the screen, so the line you're on
+stands out. Turn it on in Reading display or the tray, and pick its height and how much it dims.
+
 **Pronunciations.** Right-click a word to change how it's said, and hear the sentence with the new pronunciation
 before you save it. Your list works with every voice, and you can import or export it.
 
@@ -63,7 +74,8 @@ spacing, highlight style, and background (Cream, Peach, Soft blue, Soft dark, or
 by accent (US, UK, Australian, Canadian, Irish, Indian, New Zealand and South African). Press ▶ next to any of them
 to hear a short sample sentence first. **Show all languages** loads the full list of voices in every language.
 A few voices don't report word timing; they're marked *sentence highlight only*, and only the sentence is
-highlighted while they read.
+highlighted while they read. Windows' own voices (David, Mark and Zira on most PCs, plus any you've added) are
+listed after the online ones. They work offline and your text stays on your PC, but they sound more robotic.
 
 <p align="center">
   <img src="docs/images/settings.png" alt="The Reading display settings page" width="49%">
@@ -78,8 +90,8 @@ highlighted while they read.
 
 **Unobtrusive by design.**
 - The panel floats on top but never takes keyboard focus, so the app you're reading in stays active. Only the Type
-  or paste box, and the small windows for Pronunciations, Save as audio and a PDF password, take the keyboard,
-  only while they're open; they hand it back when you're done or press <kbd>Esc</kbd>.
+  or paste box, and the small windows for Pronunciations, Save as audio, a PDF password and choosing pages, take
+  the keyboard, only while they're open; they hand it back when you're done or press <kbd>Esc</kbd>.
 - Opening a file never pops the panel up or takes the keyboard. If the panel is hidden, the status pill says how
   it's going.
 - A tray icon and a small status pill show what's happening while the panel is hidden.
@@ -181,6 +193,8 @@ Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 | Action | How |
 |---|---|
 | Read highlighted text | <kbd>Ctrl</kbd> + <kbd>`</kbd> (the key left of <kbd>1</kbd>), or the ▶ button |
+| Read from the screen | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>`</kbd>, the ⬚ button, or *Read from screen…* in the tray. Drag over the text; <kbd>Esc</kbd> or a right-click cancels |
+| Reading ruler | ⋯ **More → Settings → Reading display**, or *Reading ruler* in the tray. An optional shortcut is in **Settings → General** |
 | Pause / resume | <kbd>Ctrl</kbd> + <kbd>`</kbd> with nothing highlighted, the ▶ button, or middle-click the tray icon |
 | Show / hide the panel | <kbd>Ctrl</kbd> + <kbd>`</kbd> with nothing highlighted (when not reading), or click the tray icon |
 | Jump to a sentence | Click it, or use the progress bar |
@@ -197,12 +211,23 @@ Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 | Read your own text | Click ✎ or the empty reading box, type or paste, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> or **Read aloud**. Highlight part of it to hear just that part. <kbd>Esc</kbd> goes back and keeps your text |
 | Clear the text | The eraser button, or *Clear text* in the tray menu. **Undo** appears for 10 seconds |
 
+## Notes
+
+- On UK and European keyboards <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>`</kbd> is <kbd>AltGr</kbd> + <kbd>`</kbd>;
+  switch it off in **Settings → General** if you type ¦. The ⬚ button and the tray menu always work.
+- If Saylight says it needs a language pack to find text, add **English (United States)** in Windows' language
+  settings (the notice has a button that opens them), then press **Try again**.
+
 ## Privacy
 
-The voices are Microsoft's online neural voices (the same voices as Microsoft Edge's Read Aloud), accessed through
-the open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read aloud is
-sent to Microsoft** to be turned into speech, so avoid using it on confidential material. A voice preview sends
-only its fixed sample sentence, never your text.
+The default voices are Microsoft's online neural voices (the same voices as Microsoft Edge's Read Aloud), accessed
+through the open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read
+aloud is sent to Microsoft** to be turned into speech, so avoid using them on confidential material. Windows' own
+voices, listed after the online ones, run on your PC and send nothing. A voice preview sends only its fixed sample
+sentence, never your text.
+
+Read from screen and scanned PDFs work on your PC: the picture of the screen or page stays in memory and is
+dropped as soon as the text is found. Nothing is saved.
 
 Saylight itself stores no text and no audio. Text is kept in memory only while you're reading, and the audio
 plays from short-lived files in a temporary folder that Saylight empties as it goes and deletes when it quits.
@@ -242,10 +267,13 @@ saylight/
   resume.py              Pick up where you left off
   single_instance.py     Open with: hands a file to the running copy
   engine.py              the reading state machine
-  voices/                the voice interface, the online voices (edge-tts), the voice list and previews
+  voices/                the voice interface, the online voices (edge-tts), Windows' voices, the list and previews
   audio_cache.py         the temporary folder for audio chunks
   player.py              playback (Windows MCI)
-  input_thread.py        global shortcut and copying the selection
+  input_thread.py        global shortcuts and copying the selection
+  ocr/, winrt_support.py text recognition with Windows OCR (the only place that loads the WinRT bindings)
+  screen_reader.py       Read from screen: the selection, the capture and the reading
+  screen_capture.py      grabbing an area of the screen, in memory only
   settings.py, theme.py  saved settings, colours and fonts
   paths.py               where Saylight keeps its data
   updates.py             the update check, download and checksum
@@ -253,11 +281,13 @@ saylight/
   ui/                    the panel, its ⋯ menu, settings tabs, controls, reading view, tray, status pill and tooltips
   ui/compose.py          the Type or paste box
   ui/sheet.py            the windows that take the keyboard: Pronunciations, Save as audio, the PDF password
+  ui/region_overlay.py   the selection overlay; ui/screen_highlight.py marks the words on the screen
+  ui/reading_ruler.py    the reading ruler
 packaging/               the PyInstaller spec, the installer script, the licence gate and the build tests
 scripts/build_release.py builds dist/Saylight-Setup.exe and its .sha256 file
 ```
 
-Run the test suite (about 1,600 tests) from the project folder:
+Run the test suite (about 1,850 tests) from the project folder:
 
 ```
 python -m unittest discover -s saylight/tests -t .
@@ -273,9 +303,10 @@ checksum. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists what's inside.
 - [edge-tts](https://github.com/rany2/edge-tts) for access to the neural voices (LGPL-3.0)
 - [Qt for Python (PySide6)](https://doc.qt.io/qtforpython-6/) for the interface (LGPL-3.0)
 - [pypdf](https://github.com/py-pdf/pypdf) for reading PDFs (BSD-3-Clause)
+- [pywinrt](https://github.com/pywinrt/pywinrt) for Windows' text recognition, PDF rendering and voices (MIT)
 - [PyInstaller](https://pyinstaller.org/) and [Inno Setup](https://jrsoftware.org/isinfo.php) for the Windows app
   and its installer
-- Segoe Fluent Icons and Segoe UI Variable, which ship with Windows 11
+- Segoe Fluent Icons and Segoe UI Variable, which ship with Windows 11, and the OCR and voices built into Windows
 
 Saylight is an independent project and is not affiliated with Microsoft.
 

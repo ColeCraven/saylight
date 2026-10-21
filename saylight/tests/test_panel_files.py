@@ -59,7 +59,7 @@ class HeaderTests(FileCase):
     def test_three_icons_with_more_in_the_middle(self) -> None:
         self.show("ready")
         p = self.panel
-        self.assertEqual((p.btn_expand.x(), p.btn_more.x(), p.btn_hide.x()), (324, 360, 396))
+        self.assertEqual((p.btn_expand.x(), p.btn_more.x(), p.btn_hide.x()), (360, 396, 432))
         self.assertEqual(p.btn_more.accessibleName(), "More")
         self.assertEqual(p.btn_more.tooltip_text(), MORE_TIP)
         self.assertEqual(p.btn_more.focusPolicy(), Qt.FocusPolicy.NoFocus)

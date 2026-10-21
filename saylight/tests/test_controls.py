@@ -1,7 +1,8 @@
 """Tests for controls in ui/controls.py: the focusable Read aloud pill and Clear / Undo / Paste buttons of the Type
 or paste box (keyboard activation, the keyboard-only focus ring, sizes and the room kept for the ring), and the
 settings page's link line and navigation row, and the v1.3 additions: glyphs, action chips with label overrides,
-described and focusable toggle rows, the focusable segmented control and focusable navigation rows.
+described and focusable toggle rows, the focusable segmented control and focusable navigation rows. Then 1.4's
+glyphs, the icon() stand-in for Segoe MDL2 Assets, and the chips for reading from the screen and scans.
 
 Widgets are rendered into a QImage and never shown.
 """
@@ -10,7 +11,7 @@ import sys
 import unittest
 
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QFocusEvent, QFontMetricsF, QImage, QKeyEvent, QMouseEvent, QPainter
+from PySide6.QtGui import QFocusEvent, QFont, QFontInfo, QFontMetricsF, QImage, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication, QWidget
 
 from saylight.theme import Theme
@@ -290,6 +291,33 @@ class GlyphTests(unittest.TestCase):
     def test_the_links_glyph_is_unchanged(self) -> None:
         self.assertEqual(G_OPEN, chr(0xE8A7))  # OpenInNewWindow, for "Privacy and licences"
 
+    def test_v14_code_points(self) -> None:
+        expected = {"G_SCREEN": 0xF683, "G_SCREEN_MDL2": 0xE9A6, "G_LANGUAGE": 0xF2B7, "G_SCAN": 0xE8FE,
+                    "G_PAGES": 0xE7C3}
+        for name, code in expected.items():
+            self.assertEqual(getattr(C, name), chr(code), name)
+
+    def test_icon_swaps_only_the_screen_glyph_outside_segoe_fluent_icons(self) -> None:
+        class IconTheme:
+            def __init__(self, family: str) -> None:
+                self.family = family
+
+            def font(self, role: str) -> QFont:
+                self.role = role
+                return QFont(self.family)
+
+        mdl2 = IconTheme("Segoe MDL2 Assets")
+        self.assertEqual(C.icon(mdl2, C.G_SCREEN), C.G_SCREEN_MDL2)
+        self.assertEqual(mdl2.role, "icon16")
+        self.assertEqual(C.icon(IconTheme("Arial"), C.G_SCREEN), C.G_SCREEN_MDL2)  # any other resolved family
+        for glyph in (C.G_LANGUAGE, C.G_SCAN, C.G_PAGES, C.G_PLAY, C.G_RETRY):  # all in both fonts
+            self.assertEqual(C.icon(mdl2, glyph), glyph)
+        fluent = IconTheme("Segoe Fluent Icons")
+        if QFontInfo(QFont("Segoe Fluent Icons")).family() != "Segoe Fluent Icons":
+            self.skipTest("Segoe Fluent Icons is not installed")
+        self.assertEqual(C.icon(fluent, C.G_SCREEN), C.G_SCREEN)
+        self.assertEqual(C.icon(theme(), C.G_SCREEN), C.G_SCREEN)
+
 
 class ActionChipTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -301,6 +329,15 @@ class ActionChipTests(unittest.TestCase):
         self.assertEqual(ACTION_PARTS["password"], (C.G_LOCK, "Enter password"))
         self.assertEqual(ACTION_PARTS["retry"], (C.G_RETRY, "Try again"))
         self.assertEqual(ACTION_PARTS["type"], (C.G_TYPE, "Type or paste text"))  # the 1.1 keys stay
+
+    def test_screen_and_scan_keys(self) -> None:
+        expected = {"screen": (C.G_SCREEN, "Read from screen"), "screen_retry": (C.G_SCREEN, "Try again"),
+                    "scan_retry": (C.G_RETRY, "Try again"), "lang_settings": (C.G_LANGUAGE, "Open language settings"),
+                    "scan_first": (C.G_PLAY, "First 50 pages"), "scan_choose": (C.G_PAGES, "Choose pages…")}
+        for name, part in expected.items():
+            self.assertEqual(ACTION_PARTS[name], part, name)
+        self.assertEqual(ACTION_PARTS["scan_all"][0], C.G_PLAY)
+        self.assertEqual(action_label("scan_all", {"scan_all": "All 160 pages"}), "All 160 pages")
 
     def test_label_overrides(self) -> None:
         label = "Continue Smith 2024 from page 14"

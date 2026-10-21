@@ -6,13 +6,14 @@ import math
 from typing import Callable, Iterable, NamedTuple
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFontInfo, QFontMetricsF, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from ..theme import READING_PRESETS, composite
 from .motion import FAST, MEDIUM, SLOW, Clock, Tween, decelerate, mix, with_alpha
 
-# Segoe Fluent Icons code points (all present in the font).
+# Segoe Fluent Icons code points (all present in the font, and all but G_SCREEN in Segoe MDL2 Assets too: draw
+# that one through icon()).
 G_PLAY = ""
 G_PAUSE = ""
 G_RETRY = ""
@@ -57,8 +58,23 @@ G_IMPORT = ""
 G_EXPORT = ""
 G_CANCEL = ""
 G_ARROW = ""       # word -> said as
+G_SCREEN = ""      # Read from screen, everywhere it appears
+G_SCREEN_MDL2 = ""  # G_SCREEN's stand-in where only Segoe MDL2 Assets is installed
+G_LANGUAGE = ""    # language settings
+G_SCAN = ""        # a scanned PDF
+G_PAGES = ""       # choosing pages
+_MDL2_STAND_INS = {G_SCREEN: G_SCREEN_MDL2}
 
 TRANSPARENT = QColor(0, 0, 0, 0)
+
+
+def icon(theme, glyph: str) -> str:
+    """The glyph to draw with the theme's icon font: `glyph`, or its Segoe MDL2 Assets stand-in when the icon
+    font resolved to anything but Segoe Fluent Icons (Windows 10 without it)."""
+    stand_in = _MDL2_STAND_INS.get(glyph)
+    if stand_in is None or QFontInfo(theme.font("icon16")).family() == "Segoe Fluent Icons":
+        return glyph
+    return stand_in
 
 
 def volume_glyph(v: int) -> str:
@@ -78,10 +94,15 @@ def draw_glyph(p: QPainter, rect: QRectF, glyph: str, font, color: QColor, dx: f
 Part = tuple[str, str]  # ("text", "..."), ("key", "Ctrl"), ("glyph", G_PLAY): a round chip with an icon,
 #                         or ("action", "type"): a clickable chip from ACTION_PARTS
 CAP_H = {"small": 16, "body": 18, "message": 20}  # keycap and glyph-chip height in DIP for each text role
-# key: (glyph, label). "continue" is always given its label when painted ("Continue Smith 2024 from page 14").
+# key: (glyph, label). "continue" and "scan_all" are always given their labels when painted ("Continue Smith 2024
+# from page 14", "All 160 pages").
 ACTION_PARTS = {"type": (G_TYPE, "Type or paste text"), "undo": (G_UNDO, "Undo"),
                 "open": (G_OPEN_FILE, "Open a file"), "continue": (G_HISTORY, "Continue"),
-                "password": (G_LOCK, "Enter password"), "retry": (G_RETRY, "Try again")}
+                "password": (G_LOCK, "Enter password"), "retry": (G_RETRY, "Try again"),
+                "screen": (G_SCREEN, "Read from screen"), "screen_retry": (G_SCREEN, "Try again"),
+                "scan_retry": (G_RETRY, "Try again"), "lang_settings": (G_LANGUAGE, "Open language settings"),
+                "scan_first": (G_PLAY, "First 50 pages"), "scan_all": (G_PLAY, "All pages"),
+                "scan_choose": (G_PAGES, "Choose pages…")}
 
 
 class ActionState(NamedTuple):
@@ -189,7 +210,7 @@ def _paint_action(p: QPainter, t, r: QRectF, baseline: float, key: str, state: A
                   caps: tuple[QColor, QColor, QColor], font, disabled_ink: QColor, label: str) -> None:
     """An action chip: keycap colours, a 16 DIP glyph and the label on the line's baseline."""
     fill, stroke, ink = caps
-    glyph = ACTION_PARTS[key][0]
+    glyph = icon(t, ACTION_PARTS[key][0])
     hover, pressed = (state.hover, state.pressed) if state.enabled else (0.0, 0.0)
     face = fill
     if not t.high_contrast:
@@ -1367,7 +1388,7 @@ class ToggleRow(Control):
         x = self.face().left() + t.px(10)
         p.setOpacity(opacity)
         p.setFont(font)
-        p.setPen(t.color("TextSecondary"))
+        p.setPen(t.color("TextSecondary" if self.isEnabled() else "TextDisabled"))
         p.drawText(QPointF(x, _baseline(fm, top, t.px(16))),
                    fm.elidedText(text, Qt.TextElideMode.ElideRight, max(0.0, right - x)))
         p.setOpacity(1.0)
@@ -1390,10 +1411,12 @@ class ToggleRow(Control):
         k = self.knob.value
         tw, th = t.k * 40, t.k * 20
         track = QRectF(r.right() - t.px(10) - tw, r.top() + (r.height() - th) / 2, tw, th)
+        enabled = self.isEnabled()  # disabled: label, track and knob in TextDisabled, and no hover
+        disabled = t.color("TextDisabled")
         font = t.font("body")
         fm = QFontMetricsF(font)
         p.setFont(font)
-        p.setPen(t.color("TextPrimary"))
+        p.setPen(t.color("TextPrimary") if enabled else disabled)
         if self.described:  # label 20 + 2 + detail 16, centred as one block
             top = r.top() + (r.height() - t.px(38)) / 2
             p.drawText(QPointF(r.left() + t.px(10), _baseline(fm, top, t.px(20))), self.label)
@@ -1404,10 +1427,10 @@ class ToggleRow(Control):
             self._paint_detail(p, self.detail, top + t.px(22), right, f)
         else:
             p.drawText(QPointF(r.left() + t.px(10), _baseline(fm, r.top(), r.height())), self.label)
-        on_fill = mix(t.color("Accent"), t.color("AccentHover"), self.hover.value)
+        on_fill = mix(t.color("Accent"), t.color("AccentHover"), self.hover.value) if enabled else disabled
         if k < 1.0:
             p.setOpacity(1.0 - k)
-            p.setPen(QPen(t.color("TextSecondary"), t.k))
+            p.setPen(QPen(t.color("TextSecondary") if enabled else disabled, t.k))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(track.adjusted(t.k / 2, t.k / 2, -t.k / 2, -t.k / 2), th / 2, th / 2)
         if k > 0.0:
@@ -1420,7 +1443,8 @@ class ToggleRow(Control):
         x0 = track.left() + th / 2
         x1 = track.right() - th / 2
         cx = x0 + (x1 - x0) * k
-        knob_color = mix(t.color("TextSecondary"), t.color("OnAccent"), k)
+        knob_color = (mix(t.color("TextSecondary"), t.color("OnAccent"), k) if enabled
+                      else mix(disabled, t.color("Surface"), k))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(knob_color)
         p.drawEllipse(QPointF(cx, track.center().y()), d / 2, d / 2)
@@ -1499,7 +1523,9 @@ class Segmented(Control):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         face = self.face()
         r = face.adjusted(0.5, 0.5, -0.5, -0.5)
-        p.setPen(QPen(t.color("ControlStroke"), 0))
+        enabled = self.isEnabled()  # disabled: labels and the bar in TextDisabled, no hover
+        stroke = t.color("ControlStroke" if enabled or not t.high_contrast else "DisabledOutline")
+        p.setPen(QPen(stroke, 0))
         p.setBrush(t.color("SegmentTrack"))
         p.drawRoundedRect(r, t.px(4), t.px(4))
         if self.focus_ring_shown():
@@ -1508,7 +1534,7 @@ class Segmented(Control):
         x0, top, h = face.left(), face.top(), face.height()
         inset = t.px(2)
         sel = QRectF(x0 + self.bar.value * sw, top, sw, h).adjusted(inset, inset, -inset, -inset)
-        p.setPen(QPen(t.color("ControlStroke"), 0))
+        p.setPen(QPen(stroke, 0))
         p.setBrush(t.color("SegmentSelected"))
         p.drawRoundedRect(sel, t.px(3), t.px(3))
         if not t.dark and not t.high_contrast:  # a hairline under the white chip makes it read as raised
@@ -1517,7 +1543,7 @@ class Segmented(Control):
             p.drawLine(QPointF(sel.left() + t.px(3), y), QPointF(sel.right() - t.px(3), y))
         bar_w, bar_h = t.k * 16, t.k * 3
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(t.color("Accent"))
+        p.setBrush(t.color("Accent" if enabled else "TextDisabled"))
         p.drawRoundedRect(QRectF(sel.center().x() - bar_w / 2, sel.bottom() - bar_h - t.k, bar_w, bar_h),
                           bar_h / 2, bar_h / 2)
         # Every label sits on the body font's baseline, so mixed faces and sizes line up.
@@ -1525,7 +1551,7 @@ class Segmented(Control):
         baseline = top + (h - 3 * t.k - (fmb.ascent() + fmb.descent())) / 2 + fmb.ascent()
         for i, item in enumerate(self.items):
             label, size = item[0], item[1]
-            if self._hover_i == i and i != self.index and self.hover.value > 0:
+            if self._hover_i == i and i != self.index and self.hover.value > 0 and enabled:
                 plate = QRectF(x0 + i * sw, top, sw, h).adjusted(inset, inset, -inset, -inset)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(with_alpha(t.color("SegmentSelected"), 0.6 * self.hover.value))
@@ -1537,7 +1563,10 @@ class Segmented(Control):
             font.setPixelSize(max(1, round(size * t.k)))
             fm = QFontMetricsF(font)
             p.setFont(font)
-            p.setPen(t.color("TextPrimary") if i == self.index else t.color("TextSecondary"))
+            if not enabled:
+                p.setPen(t.color("TextDisabled"))
+            else:
+                p.setPen(t.color("TextPrimary") if i == self.index else t.color("TextSecondary"))
             p.drawText(QPointF(x0 + i * sw + (sw - fm.horizontalAdvance(label)) / 2, baseline), label)
 
 

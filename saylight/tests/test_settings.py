@@ -73,7 +73,8 @@ class TestDefaults(Base):
 
     def test_default_values(self) -> None:
         s = Settings(self.path)
-        self.assertEqual(s.get("hotkeys"), {"read": "Ctrl+`", "toggle_panel": "", "pause_resume": "", "compose": ""})
+        self.assertEqual(s.get("hotkeys"), {"read": "Ctrl+`", "toggle_panel": "", "pause_resume": "", "compose": "",
+                                            "read_screen": "Ctrl+Alt+`", "ruler": ""})
         self.assertEqual(s.get("panel"), {"visible": True, "position": None, "expanded": False})
         expected = {"version": 1, "speed": 0.95, "volume": 100, "hud_when_hidden": True, "media_keys": True,
                     "first_hide_tip_shown": False, "skip_citations": True, "skip_urls": True,
@@ -294,8 +295,11 @@ class TestEarlierFiles(Base):
         self.assertEqual(data["voice"], "edge:en-US-AvaNeural")
         self.assertEqual(data["updates"]["skipped"], "1.3.0")
         for key in tree:
-            if key != "voice":
+            if isinstance(tree[key], dict):  # a group keeps its values and gains any newer keys' defaults
+                self.assertEqual({k: data[key][k] for k in tree[key]}, tree[key], key)
+            elif key != "voice":
                 self.assertEqual(data[key], tree[key], key)
+        self.assertEqual(data["hotkeys"]["read_screen"], "Ctrl+Alt+`")
 
     def _flatten(self, node: dict, prefix: str, out: dict) -> None:
         for key, value in node.items():
@@ -475,6 +479,79 @@ class TestPosition(Base):
         s.set("panel.position", None)
         self.assertIsNone(s.get("panel.position"))
         self.assertEqual(keys, ["panel.position"])
+
+
+class TestScreenKeys(Base):
+    """Keys added in 1.4: reading from the screen, its on-screen highlight, and the reading ruler."""
+
+    KEYS = {"hotkeys.read_screen": "Ctrl+Alt+`", "hotkeys.ruler": "", "screen.highlight": True,
+            "ruler.enabled": False, "ruler.height": "medium", "ruler.dim": "medium"}
+
+    def test_defaults(self) -> None:
+        s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+        self.assertEqual(s.get("ruler"), {"enabled": False, "height": "medium", "dim": "medium"})
+        self.assertEqual(s.get("screen"), {"highlight": True})
+        self.assertEqual(S.RULER_HEIGHTS, ("small", "medium", "large"))
+        self.assertEqual(S.RULER_DIMS, ("light", "medium", "strong"))
+
+    def test_a_1_3_file_loads_with_the_new_defaults(self) -> None:
+        self.write_json({**EARLIER_FILES["1.1"], "voice": "edge:en-US-AvaNeural", "read_references": False,
+                         "resume": {"enabled": False, "offer_count": 0}})
+        with self.assertNoLogs("saylight.settings", "WARNING"):
+            s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+
+    def test_choices_are_validated_and_normalised(self) -> None:
+        s = Settings(self.path)
+        for key, options in (("ruler.height", S.RULER_HEIGHTS), ("ruler.dim", S.RULER_DIMS)):
+            for option in options:
+                s.set(key, " " + option.upper())
+                self.assertEqual(s.get(key), option)
+            for bad in ("huge", "", 72, None, True):
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    s.set(key, bad)
+
+    def test_shortcuts_are_validated_like_the_others(self) -> None:
+        for key in ("hotkeys.read_screen", "hotkeys.ruler"):
+            self.assertIs(SCHEMA[key][1], SCHEMA["hotkeys.read"][1], key)
+        s = Settings(self.path)
+        s.set("hotkeys.ruler", "shift+alt+ctrl+`")
+        self.assertEqual(s.get("hotkeys.ruler"), "Ctrl+Alt+Shift+`")
+        s.set("hotkeys.read_screen", "")  # switched off: only the button and the tray menu remain
+        self.assertEqual(s.get("hotkeys.read_screen"), "")
+        with self.assertRaises(ValueError):
+            s.set("hotkeys.read_screen", "`")
+
+    def test_bad_values_fall_back_without_echoing_them(self) -> None:
+        self.write_json({"hotkeys": {"read_screen": "SECRET+`", "ruler": 5}, "screen": {"highlight": "SECRET"},
+                         "ruler": {"enabled": "SECRET", "height": "SECRET", "dim": [1]}})
+        with self.assertLogs("saylight.settings", "WARNING") as logs:
+            s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+        self.assertFalse(any("SECRET" in line for line in logs.output))
+
+    def test_changes_are_saved(self) -> None:
+        s = Settings(self.path)
+        s.set("ruler.enabled", True)
+        s.set("ruler.height", "large")
+        s.set("ruler.dim", "strong")
+        s.set("screen.highlight", False)
+        self.assertTrue(s.flush())
+        data = self.read_json()
+        self.assertEqual(data["ruler"], {"enabled": True, "height": "large", "dim": "strong"})
+        self.assertEqual(data["screen"], {"highlight": False})
+
+    def test_nothing_from_the_screen_is_a_setting(self) -> None:
+        """Captures, OCR text and areas are never persisted: the new keys hold switches and choices only."""
+        for key in self.KEYS:
+            if not key.startswith("hotkeys."):
+                self.assertIn(type(SCHEMA[key][0]), (bool, str), key)
+        screen_keys = [k for k in SCHEMA if k.startswith(("screen.", "ruler.", "ocr", "capture"))]
+        self.assertEqual(sorted(screen_keys), sorted(k for k in self.KEYS if not k.startswith("hotkeys.")))
 
 
 class TestHotkeys(Base):

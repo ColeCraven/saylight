@@ -27,7 +27,7 @@ import saylight
 import saylight_app as A
 from saylight import paths, voices, win32
 from saylight.engine import ClearedReading
-from saylight.input_thread import HK_COMPOSE, HK_PANEL
+from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_READ_SCREEN, HK_RULER
 from saylight.settings import Settings
 from saylight.ui.compose import ComposeSession, ComposeSnapshot
 from saylight.ui.sheet import SheetSession
@@ -352,7 +352,7 @@ class OldInstallTests(unittest.TestCase):
 # --- The App: Type or paste, Clear and Undo --------------------------------------------------------
 
 BOX, APP_WINDOW, OTHER_APP, SHELL, LAST_APP = 4242, 555, 700, 701, 888
-QUNS_ACCEPTS_NOTIFICATIONS, QUNS_RUNNING_D3D_FULL_SCREEN = 5, 3
+QUNS_ACCEPTS_NOTIFICATIONS, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_BUSY = 5, 3, 2
 
 
 class World:
@@ -413,15 +413,22 @@ class FakeEngine(QObject):
     def begin_opening(self, title: str, kind: str = "file") -> int:
         self.token += 1
         world.log("begin_opening", title, kind)
-        self.state = "opening"
+        self.before, self.state = self.state, "opening"
         return self.token
 
-    def opening_progress(self, token: int, done: int, total: int) -> None:
-        world.log("opening_progress", token, done, total)
+    def opening_progress(self, token: int, done: int, total: int, *, phase: str = "read") -> None:
+        world.log("opening_progress", token, done, total, *(("ocr",) if phase == "ocr" else ()))
+
+    def opening_choice(self, token: int, scanned: int, pages: int, est_s: int) -> None:
+        world.log("opening_choice", token, scanned, pages, est_s)
 
     def opening_failed(self, token: int, kind: str) -> None:
         world.log("opening_failed", token, kind)
-        self.state = "open_failed"
+        self.state = getattr(self, "before", "ready") if kind == "cancelled" else "open_failed"
+
+    def ocr_notice(self, kind: str, detail: str = "") -> None:
+        world.log("ocr_notice", kind, detail)
+        self.state = "ocr_notice"
 
     def open_notice(self, kind: str, title: str = "") -> None:
         world.log("open_notice", kind, title)
@@ -500,6 +507,7 @@ class FakeInput(QObject):
     copied = Signal(int, str, str)
     composeReadPressed = Signal()
     quitRequested = Signal()
+    overlayCancelPressed = Signal(str)
 
     def __init__(self, _quit_event, hotkeys: dict, parent=None) -> None:
         super().__init__(parent)
@@ -556,11 +564,12 @@ class FakePanel:
         self.rest = QRect(740, 768, 440, 252)
         self.notice_ext, self.cleared_title, self.notes, self.progress = "", "", [], []
         self.failed_badge = False
+        self.tabs = Quiet()
 
     def set_cleared(self, on: bool, title: str = "") -> None:
         self.cleared, self.cleared_title = on, title
 
-    def show_note(self, text: str, color: str = "TextSecondary") -> None:
+    def show_note(self, text: str, color: str = "TextSecondary", **_kw) -> None:
         self.notes.append((text, color))
 
     def set_save_progress(self, fraction, eta: str = "", *, done: bool = False) -> None:
@@ -715,6 +724,9 @@ class FakeHud:
     def dismiss(self) -> None:
         pass
 
+    def hide(self) -> None:
+        world.log("hud_hide")
+
 
 class Quiet:
     """Any call does nothing: the tray, tooltips and player."""
@@ -813,6 +825,14 @@ class FakeLoader(QObject):
     progress = Signal(int, int, int)
     built = Signal(int, object, object)
     failed = Signal(int, str)
+    scanChoice = Signal(int, int, int)
+    scanProgress = Signal(int, int, int)
+
+    def continue_scan(self, token: int, first: int, last: int) -> None:
+        self.jobs.append(("scan", token, first, last))
+
+    def scanned_in(self, token: int, first: int, last: int) -> int:
+        return last - first + 1
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -863,13 +883,139 @@ class FakeExporter(QObject):
         self.shut = True
 
 
+class FakeOcr(QObject):
+    done = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+
+    def start(self) -> None:
+        world.log("ocr_start")
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        world.log("ocr_shutdown")
+
+
+class FakeOverlay:
+    excluded = True
+
+    def capture_excluded(self) -> bool:
+        return self.excluded
+
+
+class FakeScreenReader(QObject):
+    """The selection and recognition, as the App drives them: begin() opens at once unless no language."""
+
+    stateChanged = Signal(str)
+    textReady = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, theme, settings, ocr, *, input_thread=None, build=None, highlight=None, parent=None) -> None:
+        super().__init__(parent)
+        self.build, self.state, self.languages = build, "idle", True
+        self.overlay = FakeOverlay()
+
+    def selecting(self) -> bool:
+        return self.state == "selecting"
+
+    def busy(self) -> bool:
+        return self.state != "idle"
+
+    def language_ready(self, *, refresh: bool = False) -> bool:
+        world.log("language_ready", refresh)
+        return self.languages
+
+    def begin(self, *, return_to: int = 0) -> None:
+        world.log("begin", return_to)
+        self.state = "selecting"
+        self.stateChanged.emit("selecting")
+
+    def cancel(self, reason: str = "app") -> None:
+        if self.state == "idle":
+            return
+        world.log("cancel", reason)
+        self.state = "idle"
+        self.stateChanged.emit("idle")
+        self.failed.emit("cancelled")
+
+    def capture(self) -> None:
+        self.state = "recognizing"
+        self.stateChanged.emit("recognizing")
+
+    def finish(self, doc, text) -> None:
+        self.state = "idle"
+        self.stateChanged.emit("idle")
+        self.textReady.emit(doc, text)
+
+    def fail(self, kind: str) -> None:
+        self.state = "idle"
+        self.stateChanged.emit("idle")
+        self.failed.emit(kind)
+
+
+class FakeHighlight(QObject):
+    pageMoved = Signal(bool)
+    shown = Signal()
+
+    def __init__(self, theme, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.own_rects = None
+
+    def set_own_rects(self, fn) -> None:
+        self.own_rects = fn
+
+    def show_for(self, source) -> None:
+        world.log("marks_show", source)
+
+    def set_word(self, *_args) -> None:
+        pass
+
+    def set_paused(self, on: bool) -> None:
+        pass
+
+    def hide(self, animate: bool = True) -> None:
+        world.log("marks_hide", animate)
+
+    def forget(self) -> None:
+        world.log("marks_forget")
+
+    def is_visible(self) -> bool:
+        return False
+
+    def window_id(self) -> int:
+        return 0
+
+
+class FakeRuler(QObject):
+    toggled = Signal(bool)
+    shown = Signal()
+
+    def __init__(self, theme, settings, own_rects, parent=None) -> None:
+        super().__init__(parent)
+        self.settings, self.own_rects, self.enabled, self.reasons = settings, own_rects, False, set()
+
+    def set_enabled(self, on: bool) -> None:
+        world.log("ruler", on)
+        self.enabled = on
+
+    def suppress(self, reason: str, on: bool) -> None:
+        (self.reasons.add if on else self.reasons.discard)(reason)
+
+    def shutdown(self) -> None:
+        pass
+
+
 FAKES = {"saylight.engine.Engine": FakeEngine, "saylight.input_thread.InputThread": FakeInput,
          "saylight.foreground.ForegroundTracker": FakeForeground, "saylight.ui.panel.Panel": FakePanel,
          "saylight.ui.compose.ComposeWindow": FakeCompose, "saylight.ui.hud.Hud": FakeHud,
          "saylight.ui.tray.Tray": Quiet, "saylight.ui.tip.TipManager": Quiet, "saylight.voices.make_router": FakeRouter,
          "saylight.voices.preview.VoicePreview": FakePreview, "saylight.update_service.UpdateService": FakeUpdates,
          "saylight.player.PlayerThread": Quiet, "saylight.single_instance.OpenServer": FakeServer,
-         "saylight.documents.loader.DocumentLoader": FakeLoader, "saylight.export.AudioExporter": FakeExporter}
+         "saylight.documents.loader.DocumentLoader": FakeLoader, "saylight.export.AudioExporter": FakeExporter,
+         "saylight.ocr.engine.OcrWorker": FakeOcr, "saylight.screen_reader.ScreenReader": FakeScreenReader,
+         "saylight.ui.screen_highlight.ScreenHighlight": FakeHighlight,
+         "saylight.ui.reading_ruler.ReadingRuler": FakeRuler}
 
 
 class AppTest(unittest.TestCase):
@@ -919,7 +1065,7 @@ class SettingsPagesTests(AppTest):
     def test_the_pages_get_the_voices_updates_and_version(self) -> None:
         app = self.app
         self.assertEqual(app.version, saylight.__version__)
-        self.assertEqual(saylight.__version__, "1.3.0")
+        self.assertEqual(saylight.__version__, "1.4.0")
         self.assertIsInstance(app.router, FakeRouter)
         self.assertIs(app.router.settings, app.settings)
         self.assertIs(app.router.parent, app)
@@ -931,9 +1077,9 @@ class SettingsPagesTests(AppTest):
         self.assertIs(app.updates.settings, app.settings)
         self.assertEqual(app.updates.current_version, saylight.__version__)
 
-    def test_the_catalog_lists_local_voices_first_and_the_online_list_once(self) -> None:
+    def test_the_catalog_lists_the_online_voices_first_then_local_ones_and_the_online_list_once(self) -> None:
         listed = self.app.catalog.voices()
-        self.assertEqual(listed[0], LOCAL_VOICE)
+        self.assertEqual(listed[-1], LOCAL_VOICE)  # Windows' voices come after the online list
         self.assertEqual([v.id for v in listed].count(ONLINE_VOICE.id), 1)
 
     def test_set_voice_stores_the_full_id(self) -> None:
@@ -1598,7 +1744,7 @@ class FileFlowTests(AppTest):
         line = next(m for m in logs.output if "Open: pdf" in m)
         self.assertIn("18 pages", line)
         self.assertNotIn("Secret", line)
-        self.assertEqual(self.p.notes, [("2 scanned pages skipped", "TextSecondary")])
+        self.assertEqual(self.p.notes, [("Scanned pages skipped", "Caution")])
 
     def test_a_failure_becomes_the_engines_notice(self) -> None:
         self.app.open_path(self.make("a.pdf"))
@@ -1751,6 +1897,219 @@ class FileFlowTests(AppTest):
         self.app._on_state("open_failed", {"label": "Password needed", "kind": "password"})
         self.e.notice.emit("open_failed")
         self.assertIn(("hud", "Password needed"), world.events)
+
+
+class ScreenFlowTests(AppTest):
+    """Read from screen as the App runs it: the pause, the cover, the overlay, and how it ends."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sr = self.app.screen_reader
+
+    def test_the_button_pauses_covers_and_opens_the_overlay(self) -> None:
+        doc = self.load("reading")
+        self.app.read_from_screen("button")
+        kinds = world.kinds()
+        self.assertLess(kinds.index("pause"), kinds.index("begin"))
+        self.assertIn(("covered", True), world.events)
+        self.assertIn("hud_hide", kinds)
+        self.assertIn(("marks_hide", False), world.events)
+        self.assertEqual(self.app.ruler.reasons, {"overlay"})
+        self.assertTrue(self.sr.selecting())
+        self.assertIs(self.app._screen_paused, doc)
+        self.assertTrue(self.app._busy())  # no update check while choosing
+
+    def test_cancelling_the_overlay_resumes_the_reading_it_paused(self) -> None:
+        self.load("reading")
+        self.app.read_from_screen("hotkey")
+        self.input.hotkeyPressed.emit(HK_READ_SCREEN)  # the shortcut again: cancel
+        self.assertIn(("cancel", "hotkey"), world.events)
+        self.assertEqual(self.e.state, "reading")
+        self.assertIn(("covered", False), world.events)
+        self.assertEqual(self.app.ruler.reasons, set())
+        self.assertNotIn("ocr_notice", world.kinds())
+
+    def test_no_language_shows_the_notice_without_the_overlay(self) -> None:
+        self.load("reading")
+        self.sr.languages = False
+        self.app.read_from_screen("retry")
+        self.assertIn(("language_ready", True), world.events)  # Try again asks Windows afresh
+        self.assertIn(("ocr_notice", "screen_language", ""), world.events)
+        self.assertNotIn("begin", world.kinds())
+        self.assertNotIn("pause", world.kinds())
+
+    def test_refused_while_copying_or_opening(self) -> None:
+        for state in ("copying", "opening"):
+            with self.subTest(state=state):
+                self.e.state = state
+                with self.assertLogs("saylight.app", "INFO"):
+                    self.app.read_from_screen("button")
+                self.assertNotIn("begin", world.kinds())
+
+    def test_the_capture_opens_finding_the_text_and_the_result_is_read(self) -> None:
+        self.load("paused")
+        self.p.page = "settings"
+        self.app.read_from_screen("card")
+        self.sr.capture()
+        self.assertIn(("begin_opening", "", "screen"), world.events)
+        self.assertIn(("covered", False), world.events)
+        doc, text = FakeDoc("Found it. Read it."), types.SimpleNamespace(text="Found it. Read it.")
+        self.sr.finish(doc, text)
+        self.assertIn(("read_document", 1), world.events)
+        self.assertIs(self.e.document, doc)
+        self.assertEqual(self.p.page, "reading")  # the new reading shows on the reading page
+
+    def test_stop_while_finding_the_text_cancels_and_keeps_the_pause(self) -> None:
+        self.load("reading")
+        self.app.read_from_screen("button")
+        self.sr.capture()
+        token = self.app._screen_token
+        self.e.state = "paused"  # Stop: the engine goes back to the state under Opening
+        self.e.openingCancelled.emit(token)
+        self.assertIn(("cancel", "stop"), world.events)
+        self.assertEqual(self.e.state, "paused")
+        self.assertNotIn("resume", world.kinds())
+
+    def test_failures_show_a_notice_and_never_resume(self) -> None:
+        self.load("reading")
+        self.app.read_from_screen("button")
+        self.sr.capture()
+        self.sr.fail("nothing_speakable")
+        self.assertIn(("ocr_notice", "screen_nothing", "nothing_speakable"), world.events)
+        self.assertNotIn("resume", world.kinds())
+
+    def test_the_box_hands_its_pause_over(self) -> None:
+        doc = self.load("reading")
+        self.app.open_compose("button")
+        self.app.read_from_screen("hotkey")
+        self.assertIn(("close_animated", "screen_read"), world.events)
+        self.assertEqual(self.e.state, "paused")  # never resumed by the box closing
+        self.assertIs(self.app._screen_paused, doc)
+
+    def test_the_ruler_and_its_shortcut(self) -> None:
+        self.input.hotkeyPressed.emit(HK_RULER)
+        self.assertEqual(self.app.ruler.enabled, True)
+        self.app.toggle_ruler(False)
+        self.assertEqual(self.app.ruler.enabled, False)
+
+    def test_the_optional_shortcuts_are_registered_from_the_settings(self) -> None:
+        hotkeys = self.input.hotkeys
+        self.assertEqual((hotkeys[HK_READ_SCREEN], hotkeys[HK_RULER]), ("Ctrl+Alt+`", ""))
+        self.assertEqual(self.app.screen_shortcut(), "")  # until Windows says it registered
+        self.input.registered.emit(HK_READ_SCREEN, True)
+        self.assertEqual(self.app.screen_shortcut(), "Ctrl+Alt+`")
+        self.input.registered.emit(HK_READ_SCREEN, False)
+        self.assertTrue(self.app.shortcut_failed("read_screen"))
+        self.app.settings.set("hotkeys.ruler", "Ctrl+Alt+Shift+R")
+        self.assertEqual(self.input.hotkeys[HK_RULER], "Ctrl+Alt+Shift+R")
+
+    def test_own_rects_lists_the_visible_windows(self) -> None:
+        self.assertEqual(self.app.own_rects(), [])  # the fakes have no windows
+
+    def test_no_hud_while_choosing_an_area(self) -> None:
+        self.load("reading")
+        self.p.visible = False  # the panel hidden, Status pop-ups while hidden on (the default)
+        self.app.read_from_screen("hotkey")
+        start = len(world.events)
+        self.e.resume()  # the media Play/Pause key keeps its meaning while the overlay is open
+        flashes = [e for e in world.events[start:] if e[0] == "hud"]
+        self.assertEqual(flashes, [], "the HUD would show over the overlay, and a drag over it would read it")
+
+    def test_marks_wait_while_choosing_and_come_back_after_a_cancel(self) -> None:
+        screen = object()
+        self.load("paused", FakeDoc("Read from the screen."))
+        self.e.document.source = types.SimpleNamespace(kind="screen", screen=screen)
+        self.app.read_from_screen("button")
+        self.e.state = "reading"
+        self.e.stateChanged.emit("reading", {})  # the media Play/Pause key, while the overlay is open
+        self.assertNotIn("marks_show", world.kinds())
+        self.sr.cancel("esc")
+        self.assertIn(("marks_show", screen), world.events)
+
+    def test_no_reading_is_kept_after_the_privacy_purge(self) -> None:
+        def held(*docs) -> list[str]:
+            return [name for name, value in vars(self.app).items() if any(value is d for d in docs)]
+        before = self.load("reading")
+        self.app.read_from_screen("button")
+        self.sr.capture()
+        doc = FakeDoc("Words found on the screen. More of them.")
+        self.sr.finish(doc, types.SimpleNamespace(text=doc.text))
+        self.assertIs(self.e.document, doc)
+        self.app.highlight.pageMoved.emit(True)  # "Page moved" said once for this reading
+        # the purge after 10 minutes at rest (or Clear once Undo has gone): the engine forgets the text
+        self.e.document = self.e.raw = None
+        self.e.state = "ready"
+        self.e.sessionChanged.emit(None)
+        self.assertEqual(held(doc, before), [], "OCR text and the earlier reading would outlive the purge")
+
+    def test_quitting_while_choosing_an_area_never_resumes(self) -> None:
+        self.load("reading")
+        self.app.read_from_screen("button")
+        self.app._shutdown()
+        self.assertIn(("cancel", "app"), world.events)
+        self.assertNotIn("resume", world.kinds())
+
+    def test_the_overlay_is_not_taken_for_a_full_screen_app(self) -> None:
+        # Windows says busy (a full-screen app) while the overlay covers the screen, and a moment after
+        self.load("reading")
+        self.app.read_from_screen("button")
+        world.notification_state = QUNS_BUSY
+        self.app._check_fullscreen()
+        self.sr.cancel("esc")
+        self.app._check_fullscreen()
+        self.assertNotIn("panel_hide", world.kinds())
+        self.app._check_fullscreen()  # still busy after that: a real full-screen app
+        self.assertIn("panel_hide", world.kinds())
+
+
+class ScanFlowTests(AppTest):
+    """Scanned PDFs: the OCR phase, the page choice, the window and the notes."""
+
+    make = FileFlowTests.make
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.files = tempfile.mkdtemp(prefix="saylight_app_files_")
+        self.addCleanup(shutil.rmtree, self.files, True)
+        self.loader = self.app.loader
+
+    def open_scan(self) -> int:
+        self.app.open_path(self.make("Scan.pdf"), "drop")
+        return self.loader.jobs[-1][1]
+
+    def test_the_ocr_phase_reaches_the_engine(self) -> None:
+        token = self.open_scan()
+        self.loader.scanProgress.emit(token, 3, 12)
+        self.assertIn(("opening_progress", token, 3, 12, "ocr"), world.events)
+
+    def test_a_long_scan_waits_for_a_choice_of_pages(self) -> None:
+        token = self.open_scan()
+        self.loader.scanChoice.emit(token, 160, 160)
+        self.assertIn(("opening_choice", token, 160, 160, 128), world.events)
+        self.app.continue_scan(120, 160)
+        self.assertEqual(self.loader.jobs[-1], ("scan", token, 120, 160))
+        self.assertIn(("opening_progress", token, 0, 41, "ocr"), world.events)
+
+    def test_stop_drops_the_choice(self) -> None:
+        token = self.open_scan()
+        self.loader.scanChoice.emit(token, 160, 160)
+        self.e.openingCancelled.emit(token)
+        self.assertIsNone(self.app._scan)
+        self.app.continue_scan(1, 50)
+        self.assertNotIn("scan", [j[0] for j in self.loader.jobs])
+
+    def test_a_low_resolution_scan_says_so_once_it_reads(self) -> None:
+        token = self.open_scan()
+        raw = loaded("Text found. More text.", pages=2)
+        raw.scan_dpi = 120
+        self.loader.built.emit(token, FakeDoc(), raw)
+        self.assertEqual(self.p.notes, [("Some words may be wrong in this scan", "Caution")])
+
+    def test_try_again_opens_the_same_file(self) -> None:
+        self.open_scan()
+        jobs = len(self.loader.jobs)
+        self.app.retry_scan()
+        self.assertEqual(self.loader.jobs[jobs][0], "open")
 
 
 class CommandLineTests(unittest.TestCase):

@@ -51,6 +51,15 @@ class BuiltInListTests(VoiceCase):
         self.assertEqual(self.page.caption.accessibleName(), "35 English voices, grouped by accent")
         self.assertEqual(self.ctl.fetches, 0)
 
+    def test_windows_voices_are_listed_last_and_said_to_sound_more_robotic(self) -> None:
+        from saylight.voices.windows import describe_voice
+        token = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens\MSTTS_V110_enUS_ZiraM"
+        zira = describe_voice(token, "Microsoft Zira", "en-US", 1)
+        self.ctl.catalog._local = lambda: [zira]
+        self.page.sync()
+        self.assertEqual(self.headers()[-1], "English (United States) · on this PC · sounds more robotic")
+        self.assertIs(self.list.rows[-1][1], zira)
+
     def test_ava_is_the_marked_default_and_chosen(self) -> None:
         from saylight.ui.voice_page import voice_detail
         ava = self.list.rows[1][1]

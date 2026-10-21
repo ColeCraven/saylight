@@ -20,6 +20,15 @@ BAR_TABLE = {
 READING_FRAMES = ((6, 12, 8, 4), (8, 9, 12, 6), (10, 6, 10, 9), (7, 10, 6, 12),
                   (5, 12, 9, 8), (9, 8, 12, 5), (12, 6, 8, 7), (8, 10, 5, 10))
 WAVE_FRAMES = ((10, 4, 4, 4), (6, 10, 4, 4), (4, 6, 10, 4), (4, 4, 6, 10), (4, 4, 4, 6), (4, 4, 4, 4))
+# The OCR notices' tooltips (engine.OCR_LABELS has the panel's labels).
+OCR_TIPS = {"screen_nothing": "Saylight · No text found in that area",
+            "screen_too_large": "Saylight · Area too large",
+            "screen_language": "Saylight · Can't read the screen (language pack needed)",
+            "screen_error": "Saylight · Couldn't read the screen",
+            "scan_nothing": "Saylight · No text found in this scan",
+            "scan_language": "Saylight · Can't read this scan",
+            "scan_error": "Saylight · Couldn't read this scan"}
+SELECTING_TIP = "Saylight · Drag over the text to read (Esc cancels)"
 
 
 def speed_label(v: float) -> str:
@@ -127,6 +136,8 @@ class Tray:
         self._badge_timer.setSingleShot(True)
         self._badge_timer.timeout.connect(self._clear_badge)
         self._badge: str | None = None
+        self._selecting = False
+        self._info_kind = ""
         theme.changed.connect(self._refresh_icon)
         self._refresh_icon()
         self.icon.setToolTip("Saylight · Ready")
@@ -152,12 +163,17 @@ class Tray:
         elif state == "open_failed":  # a Caution dot stays while the notice is up; a Critical one for 60 s
             critical = info.get("kind") in ("corrupt", "io", "missing")
             self._set_badge("Critical" if critical else "Caution", 60_000 if critical else 0)
+        elif state == "ocr_notice":  # a Caution dot for 3 s, a Critical one for 60 s
+            critical = info.get("severity") == "critical"
+            if was != "ocr_notice" or self._info_kind != info.get("notice"):
+                self._set_badge("Critical" if critical else "Caution", 60_000 if critical else 3000)
         elif state in ("copying", "opening", "preparing", "reading", "waiting", "paused"):
             self._set_badge(None, 0)
         elif was == "open_failed" and self._badge == "Caution":
             self._set_badge(None, 0)
+        self._info_kind = info.get("notice", "")
         animated = (state in ("copying", "opening", "preparing", "reading", "waiting")
-                    and not self.theme.reduced_motion)
+                    and info.get("open_phase") != "choice" and not self.theme.reduced_motion)
         if animated and not self._anim.isActive():
             self._frame = 0
             self._anim.start()
@@ -165,6 +181,12 @@ class Tray:
             self._anim.stop()
         self._refresh_icon()
         self.icon.setToolTip(self._tooltip()[:127])
+
+    def set_selecting(self, on: bool) -> None:
+        """The selection overlay is open: the tooltip says how to use it (the icon stays as it was)."""
+        if on != self._selecting:
+            self._selecting = on
+            self.icon.setToolTip(self._tooltip()[:127])
 
     def _set_badge(self, token: str | None, ms: int) -> None:
         self._badge = token
@@ -187,7 +209,9 @@ class Tray:
         fg = t.tray_color("Foreground")
         state = self._state
         spec = {"mode": "idle", "color": fg, "frame": self._frame, "opacity": 1.0}
-        if state in ("copying", "opening", "preparing", "waiting"):
+        if state == "opening" and self._info.get("open_phase") == "choice":
+            pass  # waiting for the person: the idle bars
+        elif state in ("copying", "opening", "preparing", "waiting"):
             spec["mode"] = "wave"
         elif state == "reading":
             spec["mode"] = "reading" if not t.reduced_motion else "idle"
@@ -212,6 +236,8 @@ class Tray:
         return text
 
     def _state_tooltip(self) -> str:
+        if self._selecting:
+            return SELECTING_TIP
         i = self._info
         st = self._state
         counter = f"{i.get('sentence', 0) + 1} of {i.get('total', 0)}" if i.get("total") else ""
@@ -222,6 +248,17 @@ class Tray:
             return f"Saylight · {label}\nClick to show or hide · Ctrl+` reads"
         if st == "ready_offline":
             return "Saylight · Offline (reading needs internet)"
+        if st == "opening" and i.get("open_phase") == "choice":
+            return "Saylight · Choose which pages to read"
+        if st == "opening" and i.get("open_phase") == "ocr":
+            page, total = i.get("ocr_page") or 0, i.get("ocr_total") or 0
+            if total:
+                return f"Saylight · Finding the text, page {page:,} of {total:,}"
+            return "Saylight · Finding the text…"
+        if st == "opening" and i.get("open_kind") == "screen":
+            return "Saylight · Finding the text…"
+        if st == "ocr_notice":
+            return OCR_TIPS.get(i.get("notice", ""), "Saylight · Couldn't read the screen")
         if st == "opening" and i.get("open_kind") == "file":
             title = elide_middle(i.get("title", ""), 40)
             done, total = i.get("open_done") or 0, i.get("open_total") or 0
@@ -288,6 +325,12 @@ class Tray:
         hud.setCheckable(True)
         hud.setChecked(bool(ctl.settings.get("hud_when_hidden")))
         hud.triggered.connect(lambda on: ctl.settings.set("hud_when_hidden", on))
+        if hasattr(ctl, "toggle_ruler"):
+            chord = getattr(ctl, "ruler_shortcut", lambda: "")()
+            ruler = m.addAction("Reading ruler" + (f"\t{chord}" if chord else ""))
+            ruler.setCheckable(True)
+            ruler.setChecked(bool(ctl.settings.get("ruler.enabled")))
+            ruler.triggered.connect(lambda on: ctl.toggle_ruler(on))
         m.addSeparator()
         state = self._state
         can_type = bool(self._info.get("can_type"))
@@ -301,7 +344,12 @@ class Tray:
             m.addAction("Enter PDF password…", lambda: ctl.open_password("tray"))
         compose = m.addAction("Type or paste text…", lambda: ctl.open_compose("tray"))
         compose.setEnabled(can_type)
-        under = self._info.get("underlying") if state in ("open_failed", "nothing_selected") else state
+        if hasattr(ctl, "read_from_screen"):
+            chord = getattr(ctl, "screen_shortcut", lambda: "")()
+            screen = m.addAction("Read from screen…" + (f"\t{chord}" if chord else ""),
+                                 lambda: ctl.read_from_screen("tray"))
+            screen.setEnabled(state not in ("copying", "opening"))
+        under = self._info.get("underlying") if state in ("open_failed", "nothing_selected", "ocr_notice") else state
         if under in ("copying", "opening", "preparing", "reading", "waiting", "paused"):
             m.addAction("Resume" if under == "paused" else "Pause", ctl.engine.toggle_pause)
             m.addAction("Stop", ctl.engine.stop)

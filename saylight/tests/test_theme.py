@@ -1,4 +1,5 @@
-"""Tests for theme.py: contrast guard, colour tokens, high contrast, tray colours, k, motion, fonts, presets.
+"""Tests for theme.py: contrast guard, colour tokens, high contrast, tray colours, k, motion, fonts, presets, and
+the colours of the screen-selection overlay, the marks drawn on the screen and the reading ruler.
 
 A fake SystemAdapter stands in for win32.py. Font tests need the real `windows` platform and skip otherwise.
 """
@@ -13,7 +14,7 @@ import unittest
 from unittest import mock
 
 from PySide6.QtCore import QCoreApplication, QEasingCurve, QObject, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QGuiApplication
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QGuiApplication, QRawFont
 from PySide6.QtWidgets import QApplication
 
 from saylight import settings as S
@@ -43,7 +44,7 @@ class FakeSettings(QObject):
     def __init__(self, **values: str) -> None:
         super().__init__()
         self.values = {"text_size": "medium", "reading_tint": "auto", "reading_font": "verdana", "spacing": "wide",
-                       **values}
+                       "ruler.dim": "medium", **values}
 
     def get(self, key: str) -> str:
         return self.values[key]
@@ -214,14 +215,19 @@ class TestTokens(unittest.TestCase):
 
     def test_every_token_in_every_mode(self) -> None:
         self.assertEqual(set(T._HC), set(T.TOKENS))
-        outlines = {"HoverOutline", "TrackOutline", "DisabledOutline"}
+        clear = {"HoverOutline", "TrackOutline", "DisabledOutline", "ModeFrame"}
+        see_through = {"Scrim": 0x66, "SelectionHalo": 0x80}  # the selection overlay's scrim and ring halo
         for overrides in ({}, {"scheme_dark": False}, {"hc": True}):
+            hc = bool(overrides.get("hc"))
             theme = make(**overrides)
             for token in T.TOKENS:
                 color = theme.color(token)
                 self.assertTrue(color.isValid(), (overrides, token))
-                transparent = token in outlines and not overrides.get("hc")
-                self.assertEqual(color.alpha(), 0 if transparent else 255, (overrides, token))
+                if hc:
+                    alpha = 0 if token == "Scrim" else 255
+                else:
+                    alpha = 0 if token in clear else see_through.get(token, 255)
+                self.assertEqual(color.alpha(), alpha, (overrides, token))
 
     def test_derived_tokens(self) -> None:
         for dark, hl, paused in ((True, 0.28, 0.12), (False, 0.18, 0.08)):
@@ -261,7 +267,8 @@ class TestHighContrast(unittest.TestCase):
                   "Caution": "windowtext", "Critical": "windowtext", "Track": "window",
                   "SubtleHover": "window", "HoverOutline": "highlight", "TrackOutline": "windowtext",
                   "WordHighlight": "highlight", "WordHighlightText": "highlighttext", "Buffered": "window",
-                  "ProgressInactive": "windowtext", "SegmentTrack": "window", "SegmentSelected": "window"}
+                  "ProgressInactive": "windowtext", "SegmentTrack": "window", "SegmentSelected": "window",
+                  "SelectionEdge": "highlight", "SelectionHalo": "window", "ModeFrame": "highlight"}
         for token, name in expect.items():
             self.assertEqual(theme.color(token), QColor(*HC_COLORS[name]), token)
         self.assertTrue(theme.high_contrast)
@@ -292,6 +299,80 @@ class TestHighContrast(unittest.TestCase):
         self.assertEqual(theme.color("Surface"), QColor(*T._HC_DEFAULT["window"]))
         self.assertEqual(theme.color("Accent"), QColor(*T._HC_DEFAULT["highlight"]))
         self.assertEqual(theme.color("TextDisabled"), QColor(*T._HC_DEFAULT["graytext"]))
+
+
+class TestScreenColors(unittest.TestCase):
+    """The selection overlay's tokens, the marks drawn on the screen, and the reading ruler."""
+
+    # (page, ink, light page): the reference pages the on-screen marks are checked against.
+    PAGES = (("#FFFFFF", "#000000", True), ("#FFFFFF", "#1A1A1A", True), ("#FAF5E9", "#24211C", True),
+             ("#1E1E1E", "#E6E6E6", False), ("#000000", "#FFFFFF", False), ("#1E1E1E", "#CCCCCC", False))
+
+    def test_overlay_tokens(self) -> None:
+        for dark in (True, False):
+            theme = make(scheme_dark=dark)
+            self.assertEqual(theme.color("Scrim"), QColor(0, 0, 0, 0x66))  # 40% black
+            self.assertEqual(theme.color("SelectionEdge"), QColor("#FFFFFF"))
+            self.assertEqual(theme.color("SelectionHalo"), QColor(0, 0, 0, 0x80))
+            self.assertEqual(theme.color("ModeFrame").alpha(), 0)
+        hc = make(hc=True)
+        self.assertEqual(hc.color("Scrim").alpha(), 0)  # high contrast draws the frame instead of a scrim
+        self.assertEqual(hc.color("SelectionEdge"), QColor(*HC_COLORS["highlight"]))
+        self.assertEqual(hc.color("SelectionHalo"), QColor(*HC_COLORS["window"]))
+        self.assertEqual(hc.color("ModeFrame"), QColor(*HC_COLORS["highlight"]))
+        self.assertNotIn(T.HC_TRANSPARENT, T.SYS_COLOR_NAMES)  # never read from Windows
+        self.assertEqual({name for name in T._HC.values()} - set(T.SYS_COLOR_NAMES), {T.HC_TRANSPARENT})
+
+    def test_mark_colour_follows_the_tint_on_light_pages(self) -> None:
+        for dark in (True, False):
+            for tint, expected in (("auto", "#A9C8F2"), ("cream", "#A9C8F2"), ("peach", "#98BBE8"),
+                                   ("blue", "#E9B949"), ("dark", "#36527F")):
+                theme = make(FakeSettings(reading_tint=tint), scheme_dark=dark)
+                self.assertEqual(hexes(theme.screen_mark_color(True)), expected, (dark, tint))
+                self.assertEqual(hexes(theme.screen_mark_color(False)), "#36527F", (dark, tint))
+        self.assertEqual(hexes(make(FakeSettings(reading_tint="neon")).screen_mark_color(True)), "#A9C8F2")
+        self.assertEqual(make(hc=True).screen_mark_color(True), QColor(*HC_COLORS["highlight"]))
+
+    def test_page_ink_stays_readable_under_every_mark(self) -> None:
+        self.assertEqual(T.SCREEN_MARK_ALPHA,
+                         {"band": 0.16, "band_sentence": 0.24, "word": 0.40, "word_paused": 0.20})
+        for tint in T.READING_PRESETS:
+            for dark in (True, False):
+                theme = make(FakeSettings(reading_tint=tint), scheme_dark=dark)
+                for page, ink, light in self.PAGES:
+                    mark = theme.screen_mark_color(light)
+                    for part, alpha in T.SCREEN_MARK_ALPHA.items():
+                        with self.subTest(tint=tint, dark=dark, page=page, ink=ink, part=part):
+                            under = composite(mark, alpha, QColor(page))
+                            self.assertGreaterEqual(contrast_ratio(QColor(ink), under), 7.0)
+
+    def test_ruler_tables_match_settings(self) -> None:
+        self.assertEqual(tuple(T.RULER_BAND), S.RULER_HEIGHTS)
+        self.assertEqual(tuple(T.RULER_DIM), S.RULER_DIMS)
+        self.assertEqual(T.RULER_BAND, {"small": 36, "medium": 72, "large": 120})
+        self.assertEqual(T.RULER_DIM, {"light": 0.40, "medium": 0.60, "strong": 0.80})
+
+    def test_ruler_dims_with_the_reading_background(self) -> None:
+        for dark, background in ((True, "#1F2023"), (False, "#FAF5E9")):  # Automatic follows the app theme
+            settings = FakeSettings()
+            theme = make(settings, scheme_dark=dark)
+            reading = theme.reading_colors()
+            for level, alpha in T.RULER_DIM.items():
+                settings.values["ruler.dim"] = level
+                for colors in (theme.ruler_colors(), theme.ruler_colors(level)):
+                    with self.subTest(dark=dark, level=level):
+                        self.assertEqual(colors["dim"].name().upper(), background)
+                        self.assertEqual(colors["dim"].alpha(), round(alpha * 255))
+                        self.assertEqual(colors["edge"], reading["edge"])
+                        self.assertEqual(colors["line"], reading["highlight"])
+        peach = make(FakeSettings(reading_tint="peach")).ruler_colors("strong")
+        self.assertEqual(peach["dim"].name().upper(), "#EDD1B0")
+
+    def test_high_contrast_ruler_has_lines_and_no_dimming(self) -> None:
+        colors = make(hc=True).ruler_colors()
+        self.assertEqual(colors["dim"].alpha(), 0)
+        self.assertEqual(colors["line"], QColor(*HC_COLORS["highlight"]))
+        self.assertEqual(colors["edge"], QColor(*HC_COLORS["highlight"]))
 
 
 class TestTray(unittest.TestCase):
@@ -490,7 +571,8 @@ class TestReadingPresets(unittest.TestCase):
 
 class TestFonts(unittest.TestCase):
     GLYPHS = (0xF5B0, 0xF8AE, 0xE72C, 0xF8AC, 0xF8AD, 0xE921, 0xE738, 0xE710, 0xE74F, 0xE993, 0xE994, 0xE995,
-              0xE992, 0xF384, 0xE783, 0xE946, 0xF16A)  # every icon the UI draws
+              0xE992, 0xF384, 0xE783, 0xE946, 0xF16A,
+              0xF683, 0xE9A6, 0xF2B7, 0xE8FE, 0xE7C3)  # every icon the UI draws
 
     def setUp(self) -> None:
         if not isinstance(_app, QGuiApplication) or QGuiApplication.platformName() != "windows":
@@ -518,6 +600,18 @@ class TestFonts(unittest.TestCase):
         metrics = QFontMetricsF(make(families=None).font("icon16"))
         for cp in self.GLYPHS:
             self.assertTrue(metrics.inFontUcs4(cp), hex(cp))
+
+    def test_segoe_mdl2_lacks_only_the_screen_glyph(self) -> None:
+        """Windows 10 without Segoe Fluent Icons: controls.icon() swaps U+F683 for U+E9A6."""
+        if "Segoe MDL2 Assets" not in QFontDatabase.families():
+            self.skipTest("Segoe MDL2 Assets is not installed")
+        font = QFont("Segoe MDL2 Assets")
+        font.setPixelSize(16)
+        raw = QRawFont.fromFont(font)  # the font file itself; QFontMetricsF would count fallback fonts too
+        self.assertFalse(raw.supportsCharacter(0xF683))
+        for cp in self.GLYPHS:
+            if cp != 0xF683:
+                self.assertTrue(raw.supportsCharacter(cp), hex(cp))
 
     def test_fallback_families(self) -> None:
         theme = make(families={"Segoe UI", "Segoe MDL2 Assets"})

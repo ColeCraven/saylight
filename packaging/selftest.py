@@ -13,8 +13,10 @@ Two ways in:
 
 The checks: every saylight module imports; Qt finds its windows platform, ico and network-information plugins;
 the fonts and the tray are there; certifi and Windows' certificate store load; edge-tts ships as plain .py
-files; a small PDF made by the test opens through the build's own pypdf; no Python or Qt DLL is loaded from
-outside the build. With network: edge-tts lists voices and
+files; a small PDF made by the test opens through the build's own pypdf; Windows OCR finds a fixed sentence the
+test draws in memory, and in that PDF rendered as a scan, through the build's own WinRT bindings (without their
+MSVCP140.dll); Windows' voices are listed (nothing is spoken); no Python or Qt DLL is loaded from outside the
+build. With network: edge-tts lists voices and
 synthesises one fixed word into memory, and Windows' MCI opens and measures that audio with the volume at 0
 without playing it. The report holds counts, versions and file names from the build, never user text.
 """
@@ -34,6 +36,9 @@ SAMPLE = "Testing."  # the only text ever sent to the voice service, and only wi
 # Tcl/Tk's data in _tcl_data and _tk_data.
 NOT_IMPORTABLE = ("PIL", "numpy", "tkinter", "_tkinter")
 NOT_BUNDLED = ("PIL", "numpy", "numpy.libs", "tkinter", "_tcl_data", "_tk_data", "tcl", "tk")
+# winrt-runtime ships its own MSVCP140.dll; the build leaves it out and uses the one PySide6 loads first.
+NOT_BUNDLED_FILES = (r"winrt\msvcp140.dll",)
+OCR_SAMPLE = "Saylight reads this sentence."  # drawn in memory for the OCR check; never anyone's text
 # SpecialBuild string saylight.spec writes into a test copy's exe (make_test_copy.BUILD_STAMP). The command line
 # below never starts an exe without it: a release build answers to the real quit event and shortcut.
 TEST_BUILD_STAMP = "Test copy"
@@ -229,7 +234,7 @@ def main(argv: list[str]) -> int:
     def contents():
         import importlib.util
         internal = _internal_dir()
-        present = [n for n in NOT_BUNDLED if os.path.exists(os.path.join(internal, n))]
+        present = [n for n in NOT_BUNDLED + NOT_BUNDLED_FILES if os.path.exists(os.path.join(internal, n))]
         present += [f"import {n}" for n in NOT_IMPORTABLE if importlib.util.find_spec(n) is not None]
         qt = [f for f in ("Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll")
               if os.path.isfile(os.path.join(internal, "PySide6", f))]
@@ -260,6 +265,76 @@ def main(argv: list[str]) -> int:
         return {"pypdf": pypdf.__version__, "characters": len(raw.text),
                 "cryptography": importlib.util.find_spec("cryptography") is not None}
     check("documents", documents)
+
+    def on_worker(fn):
+        """Run fn on a plain thread (blocking WinRT calls refuse the GUI thread) and return what it returned."""
+        import threading
+        box: dict = {}
+
+        def run():
+            try:
+                box["value"] = fn()
+            except BaseException as e:
+                box["error"] = e
+        thread = threading.Thread(target=run, name="saylight.selftest", daemon=True)
+        thread.start()
+        thread.join(60)
+        if thread.is_alive():
+            raise TimeoutError("no answer in 60 s")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def ocr():
+        """Windows OCR through the build's own winrt, on a sentence drawn here (memory only)."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QColor, QFont, QImage, QPainter
+
+        import winrt
+        from saylight import winrt_support
+        from saylight.ocr import engine, layout
+        image = QImage(900, 120, QImage.Format.Format_ARGB32)
+        image.fill(QColor("white"))
+        p = QPainter(image)
+        font = QFont("Segoe UI")
+        font.setPixelSize(36)
+        p.setFont(font)
+        p.setPen(QColor("black"))
+        p.drawText(image.rect(), Qt.AlignmentFlag.AlignCenter, OCR_SAMPLE)
+        p.end()
+        langs = on_worker(engine.user_languages)
+        text = on_worker(lambda: layout.to_text(engine.recognize_blocking(image))).text
+        where = os.path.abspath(list(winrt.__path__)[0])
+        if not where.startswith(_internal_dir()):
+            raise RuntimeError("winrt was loaded from outside the build")
+        if " ".join(text.split()) != OCR_SAMPLE:
+            raise RuntimeError(f"found {len(text)} characters, not the sentence")
+        return {"languages": len(langs), "characters": len(text), "available": winrt_support.available()}
+    check("ocr", ocr)
+
+    def scanned_pdf():
+        """The small PDF rendered by Windows.Data.Pdf in memory, then read with OCR, as a scanned page is."""
+        from saylight.documents import pdf_ocr
+        pages = on_worker(lambda: pdf_ocr.ocr_pages(_tiny_pdf(), [1], progress=lambda _d, _t: None,
+                                                    cancelled=lambda: False))
+        text = " ".join(pages[0].text.split()) if pages else ""
+        if OCR_SAMPLE not in text:
+            raise RuntimeError(f"found {len(text)} characters on the rendered page")
+        return {"characters": len(text)}
+    check("scanned_pdf", scanned_pdf)
+
+    def windows_voices():
+        """Windows' own voices are listed through the build's winrt (nothing is spoken)."""
+        from saylight import winrt_support
+
+        def voices():
+            synthesis = winrt_support.load("media.speechsynthesis")
+            return [v.display_name for v in synthesis.SpeechSynthesizer.all_voices]
+        names = on_worker(voices)
+        if not names:
+            raise RuntimeError("no Windows voices")
+        return {"voices": len(names)}
+    check("windows_voices", windows_voices, required=False)
 
     mp3: list[bytes] = []
     if offline:

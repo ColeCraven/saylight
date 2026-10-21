@@ -2,7 +2,7 @@
 
 Hotkeys are harmless chords (Ctrl+Alt+Shift+F24/F23/F22), pressed with SendInput: the foreground app
 only sees modifier and unassigned-key events. The real copy job is replaced by a fake in every test,
-so no Ctrl+C is ever sent. Media keys are never really registered (a fake registrar is used).
+so no Ctrl+C is ever sent. Media keys and Esc are never really registered (a fake registrar is used).
 """
 
 import threading
@@ -14,7 +14,8 @@ from PySide6.QtCore import QCoreApplication, QEventLoop, QThread
 from PySide6.QtWidgets import QApplication
 
 from saylight import clipboard, input_thread, win32
-from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, InputThread
+from saylight.input_thread import (HK_COMPOSE, HK_ESCAPE, HK_PANEL, HK_PAUSE, HK_READ, HK_READ_SCREEN, HK_RULER,
+                                   InputThread)
 from saylight.tests.test_win32 import CrossProcessLock, _hidden_window
 
 F24, F23, F22 = "Ctrl+Alt+Shift+F24", "Ctrl+Alt+Shift+F23", "Ctrl+Alt+Shift+F22"
@@ -65,6 +66,7 @@ class Recorder:
         t.copied.connect(lambda token, text, reason: self._add("copied", token, text, reason))
         t.composeReadPressed.connect(lambda: self._add("compose_read"))
         t.quitRequested.connect(lambda: self._add("quit"))
+        t.overlayCancelPressed.connect(lambda reason: self._add("overlay_cancel", reason))
 
     def _add(self, *event):
         self.events.append(event)
@@ -490,6 +492,160 @@ class ComposeGateTests(ThreadTestCase):
         self.assertTrue(pump_until(lambda: len(rec.of("registered")) == 4))
         self.assertEqual(rec.of("registered")[-1], ("registered", HK_READ, True))
         self.assertTrue(chord_free(F23), "the compose chord stayed registered")
+
+
+class OverlayGateTests(ThreadTestCase):
+    """While the screen-selection overlay is open. Registration is faked throughout, so Esc (and every other
+    key) stays free for the apps on this PC; presses are posted WM_HOTKEY messages."""
+
+    def setUp(self):
+        super().setUp()
+        self.registered: list[tuple] = []
+        self.unregistered: list[int] = []
+        self.refuse: set[int] = set()
+
+        def register(hk_id, mods, vk):
+            self.registered.append((hk_id, mods, vk))
+            return hk_id not in self.refuse
+
+        for name, fake in (("register_hotkey", register),
+                           ("unregister_hotkey", lambda hk: self.unregistered.append(hk) or True)):
+            patcher = mock.patch.object(win32, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def post(self, t: InputThread, hk_id: int) -> None:
+        self.assertTrue(win32.post_thread_message(t._thread_id, win32.WM_HOTKEY, hk_id, 0))
+
+    def test_screen_and_ruler_shortcuts_register_only_when_set(self):
+        t, rec = self.start({HK_READ: F24, HK_READ_SCREEN: "", HK_RULER: ""})
+        self.assertEqual([r[0] for r in self.registered], [HK_READ])
+        t.set_hotkeys({HK_READ: F24, HK_READ_SCREEN: F23, HK_RULER: F22})
+        self.assertTrue(pump_until(lambda: len(self.registered) == 3))
+        self.assertEqual([r[0] for r in self.registered], [HK_READ, HK_READ_SCREEN, HK_RULER])
+        self.post(t, HK_READ_SCREEN)
+        self.post(t, HK_RULER)
+        self.assertTrue(pump_until(lambda: len(rec.of("hotkey")) == 2))
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_READ_SCREEN), ("hotkey", HK_RULER)])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_escape_registers_without_modifiers_and_unregisters(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: ("registered", HK_ESCAPE, True) in rec.events))
+        self.assertEqual(self.registered[-1], (HK_ESCAPE, win32.MOD_NOREPEAT, 0x1B))
+        t.set_escape_hotkey(True)  # already on: nothing new
+        t.set_escape_hotkey(False)
+        self.assertTrue(pump_until(lambda: HK_ESCAPE in self.unregistered))
+        self.assertEqual(sum(1 for r in self.registered if r[0] == HK_ESCAPE), 1)
+
+    def test_escape_taken_by_another_app_is_reported(self):
+        self.refuse.add(HK_ESCAPE)
+        t, rec = self.start({})
+        with self.assertLogs("saylight.input_thread", "WARNING"):
+            t.set_escape_hotkey(True)
+            self.assertTrue(pump_until(lambda: rec.of("registered")))
+        self.assertEqual(rec.of("registered"), [("registered", HK_ESCAPE, False)])
+
+    def test_open_overlay_turns_every_shortcut_into_a_cancel(self):
+        t, rec = self.start({HK_READ: F24, HK_PANEL: F23, HK_READ_SCREEN: F22})
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: ("registered", HK_ESCAPE, True) in rec.events))
+        t.set_overlay_open(True)
+        for hk_id in (HK_READ, HK_PANEL, HK_READ_SCREEN, HK_ESCAPE):
+            self.post(t, hk_id)
+        self.assertTrue(pump_until(lambda: len(rec.of("overlay_cancel")) == 4))
+        pump_for(0.1)
+        self.assertEqual(rec.of("overlay_cancel"), [("overlay_cancel", "hotkey")] * 3 + [("overlay_cancel", "esc")])
+        self.assertEqual((rec.of("hotkey"), rec.of("copied"), self.fake.calls), ([], [], []))  # Ctrl+` never copies
+        self.assertTrue(all(rec.on_gui))
+
+    def test_media_keys_keep_their_meaning_while_selecting(self):
+        t, rec = self.start({})
+        t.set_media_keys(True)
+        self.assertTrue(pump_until(lambda: len(rec.of("registered")) == 4))
+        t.set_overlay_open(True)
+        self.post(t, input_thread.HK_MEDIA_PLAY_PAUSE)
+        self.assertTrue(pump_until(lambda: rec.of("hotkey")))
+        self.assertEqual(rec.of("hotkey"), [("hotkey", input_thread.HK_MEDIA_PLAY_PAUSE)])
+        self.assertEqual(rec.of("overlay_cancel"), [])
+
+    def test_closed_overlay_restores_shortcuts_and_drops_a_late_escape(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: ("registered", HK_ESCAPE, True) in rec.events))
+        t.set_overlay_open(True)
+        t.set_overlay_open(False)
+        self.post(t, HK_ESCAPE)   # pressed just as the overlay closed, before Esc was released
+        self.post(t, HK_READ)
+        self.assertTrue(pump_until(lambda: rec.of("copied")))
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_READ)])
+        self.assertEqual(rec.of("overlay_cancel"), [])
+
+    def watch(self, **timing) -> tuple[set[int], list[int]]:
+        """Fake "Not responding" for the windows in the returned set; end_process calls land in the list."""
+        hung: set[int] = set()
+        ended: list[int] = []
+        fakes = [(win32, "is_hung_window", lambda h: h in hung), (win32, "end_process", ended.append)]
+        fakes += [(input_thread, name, value) for name, value in timing.items()]
+        for target, name, fake in fakes:
+            patcher = mock.patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return hung, ended
+
+    def test_a_hung_app_never_leaves_the_overlay_over_every_screen(self):
+        # Esc reaches the GUI thread, which closes the overlay. If that thread stops answering, nothing else
+        # can take the overlay down, so the input thread ends the process.
+        hung, ended = self.watch(CANCEL_GRACE_S=0.05, HANG_CHECK_MS=20)
+        t, rec = self.start({HK_READ: F24})
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: ("registered", HK_ESCAPE, True) in rec.events))
+        t.set_overlay_open(True, hwnds=[901, 902])
+        self.post(t, HK_ESCAPE)
+        self.assertTrue(pump_until(lambda: rec.of("overlay_cancel")))
+        pump_for(0.2)
+        self.assertEqual(ended, [])   # still answering: the app closes it as usual
+        with self.assertLogs("saylight.input_thread", "ERROR") as logs:
+            hung.add(902)
+            self.assertTrue(pump_until(lambda: ended))
+        self.assertEqual(ended[0], 1)
+        self.assertIn("Screen: overlay not answering, quitting", "\n".join(logs.output))
+
+    def test_past_the_idle_timeout_a_hung_app_ends_without_a_press(self):
+        # Esc may belong to another app, and a right-click goes to the hung thread
+        hung, ended = self.watch(IDLE_WATCH_S=0.05, HANG_CHECK_MS=20)
+        hung.add(901)
+        t, rec = self.start({})
+        t.set_overlay_open(True, hwnds=[901])
+        t.set_overlay_open(False)   # closed in time: not watched
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: rec.of("registered")))
+        pump_for(0.2)
+        self.assertEqual(ended, [])
+        with self.assertLogs("saylight.input_thread", "ERROR"):
+            t.set_overlay_open(True, hwnds=[901])
+            self.assertTrue(pump_until(lambda: ended))
+        t.set_overlay_open(False)
+        t.set_escape_hotkey(False)   # the overlay closed: the watch stops
+        self.assertTrue(pump_until(lambda: HK_ESCAPE in self.unregistered))
+        count = len(ended)
+        t.set_overlay_open(True, hwnds=[901])
+        pump_for(0.2)
+        self.assertEqual(len(ended), count)
+
+    def test_reregistering_shortcuts_keeps_escape(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_escape_hotkey(True)
+        self.assertTrue(pump_until(lambda: ("registered", HK_ESCAPE, True) in rec.events))
+        t.set_hotkeys({HK_READ: F23})
+        self.assertTrue(pump_until(lambda: len(self.registered) == 3))
+        self.assertNotIn(HK_ESCAPE, self.unregistered)
+        t.set_overlay_open(True)
+        self.post(t, HK_ESCAPE)
+        self.assertTrue(pump_until(lambda: rec.of("overlay_cancel")))
+        t.stop()
+        self.assertIn(HK_ESCAPE, self.unregistered)  # released when the thread stops
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ from ..audio_cache import AudioCache
 from ..player import PlayerThread
 from ..voices import preview
 from ..voices.base import DEFAULT_VOICE_ID, VoiceInfo, Word, parse_voice_id
-from ..voices.catalog import CURATED, LOCALES, VoiceCatalog, display_name, parse_online_list
+from ..voices.catalog import CURATED, LOCALES, WINDOWS_DETAIL, VoiceCatalog, display_name, parse_online_list
 from ..voices.edge import EdgeBackend
 from ..voices.preview import SAMPLE_TEXT, VoicePreview
 from . import test_engine as TE
@@ -183,11 +183,12 @@ class CatalogTests(unittest.TestCase):
                     cat.refresh_online()
                     self.assertTrue(spin_until(lambda: cat.status == "failed", 5))
 
-    def test_local_voices_come_first(self):
-        david = VoiceInfo("windows:David", "windows", "David", "en-US", "Male", True, detail="Windows voice · offline")
+    def test_local_voices_come_after_the_online_ones(self):
+        david = VoiceInfo("windows:David", "windows", "David", "en-US", "Male", True, detail=WINDOWS_DETAIL)
         cat = VoiceCatalog(local=lambda: [david])
-        self.assertEqual(cat.voices()[0], david)
-        self.assertEqual(cat.voices()[1:], list(CURATED))
+        self.assertEqual(cat.voices()[:-1], list(CURATED))
+        self.assertEqual(cat.voices()[-1], david)
+        self.assertEqual(cat.find("windows:David"), david)
 
     def test_default_fetch_uses_edge_tts_list_voices(self):
         calls = []

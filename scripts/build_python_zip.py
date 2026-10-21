@@ -21,6 +21,17 @@ REQUIREMENTS = """\
 edge-tts>=7.3.1,<8
 PySide6-Essentials>=6.12,<7
 pypdf>=6.14.2,<7
+winrt-runtime>=3.2.1,<4
+winrt-Windows.Foundation>=3.2.1,<4
+winrt-Windows.Foundation.Collections>=3.2.1,<4
+winrt-Windows.Storage>=3.2.1,<4
+winrt-Windows.Storage.Streams>=3.2.1,<4
+winrt-Windows.Graphics.Imaging>=3.2.1,<4
+winrt-Windows.Media.Ocr>=3.2.1,<4
+winrt-Windows.Globalization>=3.2.1,<4
+winrt-Windows.Data.Pdf>=3.2.1,<4
+winrt-Windows.Media.SpeechSynthesis>=3.2.1,<4
+winrt-Windows.Media.Core>=3.2.1,<4
 """
 
 INSTALL_CMD = r"""@echo off

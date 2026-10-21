@@ -15,6 +15,10 @@ clock. Never logs text, only counts and ids.
 
 Files come in through begin_opening() (the Opening state, which keeps the current document until the new
 one is built), then read_document() or opening_failed() (an open notice that stays until the next action).
+Reading from the screen opens the same way (kind "screen", "Finding the text…"); a scanned PDF adds the OCR
+phase (opening_progress(..., phase="ocr")) and, when it is long, a wait for the person to choose pages
+(opening_choice). A failed screen or scan opening goes back to the state under it, with an OCR notice over it
+(ocr_notice).
 The optional builder, resume store and pronunciation list are duck-typed too:
 * builder(raw) builds a Document with this reading's options; if it also has start(token, raw), text over
   BUILD_ASYNC_CHARS is built on its worker instead and comes back through read_document(..., token=token);
@@ -26,6 +30,7 @@ The optional builder, resume store and pronunciation list are duck-typed too:
 import bisect
 import hashlib
 import logging
+import math
 import os
 import re
 import time
@@ -50,7 +55,7 @@ READY, READY_OFFLINE, SHORTCUT_UNAVAILABLE = "ready", "ready_offline", "shortcut
 COPYING, PREPARING, READING, WAITING, PAUSED = "copying", "preparing", "reading", "waiting", "paused"
 FINISHED, STOPPED, NOTHING_SELECTED = "finished", "stopped", "nothing_selected"
 ERROR_OFFLINE, ERROR_SERVICE, ERROR_PLAYBACK = "error_offline", "error_service", "error_playback"
-OPENING, OPEN_FAILED = "opening", "open_failed"
+OPENING, OPEN_FAILED, OCR_NOTICE = "opening", "open_failed", "ocr_notice"
 
 IDLE = frozenset({READY, READY_OFFLINE, SHORTCUT_UNAVAILABLE})
 ERRORS = frozenset({ERROR_OFFLINE, ERROR_SERVICE, ERROR_PLAYBACK})
@@ -58,7 +63,7 @@ RESTING = IDLE | ERRORS | {FINISHED, STOPPED}          # Nothing selected is an 
 SESSION = frozenset({PREPARING, READING, WAITING, PAUSED})  # a reading is running
 ACTIVE = SESSION | {COPYING, OPENING}
 _PLAYING = frozenset({PREPARING, READING, WAITING})
-OVERLAYS = frozenset({NOTHING_SELECTED, OPEN_FAILED})  # shown over the state underneath (see _underlying)
+OVERLAYS = frozenset({NOTHING_SELECTED, OPEN_FAILED, OCR_NOTICE})  # shown over the state underneath (_underlying)
 
 LABELS = {
     READY: "Ready", READY_OFFLINE: "Offline", SHORTCUT_UNAVAILABLE: "Shortcut unavailable",
@@ -66,8 +71,17 @@ LABELS = {
     WAITING: "Preparing audio…", PAUSED: "Paused", FINISHED: "Finished", STOPPED: "Stopped",
     NOTHING_SELECTED: "Nothing selected", ERROR_OFFLINE: "Can't reach the voice service",
     ERROR_SERVICE: "Voice service error", ERROR_PLAYBACK: "Couldn't play audio",
-    OPENING: "Opening…", OPEN_FAILED: "Can't open this file",
+    OPENING: "Opening…", OPEN_FAILED: "Can't open this file", OCR_NOTICE: "Couldn't read the screen",
 }
+FINDING_LABEL = "Finding the text…"  # reading from the screen, and the OCR phase of a scanned PDF
+SCAN_CHOICE_LABEL = "Scanned PDF"     # a long scan waiting for the person to choose pages
+# The OCR notice's label for each kind (ocr.model.OCR_NOTICE_KINDS). The caution ones go by themselves after
+# OCR_NOTICE_MS; the critical ones stay until the next action.
+OCR_LABELS = {"screen_nothing": "No text found", "screen_too_large": "Area too large",
+              "screen_language": "Can't read the screen", "screen_error": "Couldn't read the screen",
+              "scan_nothing": "No text found", "scan_language": "Can't read this scan",
+              "scan_error": "Couldn't read this scan"}
+OCR_CAUTION = frozenset({"screen_nothing", "screen_too_large", "scan_nothing"})
 # The open notice's label for each kind (LoadError kinds, plus "missing" for a file that has gone).
 OPEN_LABELS = {"password": "Password needed", "protected": "Can't open this PDF", "scanned": "No text to read",
                "empty": "No text to read", "unsupported": "Can't read this file", "too_large": "File too large",
@@ -93,6 +107,12 @@ RESTART_AFTER_MS = 1500       # Previous restarts the sentence when further in t
 SPEED_COMMIT_MS = 400         # a new speed is committed this long after the last change
 NOTE_MS = 3000                # "from next reading" note
 NOTHING_SELECTED_MS = 3000    # the Nothing-selected overlay
+NOTHING_SCREEN_MS = 6000      # ...when it also offers Read from screen (time to reach the chip)
+SCREEN_CHIP_REASONS = frozenset({"empty", "line_copy", "console"})  # the Nothing-selected cards with that chip
+OCR_NOTICE_MS = 8000          # a caution OCR notice
+HOLD_LEAVE_MS = 2000          # a held notice stays at least this long after the pointer leaves the card
+OCR_INFO_S = 2.0              # the OCR page count and time left change at most this often
+OCR_FIRST_GUESS_S = 0.8       # seconds per scanned page before any page has been timed
 PREFETCH_RETRY_MS = 1500      # silent retry of a failed prefetch
 PURGE_MS = 10 * 60 * 1000     # privacy purge after this long at rest
 MEDIA_PAUSE_MS = 10 * 60 * 1000  # media keys stay registered this long into a pause
@@ -315,10 +335,19 @@ class Engine(QObject):
         self._open_prev = READY                # the state under Opening
         self._open_shown = False
         self._open_progress = (0, 0)
+        self._open_phase = "read"              # "read", "ocr" (finding the text in scanned pages) or "choice"
+        self._ocr_started = 0.0                # when the OCR phase started (the clock's time)
+        self._ocr_info: tuple[int, int, int] = (0, 0, -1)  # (page, total, seconds left or -1): what the header says
+        self._ocr_info_at = float("-inf")
+        self._choice: tuple[int, int, int] = (0, 0, 0)     # (scanned, pages, estimated seconds) while choosing
         self._rebuild_live: int | None = None  # the token of a rebuild running on the worker
         self._read_section: str | None = None  # a section to read once the rebuild is in (from Finished)
         self._fail_kind = ""
         self._fail_title = ""
+        self._ocr_kind = ""                    # the OCR notice shown (OCR_LABELS)
+        self._ocr_detail = ""                  # "nothing_speakable": text was found but none of it can be read
+        self._held = False                     # the pointer is over the card: Nothing selected and cautions wait
+        self._overlay_due = 0.0                # when the overlay timer would end it (the clock's time)
 
         # state
         self._state = READY
@@ -599,32 +628,60 @@ class Engine(QObject):
         self._clear_overlay()
         self._rest = self._state
         self._reason = reason
-        self._overlay_timer.start(NOTHING_SELECTED_MS)
+        self._start_overlay_timer(NOTHING_SCREEN_MS if reason in SCREEN_CHIP_REASONS else NOTHING_SELECTED_MS)
         self._set_state(NOTHING_SELECTED)
         self._do_beep("ok")
         self.notice.emit("nothing_selected")
 
     def _clear_overlay(self) -> None:
-        """Drop Nothing selected or an open notice, without publishing (the caller does)."""
+        """Drop Nothing selected, an open notice or an OCR notice, without publishing (the caller does)."""
         if self._state == NOTHING_SELECTED:
             self._overlay_timer.stop()
             self._state = self._rest
         elif self._state == OPEN_FAILED:
             self._state = self._rest
             self._fail_kind = self._fail_title = ""
+        elif self._state == OCR_NOTICE:
+            self._overlay_timer.stop()
+            self._state = self._rest
+            self._ocr_kind = self._ocr_detail = ""
+
+    def _start_overlay_timer(self, ms: int) -> None:
+        self._overlay_due = self._clock() + ms / 1000
+        self._overlay_timer.start(ms)
+
+    def _timed_overlay(self) -> bool:
+        """Nothing selected or a caution OCR notice: shown for a while, then gone by itself."""
+        return self._state == NOTHING_SELECTED or (self._state == OCR_NOTICE and self._ocr_kind in OCR_CAUTION)
 
     def _on_overlay_expired(self) -> None:
-        if self._state == NOTHING_SELECTED:
-            self._set_state(self._rest)
+        if self._held:  # the pointer is over the card: it goes once the pointer leaves
+            return
+        if self._timed_overlay():
+            self._clear_overlay()
+            self._set_state(self._state)
+            self._emit_position()
+
+    @Slot(bool)
+    def hold_overlay(self, on: bool) -> None:
+        """Hold Nothing selected and the caution notices up while the pointer is over the card; once it
+        leaves, they stay at least HOLD_LEAVE_MS more."""
+        on = bool(on)
+        if on == self._held or self._shut:
+            return
+        self._held = on
+        if not on and self._timed_overlay():
+            self._start_overlay_timer(max(HOLD_LEAVE_MS, round((self._overlay_due - self._clock()) * 1000)))
 
     def _underlying(self) -> str:
         return self._rest if self._state in OVERLAYS else self._state
 
     def _end_notice(self) -> None:
-        """Any action ends an open notice; the state underneath it carries on."""
-        if self._state == OPEN_FAILED:
+        """Any action ends an open notice or an OCR notice; the state underneath it carries on."""
+        if self._state in (OPEN_FAILED, OCR_NOTICE):
             self._clear_overlay()
             self._publish()
+            self._emit_position()
 
     @Slot()
     def dismiss_notice(self) -> None:
@@ -901,23 +958,86 @@ class Engine(QObject):
         self._open_live = self._open_token
         self._open_kind, self._open_title = kind, title
         self._open_progress = (0, 0)
-        log.info("Opening a %s", "file" if kind == "file" else "long text")
+        self._reset_scan()
+        log.info("Opening %s", {"file": "a file", "screen": "an area of the screen"}.get(kind, "a long text"))
         self._set_state(OPENING)
         self._emit_position()
         return self._open_token
 
-    def opening_progress(self, token: int, done: int, total: int) -> None:
-        """The loader's progress (pages done of total; total 0 when unknown)."""
+    def opening_progress(self, token: int, done: int, total: int, *, phase: str = "read") -> None:
+        """The loader's progress (pages done of total; total 0 when unknown). `phase` "ocr" is finding the text
+        in scanned pages: the label becomes "Finding the text…", and the header's page and time left change at
+        most every OCR_INFO_S (the progress bar follows every page)."""
         if self._shut or token != self._open_live or self._state != OPENING:
             return
         progress = (max(0, int(done)), max(0, int(total)))
-        if progress != self._open_progress:
-            self._open_progress = progress
-            self._publish()
-            self._emit_position()
+        if phase != "ocr":
+            if progress != self._open_progress:
+                self._open_progress = progress
+                self._publish()
+                self._emit_position()
+            return
+        now = self._clock()
+        if self._open_phase != "ocr" or progress[1] != self._open_progress[1]:
+            self._open_phase = "ocr"
+            self._ocr_started = now
+            self._ocr_info_at = float("-inf")
+        self._open_progress = progress
+        done, total = progress
+        if now - self._ocr_info_at >= OCR_INFO_S or done >= total or done == 0:
+            self._ocr_info_at = now
+            per_page = (now - self._ocr_started) / done if done else OCR_FIRST_GUESS_S
+            left = (total - done) * per_page
+            self._ocr_info = (min(total, done + 1), total, math.ceil(left) if done >= 2 and left >= 10 else -1)
+        self._publish()
+        self._emit_position()
+
+    def opening_choice(self, token: int, scanned: int, pages: int, est_s: int) -> None:
+        """A scanned PDF too long to read unasked: wait, shown at once, for the person to choose pages (the App
+        hands their choice to the loader). Stop cancels the opening."""
+        if self._shut or token != self._open_live or self._state != OPENING:
+            return
+        self._open_phase = "choice"
+        self._choice = (max(0, int(scanned)), max(0, int(pages)), max(0, int(est_s)))
+        self._open_show_timer.stop()
+        self._open_shown = True
+        self._open_progress = (0, 0)
+        self._publish()
+        self._emit_position()
+        self.notice.emit("scan_choice")
+
+    def ocr_notice(self, kind: str, detail: str = "") -> None:
+        """Show an OCR notice (ocr.model.OCR_NOTICE_KINDS) over the current state: a screen or scan opening goes
+        back to the state under it first, and a reading still playing waits under the notice, paused. The
+        caution ones go after OCR_NOTICE_MS (held while the pointer is over the card); the critical ones stay
+        until the next action. `detail` "nothing_speakable" changes the no-text card's first line."""
+        if self._shut:
+            return
+        kind = kind if kind in OCR_LABELS else "screen_error"
+        if self._state == OPENING:
+            token, file = self._open_live, self._open_kind == "file"
+            self._leave_opening()
+            if file and token is not None:
+                self.openingCancelled.emit(token)
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        if self._state in _PLAYING:  # a reading under the notice waits, paused (as it does under an open notice)
+            self._pause()
+        self._rest = self._state
+        self._ocr_kind, self._ocr_detail = kind, detail
+        caution = kind in OCR_CAUTION
+        if caution:
+            self._start_overlay_timer(OCR_NOTICE_MS)
+        log.info("OCR notice: %s", kind)
+        self._set_state(OCR_NOTICE)
+        self._emit_position()
+        self._do_beep("ok" if caution else "error")
+        self.notice.emit("ocr_notice")
 
     def opening_failed(self, token: int, kind: str) -> None:
-        """The file couldn't be read: back to the state under Opening, with the open notice over it."""
+        """The file couldn't be read: back to the state under Opening, with the open notice over it. For the
+        OCR kinds the notice is an OCR notice; "cancelled" (a screen reading that stopped) shows none."""
         if self._shut or token is None:
             return
         if token == self._rebuild_live:  # a rebuild that failed keeps the document as it was
@@ -928,7 +1048,13 @@ class Engine(QObject):
             return
         title = self._open_title
         self._leave_opening()
-        self.open_notice(kind, title)
+        if kind == "cancelled":
+            self._set_state(self._state)
+            self._emit_position()
+        elif kind in OCR_LABELS:
+            self.ocr_notice(kind)
+        else:
+            self.open_notice(kind, title)
 
     def open_notice(self, kind: str, title: str = "") -> None:
         """Show the open notice for `kind` (OPEN_LABELS) over the current state, until the next action.
@@ -970,8 +1096,14 @@ class Engine(QObject):
         self._open_live = None
         self._open_progress = (0, 0)
         self._open_kind = self._open_title = ""
+        self._reset_scan()
         if self._state == OPENING:
             self._state = self._open_prev
+
+    def _reset_scan(self) -> None:
+        self._open_phase = "read"
+        self._ocr_info, self._ocr_info_at = (0, 0, -1), float("-inf")
+        self._choice = (0, 0, 0)
 
     def _on_open_show(self) -> None:
         if self._state == OPENING:
@@ -1898,9 +2030,18 @@ class Engine(QObject):
         overlay = shown == NOTHING_SELECTED
         source = getattr(doc, "source", None)
         label = LABELS[shown]
+        opening = shown == OPENING
+        ocr = opening and self._open_phase == "ocr"
+        choice = opening and self._open_phase == "choice"
         if shown == OPEN_FAILED:
             label = OPEN_LABELS.get(self._fail_kind, label)
-        elif shown == OPENING and self._open_kind != "file":
+        elif shown == OCR_NOTICE:
+            label = OCR_LABELS.get(self._ocr_kind, label)
+        elif choice:
+            label = SCAN_CHOICE_LABEL
+        elif opening and (self._open_kind == "screen" or ocr):
+            label = FINDING_LABEL
+        elif opening and self._open_kind != "file":
             label = LABELS[PREPARING]  # a long text being built: it reads as the start of preparing
         if shown == OPENING:
             title = self._open_title
@@ -1939,6 +2080,17 @@ class Engine(QObject):
             "page": _page_of(doc, self._cur) if has_text and n else 0,
             "pages": int(getattr(self._raw, "pages", 0) or 0) if has_text else 0,
             "end_of_main_text": base == FINISHED and has_text and self._unspoken_tail(),
+            # reading from the screen and scanned PDFs
+            "open_phase": self._open_phase if opening else "",
+            "ocr_page": self._ocr_info[0] if ocr else 0,
+            "ocr_total": self._ocr_info[1] if ocr else 0,
+            "ocr_left": self._ocr_info[2] if ocr else -1,
+            "scan_scanned": self._choice[0] if choice else 0,
+            "scan_pages": self._choice[1] if choice else 0,
+            "scan_est": self._choice[2] if choice else 0,
+            "notice": self._ocr_kind if shown == OCR_NOTICE else "",
+            "notice_detail": self._ocr_detail if shown == OCR_NOTICE else "",
+            "severity": ("caution" if self._ocr_kind in OCR_CAUTION else "critical") if shown == OCR_NOTICE else "",
         }
 
     def _unspoken_tail(self) -> bool:

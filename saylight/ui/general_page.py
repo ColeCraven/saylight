@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPointF, QRectF, QTimer
+from PySide6.QtGui import QFontMetricsF, QPainter
 from PySide6.QtWidgets import QWidget
 
-from .controls import G_OPEN, FadeLabel, LinkText, NavRow, Part, ToggleRow, measure_parts, spoken_parts
+from .controls import (CAP_H, G_ERROR, G_OPEN, FadeLabel, LinkText, NavRow, Part, ToggleRow, draw_glyph,
+                       measure_parts, paint_parts, spoken_parts)
 from .settings_pages import COLUMN, EDGE, OPTICAL, PITCH, SettingsPage
 from .update_bar import short_version
 
@@ -31,6 +33,52 @@ def shortcut_parts(chord: str) -> list[Part]:
     return [("key", k) for k in chord.split("+") if k] if chord else [("text", "None")]
 
 
+# The Shortcuts group: (setting, label, the chord switching on restores, tooltip). Off stores "".
+SHORTCUTS = (("read_screen", "Read from screen", "Ctrl+Alt+`",
+              "Press Ctrl+Alt+` anywhere to read text from the screen. The Read from screen button and the tray menu "
+              "always work. On UK and European keyboards this takes over AltGr+`."),
+             ("ruler", "Reading ruler", "Ctrl+Alt+Shift+`",
+              "Press Ctrl+Alt+Shift+` anywhere to turn the reading ruler on or off."))
+SHORTCUT_FAILED_TIP = {"read_screen": "Another app is using {chord}. Use the button or the tray menu instead.",
+                       "ruler": "Another app is using {chord}. Use Reading display or the tray menu instead."}
+
+
+class ShortcutRow(ToggleRow):
+    """A switch for an optional shortcut, with its keycaps right-aligned 12 DIP left of the switch (TextDisabled
+    while it is off), and a Critical mark before them when Windows wouldn't register it."""
+
+    def __init__(self, theme, tips, label: str, parent: QWidget | None = None, tooltip=""):
+        super().__init__(theme, tips, label, parent, tooltip=tooltip)
+        self.keys: list[Part] = []
+        self.failed = False
+
+    def set_keys(self, chord: str, failed: bool = False) -> None:
+        keys = shortcut_parts(chord) if chord else []
+        if keys != self.keys or failed != self.failed:
+            self.keys, self.failed = keys, failed
+            self.setAccessibleDescription(self.tooltip_text())
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.keys:
+            return
+        t = self.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.face()
+        right = r.right() - t.px(10) - t.k * 40 - t.px(12)  # 12 DIP left of the switch
+        x = right - measure_parts(t, self.keys, role="body")
+        on = self.checked and self.isEnabled()
+        ink = t.color("TextPrimary") if on else t.color("TextDisabled")
+        caps = (t.color("KeycapFill"), t.color("KeycapStroke"), ink)
+        paint_parts(p, t, x, r.top(), r.height(), self.keys, ink, role="body", caps=caps)
+        if self.failed:
+            size = t.px(12)
+            mark = QRectF(x - t.px(6) - size, r.center().y() - size / 2, size, size)
+            draw_glyph(p, mark, G_ERROR, t.font("icon12"), t.color("Critical"))
+
+
 class GeneralPage(SettingsPage):
     title = "General"
     tooltip = "Start with Windows, the shortcut, updates and licences"
@@ -47,6 +95,14 @@ class GeneralPage(SettingsPage):
         self.lbl_files.set_text(FILES_CAPTION, animate=False)
         self.row_resume = ToggleRow(t, tips, "Pick up where you left off", host, tooltip=RESUME_TIP,
                                     detail=RESUME_DETAIL)
+        self.lbl_shortcuts = FadeLabel(t, "small", "TextSecondary", host)
+        self.lbl_shortcuts.set_text("Shortcuts", animate=False)
+        self.shortcut_rows: dict[str, ShortcutRow] = {}
+        for key, label, default, tip in SHORTCUTS:
+            row = ShortcutRow(t, tips, label, host, tooltip=lambda key=key, tip=tip: self._shortcut_tip(key, tip))
+            row.toggled.connect(lambda on, key=key, default=default: self.settings.set(f"hotkeys.{key}",
+                                                                                     default if on else ""))
+            self.shortcut_rows[key] = row
         self._forgot_timer = QTimer(host)
         self._forgot_timer.setSingleShot(True)
         self._forgot_timer.timeout.connect(lambda: self.row_resume.set_detail(RESUME_DETAIL))
@@ -73,7 +129,8 @@ class GeneralPage(SettingsPage):
 
     def widgets(self) -> list[QWidget]:
         return [self.row_start, self.lbl_shortcut, self.val_shortcut, self.lbl_files, self.row_resume,
-                self.updates_line, self.row_notices, self.version_line]
+                self.updates_line, self.row_notices, self.version_line, self.lbl_shortcuts,
+                *self.shortcut_rows.values()]
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
         px = self.theme.px
@@ -101,6 +158,13 @@ class GeneralPage(SettingsPage):
         y += px(PITCH)
         self.version_line.setGeometry(x + px(OPTICAL), y + px(10), text_w, px(20))
         y += px(PITCH)
+        self.rules.append(y + px(4))
+        y += px(9)
+        self.lbl_shortcuts.setGeometry(x + px(OPTICAL), y, text_w, px(20))
+        y += px(22)
+        for row in self.shortcut_rows.values():
+            row.setGeometry(x + px(EDGE), y, row_w, px(40))
+            y += px(PITCH)
         return y - px(2) + px(EDGE) - top
 
     def sync(self) -> None:
@@ -108,6 +172,13 @@ class GeneralPage(SettingsPage):
         self.row_start.set_checked(bool(start()) if callable(start) else False)
         self.row_resume.set_checked(bool(self.settings.get("resume.enabled")))
         self._fit_shortcut()
+        hotkeys = self.settings.get("hotkeys") or {}
+        failed = getattr(self.ctl, "shortcut_failed", lambda _key: False)
+        for key, row in self.shortcut_rows.items():
+            chord = str(hotkeys.get(key, "") or "")
+            default = next(d for k, _l, d, _t in SHORTCUTS if k == key)
+            row.set_checked(bool(chord))
+            row.set_keys(chord or default, bool(chord) and failed(key))
         if self.settings.get("updates.check"):
             line = [("text", "Saylight checks GitHub for updates once a day"), ("sep", " · "), ("toggle", "Turn off")]
             self.updates_line.link_tips = {"toggle": "Stop the daily check. You can still use Check for updates "
@@ -132,6 +203,13 @@ class GeneralPage(SettingsPage):
                 break
         self.val_shortcut.set_parts(parts, "TextPrimary" if self.shortcut_ok else "Critical")
         self.val_shortcut.setAccessibleName(spoken_parts(keys + [("text", notes[0])]))
+
+    def _shortcut_tip(self, key: str, tip: str) -> str:
+        chord = str((self.settings.get("hotkeys") or {}).get(key, "") or "")
+        row = self.shortcut_rows.get(key)
+        if chord and row is not None and row.failed:
+            return SHORTCUT_FAILED_TIP[key].format(chord=chord)
+        return tip
 
     def _sync_version(self) -> None:
         version = str(getattr(self.ctl, "version", "") or "")

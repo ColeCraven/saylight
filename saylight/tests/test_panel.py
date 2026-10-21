@@ -165,6 +165,27 @@ class FakeCtl:
     def remember_place(self) -> None:
         self.calls.append(("remember_place",))
 
+    # 1.4: reading from the screen and scanned PDFs
+    screen_chord = "Ctrl+Alt+`"
+
+    def screen_shortcut(self) -> str:
+        return self.screen_chord
+
+    def read_from_screen(self, source: str) -> None:
+        self.calls.append(("read_from_screen", source))
+
+    def retry_scan(self) -> None:
+        self.calls.append(("retry_scan",))
+
+    def open_language_settings(self) -> None:
+        self.calls.append(("open_language_settings",))
+
+    def continue_scan(self, first: int, last: int) -> None:
+        self.calls.append(("continue_scan", first, last))
+
+    def open_page_range(self) -> None:
+        self.calls.append(("open_page_range",))
+
 
 def info(state: str, *, has_text: bool = False, underlying: str = "") -> dict:
     """What the engine reports for a shown state (only the keys the panel reads)."""
@@ -220,14 +241,18 @@ class PanelCase(unittest.TestCase):
 
 
 class TransportRowTests(PanelCase):
-    def test_type_and_clear_sit_after_stop_on_the_centre_line(self) -> None:
+    def test_type_screen_and_clear_sit_after_stop_on_the_centre_line(self) -> None:
         p = self.panel
         self.present("ready")
+        self.assertEqual(p.width(), 476)
         stop, typ, clear = p.btn_stop.geometry(), p.btn_type.geometry(), p.btn_clear.geometry()
+        screen = p.btn_screen.geometry()
         yt = stop.y() - 2
         self.assertEqual(typ, QRect(192, yt + 4, 32, 32))
-        self.assertEqual(clear, QRect(228, yt + 4, 32, 32))
-        self.assertEqual({QRectF(r).center().y() for r in (stop, typ, clear)}, {yt + 20})
+        self.assertEqual(screen, QRect(228, yt + 4, 32, 32))
+        self.assertEqual(clear, QRect(264, yt + 4, 32, 32))
+        self.assertEqual({QRectF(r).center().y() for r in (stop, typ, screen, clear)}, {yt + 20})
+        self.assertEqual((p.stepper.x(), p.btn_volume.x()), (312, 428))
         self.assertEqual((p.btn_prev.x(), p.play.x(), p.btn_next.x(), stop.x()), (12, 48, 96, 140))
         self.assertGreaterEqual(p.stepper.x() - (clear.right() + 1), 16)
 
@@ -257,7 +282,7 @@ class TransportRowLargeTextTests(PanelCase):
     def test_still_16_dip_clear_of_the_stepper(self) -> None:
         p = self.panel
         self.present("ready")
-        self.assertEqual(p.btn_clear.geometry().x(), 342)
+        self.assertEqual(p.btn_clear.geometry().x(), 396)
         self.assertGreaterEqual(p.stepper.x() - (p.btn_clear.geometry().right() + 1), 24)
 
 
@@ -338,7 +363,8 @@ class CardMessageTests(PanelCase):
         v = self.panel.view
         self.assertEqual(len(v.messages), 3)
         self.assertEqual(v.messages[1], [("text", "or "), ("action", "type"), ("text", "  "), ("action", "open")])
-        self.assertEqual(v._secondary_from, 2)
+        self.assertEqual(v.messages[2], [("text", "or "), ("action", "screen")])  # the third way in
+        self.assertEqual(v._secondary_from, 3)
 
     def test_cleared_line_during_the_undo_window(self) -> None:
         self.present("ready")
@@ -350,7 +376,7 @@ class CardMessageTests(PanelCase):
     def test_cleared_line_gives_way_to_text_and_overlays(self) -> None:
         self.panel.set_cleared(True)
         self.present("nothing_selected", underlying="ready")
-        self.assertEqual(self.panel.view.messages, P.NOTHING_TEXT["empty"] + [P.TYPE_LINE])
+        self.assertEqual(self.panel.view.messages, P.NOTHING_TEXT["empty"] + [P.TYPE_SCREEN_LINE])
         self.present("stopped", has_text=True)
         self.assertIsNone(self.panel.view.messages)
 
@@ -373,6 +399,7 @@ class ExpandedCardTests(PanelCase):
         self.assertEqual(len(v.messages), 7)  # 7 x 28 = 196, within the larger card
         self.assertNotIn([("text", "")], v.messages)
         self.assertEqual(v._secondary_from, 2)
+        self.assertEqual(v.messages[1], P.READY_ACTIONS_ALL)  # all three ways in on one line
         self.assertEqual(v.messages[-1][-2], ("glyph", P.G_MORE))  # "...in Settings, under (More)."
 
     def test_with_a_file_to_continue_the_last_line_goes(self) -> None:
@@ -398,7 +425,8 @@ class CardClickTests(PanelCase):
             with self.subTest(state=state):
                 self.ctl.calls.clear()
                 self.present(state, underlying=underlying)
-                self.assertEqual(self.panel.view.messages[-1], P.TYPE_LINE)  # the card says what a click does
+                line = P.TYPE_SCREEN_LINE if state == "nothing_selected" else P.TYPE_LINE
+                self.assertEqual(self.panel.view.messages[-1], line)  # the card says what a click does
                 self.click(self.blank_spot())
                 self.assertEqual(self.ctl.calls, [("open_compose", "card")])
         self.panel.on_session(None)
@@ -406,7 +434,8 @@ class CardClickTests(PanelCase):
             with self.subTest(reason=reason):
                 self.panel.present("nothing_selected", {**info("nothing_selected", underlying="ready"),
                                                         "reason": reason})
-                self.assertEqual(self.panel.view.messages, lines + [P.TYPE_LINE])
+                line = P.TYPE_SCREEN_LINE if reason in P.NOTHING_SCREEN else P.TYPE_LINE
+                self.assertEqual(self.panel.view.messages, lines + [line])
 
     def test_cards_that_say_nothing_about_typing_take_no_clicks(self) -> None:
         self.present("ready_offline")  # reading typed text would fail too
@@ -415,7 +444,7 @@ class CardClickTests(PanelCase):
         self.assertFalse(self.panel.view._card_hover)
         self.click(self.blank_spot())
         self.present("nothing_selected", has_text=True, underlying="stopped")  # over a reading: no typing in
-        self.assertEqual(self.panel.view.messages, P.NOTHING_TEXT["empty"])
+        self.assertEqual(self.panel.view.messages, P.NOTHING_TEXT["empty"] + [P.NOTHING_SCREEN["empty"]])
         self.click(self.blank_spot())
         self.assertEqual(self.ctl.calls, [])
 
@@ -510,11 +539,156 @@ class CardHoverTests(PanelCase):
         self.panel.set_cleared(True)
         self.present("nothing_selected", underlying="ready")
         v = self.panel.view
-        self.assertEqual(v.messages, P.NOTHING_TEXT["empty"] + [P.TYPE_LINE])
+        self.assertEqual(v.messages, P.NOTHING_TEXT["empty"] + [P.TYPE_SCREEN_LINE])
         self.mouse(QEvent.Type.MouseMove, self.blank_spot())
         self.assertTrue(v._card_hover)
         self.click(self.blank_spot())
         self.assertEqual(self.ctl.calls, [("open_compose", "card")])
+
+
+class ScreenButtonTests(PanelCase):
+    """The Read from screen button: on in every state but Copying and Opening, with its tooltip."""
+
+    def test_table(self) -> None:
+        p = self.panel
+        for state, on in (("ready", True), ("ready_offline", True), ("shortcut_unavailable", True),
+                          ("finished", True), ("stopped", True), ("error_service", True), ("preparing", True),
+                          ("reading", True), ("waiting", True), ("paused", True), ("copying", False),
+                          ("opening", False)):
+            with self.subTest(state=state):
+                self.present(state, has_text=state not in ("ready", "ready_offline", "shortcut_unavailable",
+                                                           "copying"))
+                self.assertEqual(p.btn_screen.isEnabled(), on)
+        p.present("ocr_notice", {**info("ocr_notice"), "underlying": "paused", "notice": "screen_nothing",
+                                 "severity": "caution"})
+        self.assertTrue(p.btn_screen.isEnabled())
+
+    def test_tooltips_name_and_shortcut(self) -> None:
+        p = self.panel
+        self.present("ready")
+        self.assertEqual(p.btn_screen.accessibleName(), "Read from screen")
+        self.assertEqual(p.btn_screen.tooltip_text(),
+                         "Read text from the screen (Ctrl+Alt+`). Works on pictures and scans too.")
+        self.assertEqual(p.btn_screen.accessibleDescription(), p.btn_screen.tooltip_text())
+        self.present("reading", has_text=True)
+        self.assertEqual(p.btn_screen.tooltip_text(),
+                         "Read text from the screen (Ctrl+Alt+`). This reading pauses while you choose.")
+        self.ctl.screen_chord = ""  # not registered: no shortcut in the tooltip
+        self.present("ready")
+        self.assertEqual(p.btn_screen.tooltip_text(), "Read text from the screen. Works on pictures and scans too.")
+        self.assertEqual(p.btn_screen.focusPolicy(), Qt.FocusPolicy.NoFocus)
+
+    def test_click_reads_from_the_screen(self) -> None:
+        self.present("ready")
+        self.panel.btn_screen.clicked.emit()
+        self.assertEqual(self.ctl.calls, [("read_from_screen", "button")])
+
+
+class ScreenCardTests(PanelCase):
+    """The 1.4 chips: clickable whenever drawn, hover only from themselves, and the card lines around them."""
+
+    def chip(self, key: str) -> QPointF:
+        self.paint_card()
+        return self.panel.view._hits[key].center()
+
+    def test_the_ready_chip_reads_from_the_screen_without_the_card_outline(self) -> None:
+        self.present("ready")
+        pos = self.chip("screen")
+        self.mouse(QEvent.Type.MouseMove, pos)
+        v = self.panel.view
+        self.assertFalse(v._card_hover)  # over a 1.4 chip the outline and the Type chip's hover are off
+        self.assertEqual(self.panel._card_pointer, "screen")
+        self.click(pos)
+        self.assertEqual(self.ctl.calls, [("read_from_screen", "card")])
+        self.mouse(QEvent.Type.MouseMove, self.blank_spot())
+        self.assertTrue(v._card_hover)  # elsewhere the whole card still opens Type
+
+    def test_nothing_selected_over_a_reading_offers_the_screen(self) -> None:
+        self.present("nothing_selected", has_text=True, underlying="stopped")
+        self.click(self.chip("screen"))
+        self.assertEqual(self.ctl.calls, [("read_from_screen", "card")])
+
+    def ocr(self, kind: str, underlying: str = "paused", detail: str = "") -> None:
+        severity = "caution" if kind in ("screen_nothing", "screen_too_large", "scan_nothing") else "critical"
+        self.panel.on_session(self.doc if underlying == "paused" else None)
+        self.panel.present("ocr_notice", {**info("ocr_notice", has_text=underlying == "paused"),
+                                          "label": "No text found", "underlying": underlying, "notice": kind,
+                                          "notice_detail": detail, "severity": severity,
+                                          "play_action": "resume" if underlying == "paused" else "read"})
+
+    def test_notices_keep_the_controls_of_the_state_underneath_and_take_chip_clicks(self) -> None:
+        p = self.panel
+        self.ocr("screen_language")
+        self.assertEqual(p.play.accessibleName(), "Resume")
+        self.assertEqual(p.view.messages[-1], [("action", "lang_settings"), ("text", "  "),
+                                               ("action", "screen_retry")])
+        self.click(self.chip("lang_settings"))
+        self.click(self.chip("screen_retry"))
+        self.click(self.blank_spot())  # a notice takes clicks only on its chips
+        self.assertEqual(self.ctl.calls, [("open_language_settings",), ("read_from_screen", "retry")])
+        self.ocr("scan_error", underlying="ready")
+        self.click(self.chip("scan_retry"))
+        self.assertEqual(self.ctl.calls[-1], ("retry_scan",))
+        self.ocr("screen_nothing", detail="nothing_speakable")
+        self.assertEqual(p.view.messages[0], [("text", "Saylight found nothing to read in that area.")])
+
+    def test_every_new_card_has_at_most_three_lines_and_fits_at_small_standard(self) -> None:
+        self.settings.set("text_size", "small")
+        self.settings.set("spacing", "standard")
+        self.present("ready")
+        room = self.panel.view.text_width()
+        cards = [P.ocr_lines(k) for k in ("screen_nothing", "screen_too_large", "screen_language", "screen_error",
+                                          "scan_nothing", "scan_language", "scan_error")]
+        cards += [P.scan_progress_lines(1234)[0], P.scan_choice_lines(120, 300, 7500), P.READY_HINT,
+                  P.NOTHING_TEXT["empty"] + [P.TYPE_SCREEN_LINE], P.NOTHING_TEXT["console"] + [P.TYPE_SCREEN_LINE]]
+        labels = {"scan_all": "All 1,234 pages"}
+        for lines in cards:
+            with self.subTest(lines=lines[0]):
+                self.assertLessEqual(len(lines), 3)
+                widest = max(P.measure_parts(self.theme, line, role="body", labels=labels) for line in lines)
+                self.assertLessEqual(widest, room)
+
+    def test_a_long_scan_offers_its_pages(self) -> None:
+        p = self.panel
+        p.on_session(None)
+        p.present("opening", {**info("opening"), "label": "Scanned PDF", "open_kind": "file", "open_phase": "choice",
+                              "scan_scanned": 160, "scan_pages": 160, "scan_est": 128, "can_type": False})
+        self.assertEqual(p.view.messages[0], [("text", "This PDF is a scan of 160 pages.")])
+        self.assertEqual(p.view.messages[1], [("text", "Finding the text in all of them takes about 2 min.")])
+        self.assertEqual(p._info_parts()[0], [("text", "160 pages")])
+        for key, call in (("scan_first", ("continue_scan", 1, 50)), ("scan_all", ("continue_scan", 1, 160)),
+                          ("scan_choose", ("open_page_range",))):
+            self.click(self.chip(key))
+            self.assertEqual(self.ctl.calls[-1], call)
+        self.assertEqual(p.view._labels.get("scan_all"), "All 160 pages")
+
+    def test_finding_the_text_in_a_scan_counts_pages_and_time(self) -> None:
+        p = self.panel
+        p.on_session(None)
+        p.present("opening", {**info("opening"), "label": "Finding the text…", "open_kind": "file",
+                              "open_phase": "ocr", "ocr_page": 3, "ocr_total": 12, "ocr_left": 17,
+                              "can_type": False})
+        self.assertEqual(p._info_parts()[0], [("text", "Page 3 of 12 · 20 s left")])
+        self.assertEqual(p.btn_stop.tooltip_text(), "Stop finding the text")
+        p._show_scan_card()
+        self.assertEqual(p.view.messages[0], [("text", "Finding the text in 12 scanned pages,")])
+
+    def test_time_left_and_estimates(self) -> None:
+        self.assertEqual([P.ocr_left_text(s) for s in (-1, 10, 11, 55, 59, 61, 125, 3900)],
+                         ["", "10 s left", "20 s left", "1 min left", "1 min left", "1 min left", "2 min left",
+                          "1 h 5 min left"])
+        self.assertEqual([P.estimate_text(s) for s in (40, 128, 3900)],
+                         ["under a minute", "about 2 min", "about 1 h 5 min"])
+
+    def test_the_low_resolution_note_outranks_the_others(self) -> None:
+        p = self.panel
+        self.present("reading", has_text=True)
+        p.show_note(P.LOW_DPI_NOTE, "Caution", ms=P.SCAN_NOTE_MS)
+        p.show_note(P.MOVED_NOTE, ms=P.MOVED_NOTE_MS)
+        self.assertEqual(p._note["text"], P.LOW_DPI_NOTE)
+        p._end_note()
+        p.show_note(P.MOVED_NOTE, ms=P.MOVED_NOTE_MS)
+        self.assertEqual(p._note["text"], P.MOVED_NOTE)
 
 
 class CoveredTests(PanelCase):

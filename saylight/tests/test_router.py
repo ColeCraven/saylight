@@ -19,6 +19,7 @@ from ..voices import base, make_backend, make_router
 from ..voices.base import VoiceInfo, Word
 from ..voices.edge import EdgeBackend
 from ..voices.router import DEFAULT_LIMITS, SynthRouter, as_speed
+from ..voices.windows import WindowsVoiceBackend
 from . import test_engine as TE
 
 
@@ -457,11 +458,15 @@ class FactoryTests(unittest.TestCase):
         self.assertIsInstance(edge, EdgeBackend)
         self.assertIsInstance(edge, base.VoiceBackend)
         edge.shutdown()
-        self.assertIsNone(make_backend("windows"))  # the Windows voice isn't in this build yet
+        windows = make_backend("windows")
+        self.assertIsInstance(windows, WindowsVoiceBackend)
+        self.assertIsInstance(windows, base.VoiceBackend)
+        windows.shutdown()
         root = tempfile.mkdtemp(prefix="router_factory_")
         self.addCleanup(shutil.rmtree, root, True)
         router = make_router(temp_root=root)
         self.assertIsInstance(router.backend("edge"), EdgeBackend)
+        self.assertIsInstance(router.backend("windows"), WindowsVoiceBackend)
         self.assertIsNone(router.temp_dir)                # nothing is created before start()
         router.start()
         self.assertEqual(os.path.dirname(router.temp_dir), root)

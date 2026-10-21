@@ -741,7 +741,7 @@ class ClickTests(unittest.TestCase):
         self.assertEqual(h.beeps, ["ok"])
         self.assertIn("nothing_selected", h.notices)
         self.assertEqual(h.toggles, 0)
-        h.advance(2999)
+        h.advance(E.NOTHING_SCREEN_MS - 1)  # it offers Read from screen, so it stays 6 s
         self.assertEqual(h.shown, E.NOTHING_SELECTED)
         h.advance(2)
         self.assertEqual(h.shown, E.READY)
@@ -3332,6 +3332,152 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual((h.engine.current_sentence, h.engine.resumed), (0, None))
         h.advance(E.SEEK_DELAY_MS + 1)
         self.assertTrue(h.req(requests)["text"].startswith(sentence(0)))
+
+
+class ScreenAndScanTests(unittest.TestCase):
+    """Reading from the screen and scanned PDFs: the screen opening, the OCR phase, the page choice and the OCR
+    notices over the state underneath."""
+
+    def test_a_screen_opening_keeps_the_paused_reading_and_shows_finding_the_text_after_150_ms(self):
+        h = H()
+        h.play()
+        old = h.engine.document
+        self.assertTrue(h.engine.pause())
+        token = h.engine.begin_opening("", "screen")
+        self.assertEqual((h.state, h.shown), (E.OPENING, E.PAUSED))
+        h.advance(E.OPEN_SHOW_MS + 1)
+        info = h.info
+        self.assertEqual((h.shown, info["label"], info["open_kind"]), (E.OPENING, E.FINDING_LABEL, "screen"))
+        self.assertEqual(info["play_action"], "none")
+        self.assertTrue(info["can_stop"])
+        self.assertFalse(info["can_type"] or info["can_clear"] or info["can_next"])
+        self.assertNotIn("opening", h.notices)  # the HUD follows the state, not a file's notice
+        self.assertIs(h.engine.document, old)
+        h.engine.stop()  # cancels: the exact state before it comes back
+        self.assertEqual((h.state, h.shown), (E.PAUSED, E.PAUSED))
+        self.assertFalse(h.engine.read_document(file_doc(), token=token))
+
+    def test_a_cancelled_screen_opening_goes_back_without_a_notice(self):
+        h = H()
+        token = h.engine.begin_opening("", "screen")
+        h.advance(E.OPEN_SHOW_MS + 1)
+        h.engine.opening_failed(token, "cancelled")
+        self.assertEqual((h.state, h.shown), (E.READY, E.READY))
+        self.assertEqual(h.beeps, [])
+
+    def test_a_failed_screen_opening_restores_the_paused_reading_under_a_notice(self):
+        h = H()
+        h.play()
+        h.engine.pause()
+        token = h.engine.begin_opening("", "screen")
+        h.engine.opening_failed(token, "screen_error")
+        info = h.info
+        self.assertEqual((h.state, h.shown), (E.OCR_NOTICE, E.OCR_NOTICE))
+        self.assertEqual((info["label"], info["notice"], info["severity"], info["underlying"]),
+                         ("Couldn't read the screen", "screen_error", "critical", E.PAUSED))
+        self.assertEqual(info["play_action"], "resume")  # the controls follow Paused
+        self.assertEqual(h.beeps, ["error"])
+        h.advance(60_000)
+        self.assertEqual(h.shown, E.OCR_NOTICE)  # critical: until the next action
+        h.engine.toggle_pause()
+        self.assertEqual(h.state, E.READING)
+
+    def test_a_caution_notice_lasts_8_s_and_waits_while_the_pointer_is_over_the_card(self):
+        h = H()
+        h.engine.ocr_notice("screen_nothing", "nothing_speakable")
+        self.assertEqual((h.shown, h.info["label"], h.info["severity"]), (E.OCR_NOTICE, "No text found", "caution"))
+        self.assertEqual(h.info["notice_detail"], "nothing_speakable")
+        self.assertEqual(h.beeps, ["ok"])
+        h.engine.hold_overlay(True)
+        h.advance(E.OCR_NOTICE_MS + 5000)
+        self.assertEqual(h.shown, E.OCR_NOTICE)
+        h.engine.hold_overlay(False)
+        h.advance(E.HOLD_LEAVE_MS - 1)
+        self.assertEqual(h.shown, E.OCR_NOTICE)
+        h.advance(2)
+        self.assertEqual(h.shown, E.READY)
+
+    def test_nothing_selected_waits_while_held(self):
+        h = H()
+        h.engine.read_selection_click(1)
+        h.copied("", "shell", token=h.input.copy_requests[-1][0])
+        self.assertEqual(h.shown, E.NOTHING_SELECTED)
+        h.engine.hold_overlay(True)
+        h.advance(E.NOTHING_SELECTED_MS + 1000)
+        self.assertEqual(h.shown, E.NOTHING_SELECTED)
+        h.engine.hold_overlay(False)
+        h.advance(E.HOLD_LEAVE_MS + 1)
+        self.assertEqual(h.shown, E.READY)
+
+    def test_a_language_notice_over_a_playing_reading_pauses_it(self):
+        h = H()
+        h.play()
+        h.engine.ocr_notice("screen_language")
+        self.assertEqual((h.shown, h.info["underlying"]), (E.OCR_NOTICE, E.PAUSED))
+        h.engine.dismiss_notice()
+        self.assertEqual(h.shown, E.PAUSED)
+
+    def test_the_ocr_phase_counts_pages_and_says_the_time_left(self):
+        h = H()
+        token = h.engine.begin_opening("Scan", "file")
+        h.advance(E.OPEN_SHOW_MS + 1)
+        h.engine.opening_progress(token, 0, 12, phase="ocr")
+        info = h.info
+        self.assertEqual((info["label"], info["open_phase"], info["ocr_page"], info["ocr_total"], info["ocr_left"]),
+                         (E.FINDING_LABEL, "ocr", 1, 12, -1))
+        h.advance(3000)
+        h.engine.opening_progress(token, 1, 12, phase="ocr")
+        self.assertEqual(h.positions[-1][4], 1 / 12)  # the bar follows every page
+        h.advance(3000)
+        h.engine.opening_progress(token, 2, 12, phase="ocr")  # 3 s a page: 30 s left
+        self.assertEqual((h.info["ocr_page"], h.info["ocr_left"]), (3, 30))
+        h.advance(500)
+        h.engine.opening_progress(token, 3, 12, phase="ocr")  # under 2 s since: the header waits
+        self.assertEqual(h.info["ocr_page"], 3)
+        h.advance(2000)
+        h.engine.opening_progress(token, 4, 12, phase="ocr")
+        self.assertEqual(h.info["ocr_page"], 5)
+        h.engine.stop()
+        self.assertEqual(h.state, E.READY)
+        self.assertEqual(h.info.get("open_phase", ""), "")
+
+    def test_a_long_scan_waits_for_a_choice_shown_at_once(self):
+        h = H()
+        cancelled = []
+        h.engine.openingCancelled.connect(cancelled.append)
+        token = h.engine.begin_opening("Scan", "file")
+        h.engine.opening_choice(token, 160, 160, 128)
+        info = h.info
+        self.assertEqual((h.shown, info["label"], info["open_phase"]), (E.OPENING, E.SCAN_CHOICE_LABEL, "choice"))
+        self.assertEqual((info["scan_scanned"], info["scan_pages"], info["scan_est"]), (160, 160, 128))
+        self.assertIn("scan_choice", h.notices)
+        h.engine.opening_progress(token, 0, 50, phase="ocr")  # the person chose pages
+        self.assertEqual((h.info["label"], h.info["open_phase"]), (E.FINDING_LABEL, "ocr"))
+        h.engine.stop()
+        self.assertEqual(cancelled, [token])
+
+    def test_scan_failures_are_ocr_notices_over_the_state_before(self):
+        h = H()
+        h.play()
+        token = h.engine.begin_opening("Scan", "file")
+        h.engine.opening_failed(token, "scan_language")
+        self.assertEqual((h.shown, h.info["label"], h.info["underlying"]), (E.OCR_NOTICE, "Can't read this scan",
+                                                                           E.PAUSED))
+        token = h.engine.begin_opening("Scan", "file")
+        h.engine.opening_failed(token, "scan_nothing")
+        self.assertEqual((h.info["notice"], h.info["severity"]), ("scan_nothing", "caution"))
+
+    def test_nothing_selected_with_the_screen_chip_lasts_6_s_and_the_others_3_s(self):
+        for reason, ms in (("empty", E.NOTHING_SCREEN_MS), ("console", E.NOTHING_SCREEN_MS),
+                           ("shell", E.NOTHING_SELECTED_MS), ("busy", E.NOTHING_SELECTED_MS)):
+            with self.subTest(reason=reason):
+                h = H()
+                h.engine.read_selection_click(1)
+                h.copied("", reason, token=h.input.copy_requests[-1][0])
+                h.advance(ms - 1)
+                self.assertEqual(h.shown, E.NOTHING_SELECTED)
+                h.advance(2)
+                self.assertEqual(h.shown, E.READY)
 
 
 if __name__ == "__main__":

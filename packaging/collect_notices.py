@@ -11,7 +11,8 @@ using the distributions' RECORD files. The gate fails when:
   ISC). GPL and AGPL always fail. LGPL-3.0 passes only for PySide6*, shiboken6 and edge-tts, and only when
   none of their modules sits inside the archive, so they stay replaceable. A bare "BSD" passes only when the
   licence text shows it is the two- or three-clause form;
-- Pillow, numpy or Tk are in the build at all (they must never ship, whatever their licence).
+- Pillow, numpy or Tk are in the build at all (they must never ship, whatever their licence);
+- winrt-runtime's own MSVCP140.dll is in the build (saylight.spec leaves it out).
 
 Without --check it then writes, next to Saylight.exe: LICENSE.txt (Saylight's), THIRD_PARTY_NOTICES.txt and a
 licenses folder with every full licence text. --json prints a summary for the build script.
@@ -59,6 +60,14 @@ EXTRA_TEXTS = {
     "edge-tts": ("GPL-3.0.txt",),
 }
 SKIP_DIST_TEXTS = {"pyside6-essentials", "shiboken6"}
+# The pywinrt packages (winrt-runtime and one per Windows namespace) declare MIT but ship no licence text: one
+# copy of the project's licence covers them all.
+WINRT_TEXT = "pywinrt-MIT.txt"
+WINRT_MSVCP = os.path.join("_internal", "winrt", "msvcp140.dll")
+
+
+def extra_texts(name: str) -> tuple[str, ...]:
+    return EXTRA_TEXTS.get(name, ()) or ((WINRT_TEXT,) if name.startswith("winrt-") else ())
 
 _ALIASES = {
     "MIT": "MIT", "MIT LICENSE": "MIT", "EXPAT": "MIT", "EXPAT LICENSE": "MIT",
@@ -401,6 +410,8 @@ def gate(dist: str) -> tuple[list[Component], dict]:
     problems = [f"can't tell where this came from: {u}" for u in unknown]
     problems += [f"not part of Python's standard library: {u}" for u in check_base_library(dist)]
     problems += [f"{top} must never be bundled (saylight.spec excludes it)" for top in never_bundled(inv)]
+    if os.path.exists(os.path.join(dist, WINRT_MSVCP)):
+        problems.append(f"{WINRT_MSVCP} must be left out (saylight.spec drops it)")
 
     components: list[Component] = []
     for name in sorted(n for n in owners if not n.startswith(":")):
@@ -422,7 +433,7 @@ def gate(dist: str) -> tuple[list[Component], dict]:
             if inside:
                 problems.append(f"{name}: LGPL modules inside the archive can't be replaced: {inside[:5]}")
         texts = [] if name in SKIP_DIST_TEXTS else dist_texts(d)
-        for extra in EXTRA_TEXTS.get(name, ()):
+        for extra in extra_texts(name):
             path = os.path.join(FIXED, extra)
             if not os.path.isfile(path):
                 problems.append(f"{name}: licenses/{extra} is missing from the repository")

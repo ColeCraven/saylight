@@ -501,7 +501,8 @@ class VoicePage(SettingsPage):
             groups.setdefault((v.private, v.locale), []).append(v)
         for (private, locale), members in groups.items():
             name = self.catalog.locale_name(locale)
-            rows.append(("header", f"{name} · on this PC" if private else name))
+            # the voices on this PC are Windows' own: private, but plainly less natural than the online ones
+            rows.append(("header", f"{name} · on this PC · sounds more robotic" if private else name))
             rows += [("voice", v) for v in members]
         return rows
 

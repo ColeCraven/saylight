@@ -123,6 +123,7 @@ def _sig(func, restype, *argtypes):
 _sig(user32.GetForegroundWindow, wintypes.HWND)
 _sig(user32.SetForegroundWindow, wintypes.BOOL, wintypes.HWND)
 _sig(user32.IsWindow, wintypes.BOOL, wintypes.HWND)
+_sig(user32.IsHungAppWindow, wintypes.BOOL, wintypes.HWND)
 _sig(user32.GetClassNameW, ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 _sig(user32.GetWindowThreadProcessId, wintypes.DWORD, wintypes.HWND, wintypes.LPDWORD)
 _sig(user32.SetWindowPos, wintypes.BOOL, wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -174,6 +175,8 @@ _sig(kernel32.GlobalSize, ctypes.c_size_t, wintypes.HGLOBAL)
 _sig(kernel32.CreateEventW, wintypes.HANDLE, wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR)
 _sig(kernel32.SetEvent, wintypes.BOOL, wintypes.HANDLE)
 _sig(kernel32.CloseHandle, wintypes.BOOL, wintypes.HANDLE)
+_sig(kernel32.GetCurrentProcess, wintypes.HANDLE)
+_sig(kernel32.TerminateProcess, wintypes.BOOL, wintypes.HANDLE, wintypes.UINT)
 _sig(dwmapi.DwmSetWindowAttribute, HRESULT, wintypes.HWND, wintypes.DWORD, wintypes.LPCVOID, wintypes.DWORD)
 _sig(shell32.SHQueryUserNotificationState, HRESULT, ctypes.POINTER(ctypes.c_int))
 
@@ -210,6 +213,16 @@ def get_window_pid(hwnd: int) -> int:
 
 def is_window(hwnd: int) -> bool:
     return bool(hwnd) and bool(user32.IsWindow(hwnd))
+
+
+def is_hung_window(hwnd: int) -> bool:
+    """True once the window's thread hasn't looked at its messages for 5 s (Windows' "Not responding")."""
+    return bool(hwnd) and bool(user32.IsHungAppWindow(hwnd))
+
+
+def end_process(code: int = 1) -> None:
+    """End this process at once. Nothing else runs: no cleanup, no atexit."""
+    kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
 
 
 def set_foreground_window(hwnd: int) -> bool:

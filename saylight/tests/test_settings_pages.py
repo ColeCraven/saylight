@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import QMouseEvent, QWheelEvent
@@ -330,6 +331,81 @@ class GeneralPageTests(ServicesCase):
         self.assertEqual(p.rules[0] + 5, y)
         self.assertEqual(p.row_resume.geometry().y(), y + 22)
         self.assertEqual(p.rules[1], p.row_resume.geometry().bottom() + 1 + 2 + 4)
+
+
+class OnYourScreenTests(ServicesCase):
+    """Reading display's "On your screen" group: Highlight on screen, Ruler and Dim."""
+
+    def test_the_group_follows_background_under_a_rule(self) -> None:
+        page = self.open_tab(0)
+        self.assertEqual(page.lbl_screen.accessibleName(), "On your screen · drawn over your other apps")
+        bg_y = page.lbl_bg.y() - 10
+        self.assertEqual(page.rules, [bg_y + 42 + 4])
+        self.assertEqual(page.lbl_screen.y(), bg_y + 42 + 9)
+        self.assertEqual(page.row_marks.y(), bg_y + 42 + 31)
+        self.assertEqual((page.seg_ruler.y() - 3, page.seg_dim.y() - 3), (bg_y + 115, bg_y + 157))
+        self.assertEqual(page.seg_ruler.x(), 132)
+
+    def test_ruler_maps_onto_enabled_and_height(self) -> None:
+        page = self.open_tab(0)
+        s = self.settings
+        self.assertEqual((page.seg_ruler.index, s.get("ruler.enabled")), (0, False))  # off by default
+        page.seg_ruler.selected.emit(3)
+        self.assertEqual((s.get("ruler.enabled"), s.get("ruler.height")), (True, "large"))
+        page.seg_ruler.selected.emit(0)
+        self.assertEqual((s.get("ruler.enabled"), s.get("ruler.height")), (False, "large"))  # the height is kept
+        s.set("ruler.enabled", True)
+        self.assertEqual(page.seg_ruler.index, 3)
+        page.seg_dim.selected.emit(2)
+        self.assertEqual(s.get("ruler.dim"), "strong")
+
+    def test_highlight_on_screen_follows_highlight(self) -> None:
+        page = self.open_tab(0)
+        s = self.settings
+        self.assertTrue(page.row_marks.checked and page.row_marks.isEnabled())  # on by default
+        page.row_marks.toggled.emit(False)
+        self.assertFalse(s.get("screen.highlight"))
+        s.set("screen.highlight", True)
+        s.set("highlight", "off")
+        self.assertFalse(page.row_marks.isEnabled() or page.row_marks.checked)
+        self.assertEqual(page.row_marks.tooltip_text(), "Turn on Highlight to use this.")
+
+    def test_dim_is_disabled_in_high_contrast(self) -> None:
+        page = self.open_tab(0)
+        self.assertTrue(page.seg_dim.isEnabled())
+        with mock.patch.object(type(self.theme), "high_contrast", new_callable=mock.PropertyMock, return_value=True):
+            page.sync()
+            self.assertFalse(page.seg_dim.isEnabled())
+            self.assertEqual(page.seg_dim.tooltip_text(),
+                             "High contrast shows the ruler as two lines, without dimming.")
+
+
+class ShortcutsGroupTests(ServicesCase):
+    def test_rows_follow_the_hotkeys_settings(self) -> None:
+        page = self.open_tab(2)
+        screen, ruler = page.shortcut_rows["read_screen"], page.shortcut_rows["ruler"]
+        self.assertTrue(screen.checked)  # on by default
+        self.assertFalse(ruler.checked)  # off by default
+        self.assertEqual(screen.keys, [("key", "Ctrl"), ("key", "Alt"), ("key", "`")])
+        self.assertEqual(ruler.keys, [("key", "Ctrl"), ("key", "Alt"), ("key", "Shift"), ("key", "`")])
+        screen.toggled.emit(False)
+        self.assertEqual(self.settings.get("hotkeys.read_screen"), "")
+        self.assertFalse(screen.checked)
+        self.settings.set("hotkeys.read_screen", "Ctrl+Alt+Shift+S")  # a chord from the settings file
+        self.assertEqual(screen.keys, [("key", "Ctrl"), ("key", "Alt"), ("key", "Shift"), ("key", "S")])
+        screen.toggled.emit(False)
+        screen.toggled.emit(True)  # off and on restores the default
+        self.assertEqual(self.settings.get("hotkeys.read_screen"), "Ctrl+Alt+`")
+        self.assertTrue(page.rules[-1] < page.lbl_shortcuts.y() < screen.y() < ruler.y())
+
+    def test_a_shortcut_windows_refused_is_marked(self) -> None:
+        self.ctl.shortcut_failed = lambda key: key == "read_screen"
+        page = self.open_tab(2)
+        page.sync()
+        row = page.shortcut_rows["read_screen"]
+        self.assertTrue(row.failed)
+        self.assertEqual(row.tooltip_text(), "Another app is using Ctrl+Alt+`. Use the button or the tray menu "
+                                             "instead.")
 
 
 class MissingServicesTests(unittest.TestCase):

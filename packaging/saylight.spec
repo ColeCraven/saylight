@@ -111,8 +111,29 @@ def _pypdf_modules() -> list[str]:
     return collect_submodules("pypdf")
 
 
+def _winrt_modules() -> list[str]:
+    """The WinRT bindings (OCR, PDF rendering, Windows' voices) are loaded by name in winrt_support.py, so the
+    analysis can't see them: every winrt module of the pinned packages. They are listed from the files, never
+    imported here: winrt crashes a process that hasn't loaded PySide6 first."""
+    spec = importlib.util.find_spec("winrt")
+    if spec is None:
+        raise SystemExit("winrt isn't installed; pip install -r requirements.txt")
+    names = []
+    for root in spec.submodule_search_locations:
+        base = os.path.dirname(root)
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            package = os.path.relpath(folder, base).replace(os.sep, ".")
+            for f in files:
+                if f.endswith(".py"):
+                    names.append(package if f == "__init__.py" else f"{package}.{f[:-3]}")
+                elif f.endswith(".pyd"):
+                    names.append(f"{package}.{f.split('.')[0]}")
+    return sorted(set(names))
+
+
 # The test copy carries its self-test module next to saylight_app.py; a release build has none.
-HIDDEN = _app_modules() + _pypdf_modules() + (["saylight_selftest"] if TEST_COPY else [])
+HIDDEN = _app_modules() + _pypdf_modules() + _winrt_modules() + (["saylight_selftest"] if TEST_COPY else [])
 
 a = Analysis(
     [ENTRY],
@@ -138,7 +159,9 @@ a = Analysis(
 #   QNetworkInformation; HTTPS goes through Python's ssl. If Qt ever does HTTPS, keep qschannelbackend.dll.
 # - platform plugins other than qwindows, the generic and icon-engine plugins, image formats other than ico
 # - the app-local Universal CRT: Windows 10 and 11 always use the system copy
+# - winrt-runtime's own MSVCP140.dll: PySide6 loads its newer copy first, and winrt works with that one
 DROP = re.compile(r"(?i)(PySide6[\\/]translations[\\/]|opengl32sw\.dll$|qt6pdf|qt6qml|qt6quick|qt6opengl|"
+                  r"winrt[\\/]msvcp140\.dll$|"
                   r"qt6svg|imageformats[\\/]q(?!ico)\w+\.dll$|plugins[\\/]tls[\\/]|"
                   r"(^|[\\/])(libssl|libcrypto)-3-x64\.dll$|platforms[\\/]q(direct2d|minimal|offscreen)\.dll$|"
                   r"plugins[\\/](generic|iconengines)[\\/]|(^|[\\/])api-ms-win-[\w-]+\.dll$|(^|[\\/])ucrtbase\.dll$)")

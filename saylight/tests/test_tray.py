@@ -27,7 +27,7 @@ class FakeSettings(QObject):
 
     def get(self, key: str):
         return {"text_size": "medium", "reading_tint": "auto", "reading_font": "verdana", "spacing": "wide",
-                "hud_when_hidden": True}[key]
+                "hud_when_hidden": True, "ruler.enabled": False}[key]
 
     def set(self, key: str, value) -> None:
         pass
@@ -122,6 +122,12 @@ class FakeCtl:
 
     def can_undo_clear(self) -> bool:
         return self.undo
+
+    def screen_shortcut(self) -> str:
+        return ""
+
+    def ruler_shortcut(self) -> str:
+        return ""
 
 
 class TrayMenuTests(unittest.TestCase):
@@ -223,29 +229,31 @@ class TrayMenuTests(unittest.TestCase):
     def test_ready_offers_type_or_paste_only(self) -> None:
         items = self.build("ready")
         self.assertTrue(items["Type or paste text…"])
-        self.assertEqual(self.box_group(), ["Type or paste text…"])
+        self.assertEqual(self.box_group(), ["Type or paste text…", "Read from screen…"])
 
     def test_copying_disables_type_and_hides_clear(self) -> None:
         self.ctl.draft = True
         items = self.build("copying", has_text=True)
         self.assertFalse(items["Type or paste text…"])
-        self.assertEqual(self.box_group(), ["Type or paste text…", "Pause", "Stop"])
+        self.assertEqual(self.box_group(), ["Type or paste text…", "Read from screen…", "Pause", "Stop"])
 
     def test_reading_and_resting_with_text(self) -> None:
         self.build("reading", has_text=True)
-        self.assertEqual(self.box_group(), ["Type or paste text…", "Pause", "Stop", "Clear text"])
+        self.assertEqual(self.box_group(),
+                         ["Type or paste text…", "Read from screen…", "Pause", "Stop", "Clear text"])
         self.build("stopped", has_text=True)
-        self.assertEqual(self.box_group(), ["Type or paste text…", "Read again from start", "Clear text"])
+        self.assertEqual(self.box_group(),
+                         ["Type or paste text…", "Read from screen…", "Read again from start", "Clear text"])
 
     def test_typed_text_alone_can_be_cleared(self) -> None:
         self.ctl.draft = True
         self.build("ready")
-        self.assertEqual(self.box_group(), ["Type or paste text…", "Clear text"])
+        self.assertEqual(self.box_group(), ["Type or paste text…", "Read from screen…", "Clear text"])
 
     def test_undo_during_the_undo_window(self) -> None:
         self.ctl.undo = True
         self.build("ready")
-        self.assertEqual(self.box_group(), ["Type or paste text…", "Undo clear"])
+        self.assertEqual(self.box_group(), ["Type or paste text…", "Read from screen…", "Undo clear"])
 
     def test_items_call_the_controller(self) -> None:
         self.ctl.undo = True
@@ -279,6 +287,44 @@ class TrayClickTests(unittest.TestCase):
     def test_click_toggles_the_panel_otherwise(self) -> None:
         self.tray._on_activated(QSystemTrayIcon.ActivationReason.Trigger)
         self.assertEqual(self.ctl.calls, [("toggle_panel", True)])
+
+
+class ScreenTrayTests(unittest.TestCase):
+    """1.4: Read from screen, the reading ruler and the OCR tooltips."""
+
+    setUp, build = TrayMenuTests.setUp, TrayMenuTests.build
+
+    def test_read_from_screen_and_the_ruler(self) -> None:
+        items = self.build("ready")
+        self.assertTrue(items["Read from screen…"])
+        self.assertIn("Reading ruler", items)
+        self.assertFalse(self.build("opening")["Read from screen…"])  # not while opening or copying
+        self.build("ready")
+        texts = [a.text() for a in self.tray.menu.actions()]
+        self.assertEqual(texts.index("Type or paste text…") + 1, texts.index("Read from screen…"))
+        self.ctl.screen_shortcut = lambda: "Ctrl+Alt+Shift+S"
+        self.assertIn("Read from screen…	Ctrl+Alt+Shift+S", self.build("ready"))
+        next(a for a in self.tray.menu.actions() if a.text().startswith("Read from screen")).trigger()
+        next(a for a in self.tray.menu.actions() if a.text() == "Reading ruler").trigger()
+        self.assertEqual(self.ctl.calls[-2:], [("read_from_screen", "tray"), ("toggle_ruler", True)])
+
+    def test_tooltips(self) -> None:
+        t = self.tray
+        t.set_selecting(True)
+        self.assertEqual(t.icon.toolTip(), "Saylight · Drag over the text to read (Esc cancels)")
+        t.set_selecting(False)
+        t.set_state("opening", {"open_kind": "screen", "open_phase": "read"})
+        self.assertEqual(t.icon.toolTip(), "Saylight · Finding the text…")
+        t.set_state("opening", {"open_kind": "file", "open_phase": "ocr", "ocr_page": 3, "ocr_total": 12})
+        self.assertEqual(t.icon.toolTip(), "Saylight · Finding the text, page 3 of 12")
+        t.set_state("opening", {"open_kind": "file", "open_phase": "choice"})
+        self.assertEqual(t.icon.toolTip(), "Saylight · Choose which pages to read")
+        self.assertEqual(t._icon_spec()["mode"], "idle")
+        t.set_state("ocr_notice", {"notice": "screen_language", "severity": "critical"})
+        self.assertEqual(t.icon.toolTip(), "Saylight · Can't read the screen (language pack needed)")
+        self.assertEqual(t._badge, "Critical")
+        t.set_state("ocr_notice", {"notice": "screen_nothing", "severity": "caution"})
+        self.assertEqual(t._badge, "Caution")
 
 
 if __name__ == "__main__":

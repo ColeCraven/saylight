@@ -8,12 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..ocr.model import SCAN_NOTICES, OcrText, ScreenText
+
 DOCUMENT_KINDS = ("pdf", "docx", "txt", "md")
 ASIDE_KINDS = ("footnote", "caption", "table", "note")
 SOURCE_KINDS = ("selection", "file", "screen")
 # "password": the PDF needs a password (or the one given didn't work); "protected": it is encrypted in a way
-# Saylight can't open at all.
-LOAD_ERROR_KINDS = ("password", "protected", "scanned", "unsupported", "too_large", "corrupt", "empty", "io")
+# Saylight can't open at all. The scan kinds are a scanned PDF whose pages couldn't be read with OCR; the
+# engine shows them as OCR notices over the reading underneath.
+LOAD_ERROR_KINDS = ("password", "protected", "scanned", "unsupported", "too_large", "corrupt", "empty",
+                    "io") + SCAN_NOTICES
 
 
 @dataclass(frozen=True)
@@ -38,18 +42,19 @@ class LoadedDocument:
     encoding: str = ""                 # what a text file was decoded as; "" for PDF and Word
     citation_spans: list[tuple[int, int]] = field(default_factory=list)  # Word's own citation fields
     page_starts: list[int] = field(default_factory=list)            # offset in `text` where each page starts
+    scan_dpi: int = 0                  # the lowest effective dpi of the pages read with OCR; 0 for no OCR
 
 
 @dataclass(frozen=True)
 class DocSource:
-    """Where the reading came from: highlighted text, a file, or (later) the screen."""
+    """Where the reading came from: highlighted text, a file, or an area of the screen."""
     kind: str                          # one of SOURCE_KINDS
     path: str = ""                     # files only; never logged
     title: str = ""                    # files only; never logged
-    screen: object | None = None       # the screen text a "screen" reading came from
+    screen: ScreenText | None = None   # "screen" only: where its words are on the screen
 
 
-RawInput = str | LoadedDocument        # what a reading is built from, kept so it can be rebuilt
+RawInput = str | LoadedDocument | OcrText  # what a reading is built from, kept so it can be rebuilt
 
 
 class LoadError(Exception):

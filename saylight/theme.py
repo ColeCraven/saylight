@@ -46,6 +46,7 @@ _DARK = {
     "KeycapFill": "#383838", "KeycapStroke": "#4D4D4D", "TipSurface": "#383838",
     "SegmentTrack": "#232323", "SegmentSelected": "#454545", "ProgressInactive": "#9A9A9A",
     "Caution": "#FCE100", "Critical": "#FF99A4",
+    "Scrim": "#66000000", "SelectionEdge": "#FFFFFF", "SelectionHalo": "#80000000", "ModeFrame": "transparent",
 }
 _LIGHT = {
     "Surface": "#F9F9F9", "TextPrimary": "#1A1A1A", "TextSecondary": "#5F5F5F", "TextDisabled": "#9F9F9F",
@@ -56,14 +57,18 @@ _LIGHT = {
     "KeycapFill": "#FFFFFF", "KeycapStroke": "#D1D1D1", "TipSurface": "#FFFFFF",
     "SegmentTrack": "#F3F3F3", "SegmentSelected": "#FFFFFF", "ProgressInactive": "#7A7A7A",
     "Caution": "#9D5D00", "Critical": "#C42B1C",
+    "Scrim": "#66000000", "SelectionEdge": "#FFFFFF", "SelectionHalo": "#80000000", "ModeFrame": "transparent",
 }
+# Scrim, SelectionHalo and ModeFrame are the screen-selection overlay's: the 40% scrim over every screen, the dark
+# halo either side of the white selection ring (so it shows on white, black and the scrim), and the frame high
+# contrast draws along each screen edge instead of a scrim.
 # Derived from the accent. WordHighlightText is the current word's text colour, and the *Outline tokens
 # are transparent except in high contrast, which draws 1 px outlines.
 _DERIVED = ("Accent", "AccentHover", "AccentPressed", "OnAccent", "OnAccentPressed", "WordHighlight",
             "WordHighlightPaused", "WordHighlightText", "HoverOutline", "TrackOutline", "DisabledOutline")
 TOKENS = tuple(_DARK) + _DERIVED
 
-# High contrast (SPI_GETHIGHCONTRAST): every token comes from a system colour.
+# High contrast (SPI_GETHIGHCONTRAST): every token comes from a system colour, or is "transparent".
 _HC = {
     "Surface": "window", "TextPrimary": "windowtext", "TextSecondary": "windowtext", "TextDisabled": "graytext",
     "Accent": "highlight", "AccentHover": "highlight", "AccentPressed": "highlight", "AccentDisabled": "window",
@@ -76,8 +81,10 @@ _HC = {
     "SegmentTrack": "window", "SegmentSelected": "window", "ProgressInactive": "windowtext",
     "Caution": "windowtext", "Critical": "windowtext",
     "HoverOutline": "highlight", "TrackOutline": "windowtext", "DisabledOutline": "graytext",
+    "Scrim": "transparent", "SelectionEdge": "highlight", "SelectionHalo": "window", "ModeFrame": "highlight",
 }
 SYS_COLOR_NAMES = ("window", "windowtext", "highlight", "highlighttext", "graytext")
+HC_TRANSPARENT = "transparent"  # the one _HC name that isn't a system colour
 _HC_DEFAULT = {"window": (0, 0, 0), "windowtext": (255, 255, 255), "highlight": (26, 235, 255),
                "highlighttext": (0, 0, 0), "graytext": (63, 242, 63)}  # "High Contrast Black"
 
@@ -196,6 +203,17 @@ _HC_READING = {"background": "Surface", "text": "TextPrimary", "secondary": "Tex
                "keycap_fill": "KeycapFill", "keycap_stroke": "KeycapStroke", "keycap_text": "TextPrimary",
                "skipped": "TextDisabled"}
 READING_ROLES = tuple(_HC_READING)
+
+# --- Reading from the screen and the reading ruler -----------------------------------
+#
+# The on-screen marks use screen_mark_color() at these alphas: the sentence band in Word and in Sentence
+# highlighting, and the spoken word while reading and while paused. The page's own ink stays at 7:1 or better
+# under every one of them (tests/test_theme.py checks reference pages).
+SCREEN_MARK_ALPHA = {"band": 0.16, "band_sentence": 0.24, "word": 0.40, "word_paused": 0.20}
+# The ruler's clear band in DIP at k = 1 (about 1, 3 and 5 lines), and how much of the reading background
+# covers the rest of the screen. Keep the keys in step with settings.RULER_HEIGHTS and RULER_DIMS.
+RULER_BAND = {"small": 36, "medium": 72, "large": 120}
+RULER_DIM = {"light": 0.40, "medium": 0.60, "strong": 0.80}
 
 # --- Fonts ---------------------------------------------------------------------
 
@@ -446,6 +464,33 @@ class Theme(QObject):
                 "keycap_text": given("keycap_text") or QColor(text),
                 "skipped": given("skipped") or given("secondary") or self.color("TextSecondary")}
 
+    def screen_mark_color(self, light_page: bool) -> QColor:
+        """The colour of the word and band marked on the screen while reading from it (see SCREEN_MARK_ALPHA).
+
+        On a light page it is the reading tint's light-mode pill, so the screen matches the card. On a dark page
+        it is Soft dark's pill whatever the tint: a light pill would leave light ink well under 7:1. High contrast
+        draws outlines instead of fills; this is then the Highlight colour."""
+        if self._state.high_contrast:
+            return self.color("Accent")
+        if not light_page:
+            return QColor(_SOFT_DARK["highlight"])
+        tint = READING_PRESETS.get(self._settings.get("reading_tint"), READING_PRESETS["auto"])
+        return QColor(tint["light"].get("highlight") or _CREAM["highlight"])
+
+    def ruler_colors(self, dim: str | None = None) -> dict[str, QColor]:
+        """The reading ruler's colours: "dim" covers the screen above and below the band (the reading background
+        at RULER_DIM[dim]; `dim` defaults to the ruler.dim setting), "edge" is the 1 px line on each dim area's
+        band side (the card hairline) and "line" draws the band's two lines when there is no dimming (the
+        reading pill colour). High contrast never dims: "dim" is transparent and both lines are Highlight."""
+        if self._state.high_contrast:
+            line = self.color("Accent")
+            return {"dim": QColor(Qt.GlobalColor.transparent), "edge": QColor(line), "line": line}
+        colors = self.reading_colors()
+        shade = QColor(colors["background"])
+        level = self._settings.get("ruler.dim") if dim is None else dim
+        shade.setAlphaF(RULER_DIM.get(level, RULER_DIM["medium"]))
+        return {"dim": shade, "edge": colors["edge"], "line": colors["highlight"]}
+
     # --- Fonts and metrics
 
     def font(self, role: str) -> QFont:
@@ -501,6 +546,7 @@ class Theme(QObject):
         self._fonts.clear()
         if st.high_contrast:
             sys_colors = {name: QColor(*rgb) for name, rgb in st.sys_colors}
+            sys_colors[HC_TRANSPARENT] = QColor(Qt.GlobalColor.transparent)
             self._tokens = {token: QColor(sys_colors[name]) for token, name in _HC.items()}
             self._tray = {token: QColor(sys_colors["windowtext"]) for token in TRAY_TOKENS}  # monochrome
             self._accent_source = "high_contrast"

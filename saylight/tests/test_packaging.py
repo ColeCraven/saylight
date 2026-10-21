@@ -497,3 +497,37 @@ class DocumentsPackagingTests(unittest.TestCase):
     def test_the_test_copy_gets_its_own_open_with_pipe(self):
         from saylight import single_instance
         self.assertEqual(single_instance.SERVER_BASE, mtc.read_identity()["real"]["OpenPipe"])
+
+
+class WinrtPackagingTests(unittest.TestCase):
+    """1.4: the WinRT bindings (OCR, PDF rendering, Windows' voices) are pinned, bundled under MIT, and winrt's
+    own MSVCP140.dll is left out."""
+
+    PACKAGES = ("winrt-runtime", "winrt-Windows.Foundation", "winrt-Windows.Foundation.Collections",
+                "winrt-Windows.Storage", "winrt-Windows.Storage.Streams", "winrt-Windows.Graphics.Imaging",
+                "winrt-Windows.Media.Ocr", "winrt-Windows.Globalization", "winrt-Windows.Data.Pdf",
+                "winrt-Windows.Media.SpeechSynthesis", "winrt-Windows.Media.Core")
+
+    def test_pinned_for_the_build_and_loosely_for_the_python_zip(self):
+        pins = _read(os.path.join(REPO, "requirements.txt")).splitlines()
+        zip_script = _read(os.path.join(REPO, "scripts", "build_python_zip.py"))
+        for name in self.PACKAGES:
+            self.assertIn(f"{name}==3.2.1", pins)
+            self.assertIn(f"\n{name}>=3.2.1,<4\n", zip_script)
+
+    def test_the_spec_bundles_winrt_without_its_msvcp140(self):
+        spec = _read(os.path.join(PACKAGING, "saylight.spec"))
+        self.assertIn('find_spec("winrt")', spec)  # listed from the files: importing winrt first crashes
+        self.assertIn(r'winrt[\\/]msvcp140\.dll$', spec)
+
+    def test_the_gate_keeps_one_licence_text_for_every_winrt_package(self):
+        self.assertTrue(os.path.isfile(os.path.join(REPO, "licenses", cn.WINRT_TEXT)))
+        self.assertEqual(cn.extra_texts("winrt-windows-media-ocr"), (cn.WINRT_TEXT,))
+        self.assertEqual(cn.extra_texts("edge-tts"), ("GPL-3.0.txt",))
+        self.assertEqual(cn.extra_texts("pypdf"), ())
+
+    def test_the_self_test_checks_ocr_and_the_missing_msvcp140(self):
+        self.assertIn(r"winrt\msvcp140.dll", selftest.NOT_BUNDLED_FILES)
+        src = _read(os.path.join(PACKAGING, "selftest.py"))
+        for name in ('check("ocr", ocr)', 'check("scanned_pdf", scanned_pdf)'):
+            self.assertIn(name, src)

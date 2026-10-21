@@ -23,6 +23,7 @@ from .academic_text import (chunk_sentences, chunk_text, normalize_pair, referen
                             split_sentences)
 from .alignment import Aligned, Edit, diff_edits
 from .documents.model import DocSource, LoadedDocument
+from .ocr.model import OcrText
 
 log = logging.getLogger("saylight.text_model")
 
@@ -97,13 +98,14 @@ class Document:
                                            pronunciations=pronunciations))
 
     @classmethod
-    def build(cls, raw: str | LoadedDocument, options: BuildOptions) -> Document:
-        """A Document from text, or from a file's text with its notes and reference list after the main text."""
+    def build(cls, raw: str | LoadedDocument | OcrText, options: BuildOptions) -> Document:
+        """A Document from text (or the text OCR found), or from a file's text with its notes and reference list
+        after the main text."""
         b = _Builder(options)
         if isinstance(raw, LoadedDocument):
             b.loaded(raw)
         else:
-            b.body(raw)
+            b.body(getattr(raw, "text", raw))  # text, or an OcrText from the screen
         return b.document()
 
     # --- queries ----------------------------------------------------------------------------------------------
