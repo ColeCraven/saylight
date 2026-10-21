@@ -1,5 +1,5 @@
-"""Tests for the tray menu (ui/tray.py): the Type or paste, Clear text and Undo clear items, and the Type or paste
-box closing when the menu opens or the icon is clicked.
+"""Tests for the tray menu (ui/tray.py): the Open a file placeholder, the Type or paste, Clear text and Undo clear
+items, Settings, and the Type or paste box closing when the menu opens or the icon is clicked.
 
 The tray icon is created but never shown; the menu is built directly.
 """
@@ -122,9 +122,22 @@ class TrayMenuTests(unittest.TestCase):
         return {a.text(): a.isEnabled() for a in self.tray.menu.actions() if not a.isSeparator()}
 
     def box_group(self) -> list[str]:
-        """The items between the pop-ups toggle and Speed."""
+        """The items between the Open a file placeholder and Speed."""
         texts = [a.text() for a in self.tray.menu.actions() if not a.isSeparator()]
-        return texts[texts.index("Status pop-ups while hidden") + 1:texts.index("Speed")]
+        return texts[texts.index("Open a file…") + 1:texts.index("Speed")]
+
+    def test_open_a_file_is_a_disabled_placeholder(self) -> None:
+        items = self.build("ready")
+        texts = [a.text() for a in self.tray.menu.actions() if not a.isSeparator()]
+        self.assertFalse(items["Open a file…"])
+        self.assertEqual(texts.index("Open a file…") + 1, texts.index("Type or paste text…"))
+
+    def test_settings_opens_the_settings_page(self) -> None:
+        self.build("ready")
+        actions = {a.text(): a for a in self.tray.menu.actions()}
+        self.assertNotIn("Reading display…", actions)
+        actions["Settings…"].trigger()
+        self.assertEqual(self.ctl.calls, [("open_settings",)])
 
     def test_ready_offers_type_or_paste_only(self) -> None:
         items = self.build("ready")

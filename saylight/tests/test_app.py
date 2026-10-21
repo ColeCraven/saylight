@@ -1,10 +1,11 @@
-"""Tests for saylight_app.py: moving the settings over from the earlier name, replacing the earlier install, and
-the App's handling of the Type or paste box, Clear and Undo.
+"""Tests for saylight_app.py: choosing the settings file, the crash-on-start message, the commands (also as the
+installed Saylight.exe), and the App: its wiring for the settings pages and its handling of the Type or paste
+box, Clear and Undo.
 
 No test here touches the registry, named events or the Start menu: the system operations are replaced by a fake,
 and the modules that reach the real ones are swapped for stand-ins that fail the test if used. The App tests build
-it from fakes (engine, input, foreground, panel, box, tray, HUD), with Win32 replaced: no window is shown, no
-hotkey is registered and nothing plays.
+it from fakes (engine, input, foreground, panel, box, tray, HUD, voices and the update check), with Win32
+replaced: no window is shown, no hotkey is registered and nothing plays. The data folder is a temporary one.
 """
 
 import contextlib
@@ -19,95 +20,171 @@ import unittest
 from unittest import mock
 
 from PySide6.QtCore import QCoreApplication, QObject, QRect, QTimer, Signal
+from PySide6.QtNetwork import QNetworkInformation
 from PySide6.QtWidgets import QApplication
 
+import saylight
 import saylight_app as A
-from saylight import win32
+from saylight import paths, voices, win32
 from saylight.engine import ClearedReading
 from saylight.input_thread import HK_COMPOSE, HK_PANEL
 from saylight.settings import Settings
 from saylight.ui.compose import ComposeSession, ComposeSnapshot
+from saylight.voices.base import VoiceInfo
+from saylight.voices.catalog import VoiceCatalog
 
 _app = None
+_data_env = None
 
 
 def setUpModule() -> None:
-    global _app
+    global _app, _data_env
     _app = QCoreApplication.instance() or QApplication([sys.argv[0], "-platform", "windows"])
+    _data_env = mock.patch.dict(os.environ, {"SAYLIGHT_DATA_DIR": tempfile.mkdtemp(prefix="saylight_app_data_")})
+    _data_env.start()
 
 
-class MigrateSettingsTests(unittest.TestCase):
+def tearDownModule() -> None:
+    folder = os.environ["SAYLIGHT_DATA_DIR"]
+    _data_env.stop()
+    shutil.rmtree(folder, True)
+
+
+class SettingsFileTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.dir = tempfile.mkdtemp(prefix="saylight_app_test_")
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.new = os.path.join(self.dir, "saylight_settings.json")
-        self.old = os.path.join(self.dir, "read_aloud_settings.json")
-        self.sleeps: list[float] = []
-        patcher = mock.patch.object(A, "time", types.SimpleNamespace(sleep=self.sleeps.append))
+        self.app_dir = tempfile.mkdtemp(prefix="saylight_app_test_")
+        self.addCleanup(shutil.rmtree, self.app_dir, True)
+        patcher = mock.patch.object(A.paths, "install_dir", lambda: self.app_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.data_file = paths.settings_path()
+        self.addCleanup(lambda: os.path.exists(self.data_file) and os.remove(self.data_file))
 
-    def write(self, path: str, obj: dict) -> None:
+    def write(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f)
+            json.dump({"speed": 1.1}, f)
 
-    def read(self, path: str) -> dict:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+    def test_the_data_folder_file_is_used(self) -> None:
+        self.assertEqual(A.settings_file(), self.data_file)
+        self.write(self.data_file)
+        self.write(os.path.join(self.app_dir, "saylight_settings.json"))
+        self.assertEqual(A.settings_file(), self.data_file)
 
-    def test_names_match_the_app(self):
-        self.assertEqual(os.path.basename(A.SETTINGS_PATH), "saylight_settings.json")
-        self.assertEqual(os.path.basename(A.OLD_SETTINGS_PATH), "read_aloud_settings.json")
-        self.assertEqual(os.path.dirname(A.SETTINGS_PATH), os.path.dirname(A.OLD_SETTINGS_PATH))
+    def test_an_earlier_file_that_could_not_move_is_used_this_session(self) -> None:
+        for name in ("read_aloud_settings.json", "saylight_settings.json"):  # the newer name wins
+            earlier = os.path.join(self.app_dir, name)
+            self.write(earlier)
+            with self.subTest(name=name), self.assertLogs("saylight.app", "INFO") as logs:
+                self.assertEqual(A.settings_file(), earlier)
+            self.assertNotIn(self.app_dir, " ".join(logs.output))
 
-    def test_old_file_is_renamed_and_its_settings_load(self):
-        mine = {"speed": 1.25, "volume": 40, "reading_font": "sitka", "panel": {"visible": False}}
-        self.write(self.old, mine)
-        with self.assertLogs("saylight.app", "INFO") as logs:
-            path = A.migrate_settings(self.new, self.old)
-        self.assertEqual(path, self.new)
-        self.assertFalse(os.path.exists(self.old))
-        self.assertEqual(self.read(self.new), mine)
-        self.assertIn("read_aloud_settings.json", logs.output[0])
-        settings = Settings(path)
-        self.assertEqual((settings.get("speed"), settings.get("volume"), settings.get("reading_font")),
-                         (1.25, 40, "sitka"))
 
-    def test_existing_new_file_wins_and_old_is_left_alone(self):
-        self.write(self.new, {"speed": 0.9})
-        self.write(self.old, {"speed": 1.5})
-        with self.assertNoLogs("saylight.app", "INFO"):
-            self.assertEqual(A.migrate_settings(self.new, self.old), self.new)
-        self.assertEqual(self.read(self.new), {"speed": 0.9})
-        self.assertEqual(self.read(self.old), {"speed": 1.5})
+class CrashLogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        folder = tempfile.mkdtemp(prefix="saylight_app_test_")
+        self.addCleanup(shutil.rmtree, folder, True)
+        self.path = os.path.join(folder, "saylight_crash.log")
 
-    def test_nothing_to_migrate(self):
-        self.assertEqual(A.migrate_settings(self.new, self.old), self.new)
-        self.assertEqual(os.listdir(self.dir), [])
+    def write(self, data: bytes) -> None:
+        with open(self.path, "wb") as f:
+            f.write(data)
 
-    def test_brief_lock_is_retried(self):
-        self.write(self.old, {"speed": 1.1})
-        real, calls = os.rename, []
+    def test_a_long_crash_log_keeps_its_newest_lines(self) -> None:
+        lines = [f"Windows fatal exception: code 0x8001010d, dump {i:05d}\n".encode() for i in range(20_000)]
+        self.write(b"".join(lines))
+        A.trim_crash_log(self.path, limit=100_000)
+        with open(self.path, "rb") as f:
+            kept = f.read()
+        self.assertLessEqual(len(kept), 50_000)
+        self.assertTrue(kept.endswith(lines[-1]))
+        self.assertIn(kept[:kept.index(b"\n") + 1], lines)  # starts on a whole line
 
-        def flaky(src, dst):
-            calls.append(src)
-            if len(calls) == 1:
-                raise PermissionError(32, "in use")
-            real(src, dst)
+    def test_a_short_or_missing_crash_log_is_left_alone(self) -> None:
+        A.trim_crash_log(self.path)
+        self.assertFalse(os.path.exists(self.path))
+        self.write(b"Saylight couldn't start\n")
+        A.trim_crash_log(self.path)
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), b"Saylight couldn't start\n")
 
-        with mock.patch.object(A.os, "rename", flaky), self.assertLogs("saylight.app", "INFO"):
-            self.assertEqual(A.migrate_settings(self.new, self.old), self.new)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self.read(self.new), {"speed": 1.1})
 
-    def test_lasting_lock_uses_the_old_file_this_session(self):
-        self.write(self.old, {"speed": 1.1})
-        with mock.patch.object(A.os, "rename", side_effect=PermissionError(32, "in use")) as rename, \
-                self.assertLogs("saylight.app", "ERROR"):
-            self.assertEqual(A.migrate_settings(self.new, self.old), self.old)
-        self.assertEqual(rename.call_count, 4)
-        self.assertEqual(self.read(self.old), {"speed": 1.1})  # untouched, so the next start can try again
-        self.assertFalse(os.path.exists(self.new))
+class StartFailureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.shown: list[str] = []
+        self.crash = paths.crash_path()
+        self.addCleanup(lambda: os.path.exists(self.crash) and os.remove(self.crash))
+
+    def run_failing(self, **patches) -> int:
+        with mock.patch.multiple(A, show_start_failure=self.shown.append, App=A.App, **patches), \
+                self.assertLogs("saylight", "ERROR"):
+            return A.run_safely()
+
+    def test_a_failed_start_is_recorded_and_explained(self) -> None:
+        def boom():
+            raise RuntimeError("no screen")
+
+        self.assertEqual(self.run_failing(_build_app_class=lambda: object, run=boom), 1)
+        self.assertEqual(self.shown, [self.crash])
+        with open(self.crash, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(f"Saylight {saylight.__version__} couldn't start", text)
+        self.assertIn("RuntimeError: no screen", text)
+
+    def test_a_failure_while_loading_is_caught_too(self) -> None:
+        def broken():
+            raise ImportError("missing piece")
+
+        self.assertEqual(self.run_failing(_build_app_class=broken), 1)
+        self.assertEqual(self.shown, [self.crash])
+
+    def test_the_message_names_the_file_and_opens_its_folder(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        seen, opened = [], []
+
+        def exec_(box):
+            seen.append((box.text(), [b.text() for b in box.buttons()], box.isVisible()))
+            return 0
+
+        def clicked(box):
+            return next(b for b in box.buttons() if b.text() == "Open folder")
+
+        path = os.path.join(paths.data_dir(), "saylight_crash.log")
+        with mock.patch.object(QMessageBox, "exec", exec_), mock.patch.object(QMessageBox, "clickedButton", clicked), \
+                mock.patch.object(A.os, "startfile", opened.append, create=True):
+            A.show_start_failure(path)
+        text, buttons, visible = seen[0]
+        self.assertEqual(text, f"Saylight couldn't start. Details are in {path}")
+        self.assertIn("Open folder", buttons)
+        self.assertFalse(visible)
+        self.assertEqual(opened, [paths.data_dir()])
+
+    def test_without_qt_a_windows_message_is_shown(self) -> None:
+        calls, opened = [], []
+
+        def message_box(_owner, text, title, flags):
+            calls.append((text, title, flags))
+            return A.IDYES
+
+        fake_ctypes = types.SimpleNamespace(windll=types.SimpleNamespace(
+            user32=types.SimpleNamespace(MessageBoxW=message_box)))
+        with mock.patch("PySide6.QtWidgets.QMessageBox", side_effect=RuntimeError("no Qt")), \
+                mock.patch.object(A, "ctypes", fake_ctypes), mock.patch.object(A.os, "startfile", opened.append):
+            A.show_start_failure("C:\\data\\saylight_crash.log")
+        self.assertEqual(calls[0][1], "Saylight")
+        self.assertTrue(calls[0][0].startswith("Saylight couldn't start. Details are in C:\\data\\saylight_crash.log"))
+        self.assertTrue(calls[0][2] & A.MB_YESNO)
+        self.assertEqual(opened, ["C:\\data"])
+
+    def test_with_no_crash_file_there_is_no_folder_to_open(self) -> None:
+        calls = []
+        fake_ctypes = types.SimpleNamespace(windll=types.SimpleNamespace(
+            user32=types.SimpleNamespace(MessageBoxW=lambda *a: calls.append(a) or A.IDYES)))
+        with mock.patch("PySide6.QtWidgets.QMessageBox", side_effect=RuntimeError("no Qt")), \
+                mock.patch.object(A, "ctypes", fake_ctypes), mock.patch.object(A.os, "startfile") as startfile:
+            A.show_start_failure("")
+        self.assertEqual(calls[0][1], "Saylight couldn't start.")
+        self.assertFalse(calls[0][3] & A.MB_YESNO)
+        startfile.assert_not_called()
 
 
 class _Forbidden:
@@ -141,6 +218,9 @@ class FakeSystem:
         self.run_values.discard(name)
         return found
 
+    def read_run_value(self, name: str) -> str | None:
+        return '"value"' if name in self.run_values else None
+
     def remove_file(self, path: str) -> bool:
         self.calls.append(("remove", path))
         found = path in self.files
@@ -154,7 +234,8 @@ class FakeSystem:
     def installed(self):
         """Route saylight_app's system operations here; the real modules behind them are made unusable."""
         with mock.patch.multiple(A, signal_quit=self.signal_quit, set_run_value=self.set_run_value,
-                                 delete_run_value=self.delete_run_value, remove_file=self.remove_file,
+                                 delete_run_value=self.delete_run_value, read_run_value=self.read_run_value,
+                                 remove_file=self.remove_file,
                                  create_shortcut=lambda: self.calls.append(("create_shortcut",)),
                                  start=lambda: self.calls.append(("start",)),
                                  time=types.SimpleNamespace(sleep=self.sleep), winreg=_Forbidden("winreg"),
@@ -238,6 +319,25 @@ class OldInstallTests(unittest.TestCase):
         self.assertIn(("signal", NEW_EVENT), fake.calls)
         self.assertIn(("signal", OLD_EVENT), fake.calls)
         self.assertIn("Saylight has quit.", out.getvalue())
+
+    def test_the_sign_in_command_quotes_each_part(self):
+        pythonw = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "pythonw.exe")
+        self.assertEqual(A.run_command(), f'"{pythonw}" "{os.path.join(paths.install_dir(), "saylight_app.py")}"')
+        exe = r"C:\Users\Ann Lee\AppData\Local\Programs\Saylight\Saylight.exe"
+        with mock.patch.multiple(sys, frozen=True, executable=exe, create=True):
+            self.assertEqual(A.run_command(), f'"{exe}"')  # as the installer writes it
+
+    def test_installed_install_and_uninstall_leave_the_start_menu_to_the_installer(self):
+        fake = FakeSystem(run_values={"ReadAloudHotkey"}, files={OLD_LNK, NEW_LNK})
+        exe = r"C:\Programs\Saylight\Saylight.exe"
+        with mock.patch.multiple(sys, frozen=True, executable=exe, create=True), fake.installed():
+            A.install()
+            self.assertNotIn(("create_shortcut",), fake.calls)
+            self.assertIn(("set_run", "Saylight", f'"{exe}"'), fake.calls)
+            self.assertEqual(fake.calls[-1], ("start",))
+            A.uninstall()
+        self.assertEqual(fake.run_values, set())
+        self.assertEqual(fake.files, {NEW_LNK})  # Settings > Apps removes it
 
     def test_quit_signals_both_names(self):
         for running, expected in (({OLD_EVENT}, True), ({NEW_EVENT}, True), (set(), False)):
@@ -562,7 +662,7 @@ class FakeHud:
 
 
 class Quiet:
-    """Any call does nothing: the tray, tooltips, synth and player."""
+    """Any call does nothing: the tray, tooltips and player."""
 
     def __init__(self, *_args, **_kw) -> None:
         pass
@@ -571,14 +671,83 @@ class Quiet:
         return lambda *_args, **_kw: None
 
 
+ONLINE_VOICE = VoiceInfo("edge:en-US-AvaNeural", "edge", "Ava", "en-US", "Female", False)
+LOCAL_VOICE = VoiceInfo("windows:David", "windows", "David", "en-US", "Male", True)
+
+
+class FakeRouter:
+    """The engine's synth, as the App sees it."""
+
+    def __init__(self, *, settings=None, parent=None, temp_root=None) -> None:
+        self.settings, self.parent, self.reachable = settings, parent, []
+
+    def voices(self) -> list:
+        return [ONLINE_VOICE, LOCAL_VOICE]
+
+    def set_reachable(self, on: bool) -> None:
+        self.reachable.append(on)
+
+
+class FakePreview(QObject):
+    def __init__(self, factory, volume, parent=None) -> None:
+        super().__init__(parent)
+        self.factory, self.volume, self.shut = factory, volume, False
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        world.log("preview_shutdown")
+        self.shut = True
+
+
+class FakeUpdates(QObject):
+    quitRequested = Signal()
+
+    def __init__(self, settings, current_version: str, *, online, busy, parent=None) -> None:
+        super().__init__(parent)
+        self.settings, self.current_version, self.online, self.busy = settings, current_version, online, busy
+        self.started = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+
+class FakeNetwork(QObject):
+    """QNetworkInformation with the reachability a test sets."""
+
+    Reachability = QNetworkInformation.Reachability
+    reachabilityChanged = Signal(object)
+    current = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = QNetworkInformation.Reachability.Unknown
+
+    def reachability(self):
+        return self.value
+
+    def set(self, value) -> None:
+        self.value = value
+        self.reachabilityChanged.emit(value)
+
+    @staticmethod
+    def loadDefaultBackend() -> bool:
+        return True
+
+    @classmethod
+    def instance(cls):
+        return cls.current
+
+
 FAKES = {"saylight.engine.Engine": FakeEngine, "saylight.input_thread.InputThread": FakeInput,
          "saylight.foreground.ForegroundTracker": FakeForeground, "saylight.ui.panel.Panel": FakePanel,
          "saylight.ui.compose.ComposeWindow": FakeCompose, "saylight.ui.hud.Hud": FakeHud,
-         "saylight.ui.tray.Tray": Quiet, "saylight.ui.tip.TipManager": Quiet, "saylight.synth.SynthWorker": Quiet,
+         "saylight.ui.tray.Tray": Quiet, "saylight.ui.tip.TipManager": Quiet, "saylight.voices.make_router": FakeRouter,
+         "saylight.voices.preview.VoicePreview": FakePreview, "saylight.update_service.UpdateService": FakeUpdates,
          "saylight.player.PlayerThread": Quiet}
 
 
-class ComposeFlowTests(unittest.TestCase):
+class AppTest(unittest.TestCase):
+    """Builds the App from the fakes."""
+
     App = None
 
     @classmethod
@@ -615,6 +784,110 @@ class ComposeFlowTests(unittest.TestCase):
 
     def focus_changes(self) -> list:
         return [e[1] for e in world.events if e[0] == "set_foreground"]
+
+
+class SettingsPagesTests(AppTest):
+    """What the App offers the settings pages, and how it wires the voices and the update check."""
+
+    def test_the_pages_get_the_voices_updates_and_version(self) -> None:
+        app = self.app
+        self.assertEqual(app.version, saylight.__version__)
+        self.assertEqual(saylight.__version__, "1.2.0")
+        self.assertIsInstance(app.router, FakeRouter)
+        self.assertIs(app.router.settings, app.settings)
+        self.assertIs(app.router.parent, app)
+        self.assertIsInstance(app.catalog, VoiceCatalog)
+        self.assertIs(app.preview.factory, voices.make_backend)
+        app.settings.set("volume", 35)
+        self.assertEqual(app.preview.volume(), 35)
+        self.assertIsInstance(app.updates, FakeUpdates)
+        self.assertIs(app.updates.settings, app.settings)
+        self.assertEqual(app.updates.current_version, saylight.__version__)
+
+    def test_the_catalog_lists_local_voices_first_and_the_online_list_once(self) -> None:
+        listed = self.app.catalog.voices()
+        self.assertEqual(listed[0], LOCAL_VOICE)
+        self.assertEqual([v.id for v in listed].count(ONLINE_VOICE.id), 1)
+
+    def test_set_voice_stores_the_full_id(self) -> None:
+        self.app.set_voice("en-GB-SoniaNeural")
+        self.assertEqual(self.app.settings.get("voice"), "edge:en-GB-SoniaNeural")
+        self.app.set_voice("edge:en-US-AvaNeural")
+        self.assertEqual(self.app.settings.get("voice"), "edge:en-US-AvaNeural")
+        with self.assertRaises(ValueError):
+            self.app.set_voice("")
+
+    def test_no_update_check_during_a_reading(self) -> None:
+        busy = self.app.updates.busy
+        for state, expected in (("ready", False), ("finished", False), ("error_offline", False), ("copying", True),
+                                ("preparing", True), ("reading", True), ("waiting", True), ("paused", True)):
+            self.e.state = state
+            self.assertIs(busy(), expected, state)
+
+    def test_start_starts_the_update_check_and_follows_the_network(self) -> None:
+        net = FakeNetwork()
+        engine_online: list[bool] = []
+        self.e.set_online = engine_online.append
+        with mock.patch.object(FakeNetwork, "current", net), \
+                mock.patch("PySide6.QtNetwork.QNetworkInformation", FakeNetwork):
+            self.app.start()
+        online = self.app.updates.online
+        self.assertEqual(self.app.updates.started, 1)
+        self.assertTrue(online())                         # an unknown state counts as online
+        R = QNetworkInformation.Reachability
+        net.set(R.Disconnected)
+        self.assertFalse(online())
+        net.set(R.Online)
+        self.assertTrue(online())
+        self.assertEqual(engine_online, [True, False, True])
+        self.assertEqual(self.app.router.reachable, [True, False, True])
+
+    def test_setup_starting_quits_the_app(self) -> None:
+        quits = []
+        self.app.qapp = mock.Mock(quit=lambda: quits.append(self.c.isVisible()))
+        self.app.open_compose("button")
+        self.app.updates.quitRequested.emit()
+        self.assertEqual(quits, [False])
+
+    def test_quitting_stops_the_voice_preview(self) -> None:
+        self.app._shutdown()
+        self.assertTrue(self.app.preview.shut)
+
+    def test_start_with_windows(self) -> None:
+        fake = FakeSystem()
+        with fake.installed():
+            self.assertFalse(self.app.start_with_windows())
+            self.assertTrue(self.app.set_start_with_windows(True))
+            self.assertTrue(self.app.start_with_windows())
+            self.assertIn(("set_run", "Saylight", A.run_command()), fake.calls)
+            self.assertTrue(self.app.set_start_with_windows(False))
+            self.assertFalse(self.app.start_with_windows())
+        self.assertEqual(fake.run_values, set())
+
+    def test_a_registry_failure_is_reported_not_raised(self) -> None:
+        def denied(*_args):
+            raise PermissionError(5, "denied")
+
+        with mock.patch.multiple(A, set_run_value=denied, read_run_value=denied), \
+                self.assertLogs("saylight.app", "WARNING"):
+            self.assertFalse(self.app.set_start_with_windows(True))
+            self.assertFalse(self.app.start_with_windows())
+
+    def test_the_licence_notices(self) -> None:
+        self.assertEqual(self.app.notices_path(), os.path.join(paths.install_dir(), "THIRD_PARTY_NOTICES.md"))
+        exe = os.path.join(tempfile.gettempdir(), "Saylight", "Saylight.exe")
+        with mock.patch.multiple(sys, frozen=True, executable=exe, create=True):
+            self.assertEqual(self.app.notices_path(), os.path.join(os.path.dirname(exe), "THIRD_PARTY_NOTICES.txt"))
+        opened = []
+        with mock.patch.object(A.os, "startfile", opened.append):
+            self.assertTrue(self.app.open_notices())
+        self.assertEqual(opened, [self.app.notices_path()])
+        with mock.patch.object(A.os, "startfile", side_effect=OSError(2, "gone")), \
+                self.assertLogs("saylight.app", "WARNING"):
+            self.assertFalse(self.app.open_notices())
+
+
+class ComposeFlowTests(AppTest):
 
     # --- Opening
 

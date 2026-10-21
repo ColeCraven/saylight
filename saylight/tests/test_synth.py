@@ -1,6 +1,7 @@
-"""Tests for synth.py.
+"""Tests for the online voice: voices/edge.py, which synth.py re-exports as Saylight 1.0's SynthWorker.
 
-One real edge-tts request (word timing against the MCI length); a refused local proxy for the
+Every worker test runs twice: on SynthWorker directly, and through SynthRouter, the engine's synth from
+v1.2. One real edge-tts request (word timing against the MCI length); a refused local proxy for the
 offline path (no request leaves the machine); fakes for everything timing-sensitive. No audio is
 played: the MP3 is only opened in MCI to read its length.
 """
@@ -9,9 +10,9 @@ import asyncio
 import functools
 import glob
 import os
-import re
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -26,7 +27,10 @@ from PySide6.QtCore import QCoreApplication, QEventLoop
 from PySide6.QtNetwork import QNetworkInformation
 
 from .. import player, synth
+from ..audio_cache import LOCK_NAME, AudioCache
 from ..synth import SynthWorker, Word, classify_error, rate_string
+from ..voices import edge
+from ..voices.router import SynthRouter
 
 VOICE = "en-US-AvaNeural"
 TEXT = "Saylight speaks the text you highlight. It keeps time with the audio."
@@ -69,7 +73,7 @@ def wait_files(folder: str, pattern: str, timeout: float = 3.0, *, nonempty: boo
 def mci_length(path: str) -> int:
     """Open without playing, read the length in ms, close."""
     alias = "synth_test_len"
-    player._mci(f'open "{path}" type mpegvideo alias {alias}')
+    player._mci(f'open "{player._mci_path(path)}" type mpegvideo alias {alias}')
     try:
         player._mci(f"set {alias} time format milliseconds")
         return int(player._mci(f"status {alias} length"))
@@ -197,24 +201,54 @@ class PureFunctionTests(unittest.TestCase):
                 "in the second half of this long chunk.")
         mid = text[60:95]
         self.assertNotIn(text.strip()[:32], mid)          # the first-32-characters probe misses this
-        detail = synth._describe(RuntimeError(f"cannot parse near {mid!r}"), text)
+        detail = edge._describe(RuntimeError(f"cannot parse near {mid!r}"), text)
         self.assertEqual(detail, "RuntimeError: (message withheld: it quoted the text)")
-        squeezed = synth._describe(RuntimeError(" ".join(text[40:80].split()) + " is bad"), "\n" + text)
+        squeezed = edge._describe(RuntimeError(" ".join(text[40:80].split()) + " is bad"), "\n" + text)
         self.assertNotIn("confidential", squeezed)
-        kept = synth._describe(aiohttp.ClientConnectionError("Cannot connect to host speech.platform.bing.com:443"),
+        kept = edge._describe(aiohttp.ClientConnectionError("Cannot connect to host speech.platform.bing.com:443"),
                                text)
         self.assertEqual(kept, "ClientConnectionError: Cannot connect to host speech.platform.bing.com:443")
-        self.assertEqual(synth._describe(TimeoutError(), text), "TimeoutError")
-        self.assertEqual(synth._describe(UnicodeEncodeError("utf-8", "a\ud800", 1, 2, "surrogates"), text),
+        self.assertEqual(edge._describe(TimeoutError(), text), "TimeoutError")
+        self.assertEqual(edge._describe(UnicodeEncodeError("utf-8", "a\ud800", 1, 2, "surrogates"), text),
                          "UnicodeEncodeError")
+
+    def test_describe_leaves_out_file_paths(self):
+        part = os.path.join(tempfile.gettempdir(), "saylight_x", "g1_c0_1.part")
+        cases = {
+            FileNotFoundError(2, "No such file or directory", part):
+                "FileNotFoundError: [Errno 2] No such file or directory",
+            PermissionError(13, "Access is denied", part, 5, part[:-5] + ".mp3"):
+                "PermissionError: [WinError 5] Access is denied",
+            OSError(28, "No space left on device"): "OSError: [Errno 28] No space left on device",
+            aiohttp.ClientOSError(10054, "reset"): "ClientOSError: [Errno 10054] reset",
+        }
+        for exc, detail in cases.items():
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(edge._describe(exc, TEXT), detail)
+        try:
+            open(part, "rb")
+        except OSError as e:
+            real = edge._describe(e, TEXT)
+        self.assertNotIn("saylight_x", real)
+        self.assertTrue(real.startswith("FileNotFoundError: [Errno 2] "), real)
 
 
 class WorkerTestBase(unittest.TestCase):
+    """`worker` is what the engine talks to; `backend` is the EdgeBackend doing the work (the same object
+    unless the test runs through the router)."""
+
+    via_router = False
+
     def setUp(self):
         _app()
         self.root = tempfile.mkdtemp(prefix="synth_test_")
         self.addCleanup(shutil.rmtree, self.root, True)
-        self.worker = SynthWorker(temp_root=self.root)
+        if self.via_router:
+            self.backend = SynthWorker()
+            self.cache = AudioCache(self.root)
+            self.worker = SynthRouter({"edge": self.backend}, self.cache)
+        else:
+            self.worker = self.backend = SynthWorker(temp_root=self.root)
         self.addCleanup(self.worker.shutdown)
         self.ready, self.failed = [], []
         self.worker.chunkReady.connect(lambda *a: self.ready.append(a))
@@ -222,14 +256,16 @@ class WorkerTestBase(unittest.TestCase):
 
     def use_fake(self, script) -> list[FakeComm]:
         made: list[FakeComm] = []
-        patcher = mock.patch.object(synth.edge_tts, "Communicate", functools.partial(FakeComm, script, made))
+        patcher = mock.patch.object(edge.edge_tts, "Communicate", functools.partial(FakeComm, script, made))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.worker.shutdown)   # runs before the patch is removed (cleanups are LIFO)
         return made
 
     def files(self, pattern: str = "*") -> list[str]:
-        return sorted(os.path.basename(p) for p in glob.glob(os.path.join(self.worker.temp_dir, pattern)))
+        """Chunk files in the cache folder (the run's lock file is not one)."""
+        names = (os.path.basename(p) for p in glob.glob(os.path.join(self.worker.temp_dir, pattern)))
+        return sorted(name for name in names if name != LOCK_NAME)
 
 
 class RealServiceTests(WorkerTestBase):
@@ -241,8 +277,8 @@ class RealServiceTests(WorkerTestBase):
             return made[-1]
 
         self.worker.start()
-        with mock.patch.object(synth.edge_tts, "Communicate", capture), \
-                self.assertLogs("saylight.synth", "DEBUG") as logs:
+        with mock.patch.object(edge.edge_tts, "Communicate", capture), \
+                self.assertLogs("saylight", "DEBUG") as logs:
             self.worker.synthesize(1, 0, TEXT, VOICE, "-5%")
             spin_until(lambda: self.ready or self.failed, 25)
         if self.failed and self.failed[0][2] == "offline":
@@ -255,7 +291,9 @@ class RealServiceTests(WorkerTestBase):
         self.assertEqual(self.files("*.part"), [])
         self.assertTrue(words and all(isinstance(w, Word) for w in words))
         # The completeness check really ran: this edge-tts reports the bytes confirmed by turn.end.
-        self.assertEqual(synth._confirmed_bytes(made[0]), os.path.getsize(path))
+        self.assertEqual(edge._confirmed_bytes(made[0]), os.path.getsize(path))
+        # Created as a short-lived file, which Windows tries to keep in memory, and MCI still opens it.
+        self.assertTrue(os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_TEMPORARY)
 
         # Every word is found, in order, in the text that was sent.
         cursor = 0
@@ -285,7 +323,7 @@ class RealServiceTests(WorkerTestBase):
     def test_refused_proxy_is_offline(self):
         real = edge_tts.Communicate
         refused = functools.partial(real, proxy="http://127.0.0.1:9")
-        with mock.patch.object(synth.edge_tts, "Communicate", refused), self.assertLogs("saylight.synth", "WARNING"):
+        with mock.patch.object(edge.edge_tts, "Communicate", refused), self.assertLogs("saylight.voices", "WARNING"):
             self.worker.start()
             self.worker.synthesize(3, 4, TEXT, VOICE, "-5%")
             self.assertTrue(spin_until(lambda: self.failed, 15))
@@ -360,7 +398,7 @@ class QueueAndCancelTests(WorkerTestBase):
     def test_cancel_wins_over_an_undelivered_failure(self):
         self.use_fake(raising)
         self.worker.start()
-        with self.assertLogs("saylight.synth", "WARNING") as logs:
+        with self.assertLogs("saylight.voices", "WARNING") as logs:
             self.worker.synthesize(1, 0, "bad", VOICE, "-5%")
             end = time.monotonic() + 3
             while not logs.records and time.monotonic() < end:
@@ -369,7 +407,7 @@ class QueueAndCancelTests(WorkerTestBase):
             self.worker.cancel_before(2)
             spin(0.3)
         self.assertEqual((self.ready, self.failed), ([], []))
-        self.assertEqual(self.worker._live, [])
+        self.assertEqual(self.backend._live, [])
 
     def test_results_arrive_on_the_gui_thread(self):
         self.use_fake(confirmed)
@@ -377,7 +415,7 @@ class QueueAndCancelTests(WorkerTestBase):
         self.worker.chunkReady.connect(lambda *a: threads.append(threading.current_thread()))
         self.worker.chunkFailed.connect(lambda *a: threads.append(threading.current_thread()))
         self.worker.start()
-        with self.assertLogs("saylight.synth", "WARNING"):
+        with self.assertLogs("saylight.voices", "WARNING"):
             self.worker.synthesize(1, 0, "whole", VOICE, "-5%")
             self.worker.synthesize(1, 1, "cut short", VOICE, "-5%")
             self.assertTrue(spin_until(lambda: len(threads) == 2, 3))
@@ -386,7 +424,7 @@ class QueueAndCancelTests(WorkerTestBase):
     def test_start_off_the_gui_thread_watches_the_network_on_it(self):
         self.use_fake(quick)
         seen = []
-        with mock.patch.object(synth, "QNetworkInformation") as qni:
+        with mock.patch.object(edge, "QNetworkInformation") as qni:
             qni.loadBackendByFeatures.side_effect = lambda *a: seen.append(threading.current_thread()) and False
             starter = threading.Thread(target=self.worker.start)
             starter.start()
@@ -420,7 +458,7 @@ class QueueAndCancelTests(WorkerTestBase):
         t0 = time.monotonic()
         self.worker.shutdown()
         self.assertLess(time.monotonic() - t0, 2.5)
-        self.assertFalse(self.worker._thread.is_alive())
+        self.assertFalse(self.backend._thread.is_alive())
         self.assertFalse(os.path.exists(folder))
         self.assertTrue(made[0].closed)
         self.worker.synthesize(2, 0, "ignored", VOICE, "-5%")
@@ -433,7 +471,7 @@ class FailureTests(WorkerTestBase):
         self.use_fake(raising)
         self.worker.start()
         middle = "middle: an ordinary opening clause, then the private finding that must never be logged"
-        with self.assertLogs("saylight.synth", "WARNING") as logs:
+        with self.assertLogs("saylight.voices", "WARNING") as logs:
             self.worker.synthesize(1, 0, "svc", VOICE, "-5%")
             self.worker.synthesize(1, 1, "bad", VOICE, "-5%")
             self.worker.synthesize(1, 2, "quote: the secret sentence", VOICE, "-5%")
@@ -452,7 +490,7 @@ class FailureTests(WorkerTestBase):
     def test_stream_that_ends_without_turn_end_fails_offline(self):
         self.use_fake(confirmed)
         self.worker.start()
-        with self.assertLogs("saylight.synth", "WARNING"):
+        with self.assertLogs("saylight.voices", "WARNING"):
             self.worker.synthesize(1, 0, "whole", VOICE, "-5%")
             self.worker.synthesize(1, 1, "cut short", VOICE, "-5%")
             self.assertTrue(spin_until(lambda: self.ready and self.failed, 3))
@@ -466,17 +504,43 @@ class FailureTests(WorkerTestBase):
     def test_cache_folder_is_recreated_if_a_cleaner_removed_it(self):
         self.use_fake(quick)
         self.worker.start()
+        self.backend._cache._unlock()      # while the run holds its lock, no cleaner can remove the folder
         shutil.rmtree(self.worker.temp_dir)
         self.worker.synthesize(1, 0, "x", VOICE, "-5%")
         self.assertTrue(spin_until(lambda: self.ready or self.failed, 3))
         self.assertEqual(self.failed, [])
         self.assertTrue(os.path.isfile(self.ready[0][2]))
 
+    def test_a_file_error_is_reported_without_its_path(self):
+        self.use_fake(quick)
+        self.worker.start()
+
+        def denied(path):
+            raise PermissionError(13, "Access is denied", path, 5)
+
+        with mock.patch.object(AudioCache, "create", side_effect=denied), \
+                self.assertLogs("saylight", "WARNING") as logs:
+            self.worker.synthesize(1, 0, "x", VOICE, "-5%")
+            self.assertTrue(spin_until(lambda: self.failed, 3))
+        self.assertEqual(self.failed[0], (1, 0, "other", "PermissionError: [WinError 5] Access is denied"))
+        self.assertFalse(any(self.root in r.getMessage() or "g1_c0" in r.getMessage() for r in logs.records))
+
+    def test_a_job_the_cache_cannot_take_fails_instead_of_vanishing(self):
+        made = self.use_fake(quick)
+        self.worker.start()
+        refused = RuntimeError("the audio cache has not been started")
+        with mock.patch.object(AudioCache, "new_path", side_effect=refused), \
+                self.assertLogs("saylight.voices", "WARNING"):
+            self.worker.synthesize(1, 0, "x", VOICE, "-5%")
+            self.assertTrue(spin_until(lambda: self.failed, 3))
+        self.assertEqual(self.failed[0], (1, 0, "other", "RuntimeError: the audio cache has not been started"))
+        self.assertEqual((made, self.backend._live), ([], []))
+
     def test_reported_disconnection_makes_service_errors_offline(self):
         self.use_fake(raising)
         self.worker.start()
-        self.worker._on_reachability(QNetworkInformation.Reachability.Disconnected)
-        with self.assertLogs("saylight.synth", "WARNING"):
+        self.backend._on_reachability(QNetworkInformation.Reachability.Disconnected)
+        with self.assertLogs("saylight.voices", "WARNING"):
             self.worker.synthesize(1, 0, "svc", VOICE, "-5%")
             self.worker.synthesize(1, 1, "bad", VOICE, "-5%")
             self.assertTrue(spin_until(lambda: len(self.failed) == 2, 3))
@@ -485,7 +549,7 @@ class FailureTests(WorkerTestBase):
     def test_empty_text_fails_without_a_request(self):
         made = self.use_fake(quick)
         self.worker.start()
-        with self.assertLogs("saylight.synth", "WARNING"):
+        with self.assertLogs("saylight.voices", "WARNING"):
             self.worker.synthesize(1, 0, "  \n ", VOICE, "-5%")
             self.assertTrue(spin_until(lambda: self.failed, 3))
         self.assertEqual(self.failed[0], (1, 0, "other", "ValueError: empty text"))
@@ -500,7 +564,7 @@ class FailureTests(WorkerTestBase):
 
     def test_stalled_stream_times_out_as_offline(self):
         made = self.use_fake(hang)
-        with mock.patch.object(synth, "IDLE_TIMEOUT_S", 0.3), self.assertLogs("saylight.synth", "WARNING"):
+        with mock.patch.object(edge, "IDLE_TIMEOUT_S", 0.3), self.assertLogs("saylight.voices", "WARNING"):
             self.worker.start()
             self.worker.synthesize(1, 0, "x", VOICE, "-5%")
             self.assertTrue(spin_until(lambda: self.failed, 3))
@@ -551,7 +615,7 @@ class TempFileTests(WorkerTestBase):
 
         outside = os.path.join(self.root, "keep.mp3")
         open(outside, "wb").close()
-        with self.assertLogs("saylight.synth", "WARNING"):
+        with self.assertLogs("saylight.audio_cache", "WARNING"):
             self.worker.delete(outside)
         self.assertTrue(os.path.exists(outside))
 
@@ -564,6 +628,24 @@ class TempFileTests(WorkerTestBase):
         while os.path.exists(locked) and time.monotonic() < end:
             time.sleep(0.02)
         self.assertFalse(os.path.exists(locked))
+
+
+# --- The same tests through SynthRouter --------------------------------------------------------
+
+class RouterRealServiceTests(RealServiceTests):
+    via_router = True
+
+
+class RouterQueueAndCancelTests(QueueAndCancelTests):
+    via_router = True
+
+
+class RouterFailureTests(FailureTests):
+    via_router = True
+
+
+class RouterTempFileTests(TempFileTests):
+    via_router = True
 
 
 if __name__ == "__main__":

@@ -36,6 +36,9 @@ G_TYPE = ""
 G_CLEAR = ""
 G_UNDO = ""
 G_PASTE = ""
+G_DOWNLOAD = ""
+G_OPEN = ""      # OpenInNewWindow
+G_CHEVRON = ""   # ChevronRight
 
 TRANSPARENT = QColor(0, 0, 0, 0)
 
@@ -65,6 +68,16 @@ class ActionState(NamedTuple):
     hover: float = 0.0
     pressed: float = 0.0
     enabled: bool = True
+
+
+def spoken_parts(parts: list[Part]) -> str:
+    """The parts as one accessible name, with " + " between keycaps: "Ctrl + ` reads the highlighted text"."""
+    out = ""
+    for i, (kind, s) in enumerate(parts):
+        if kind == "key" and i and parts[i - 1][0] == "key":
+            out += " + "
+        out += s
+    return out
 
 
 def _keycap_width(theme, label: str) -> float:
@@ -1212,7 +1225,7 @@ class FadeLabel(QWidget):
             self.fade.to(1.0)
         else:
             self.fade.snap(1.0)
-        self.setAccessibleName("".join(s for _, s in parts))
+        self.setAccessibleName(spoken_parts(parts))
         self.update()
 
     def set_text(self, text: str, color_token: str | None = None, *, animate: bool = True) -> None:
@@ -1270,7 +1283,7 @@ class ToggleRow(Control):
         self.checked = False
         self.knob = Tween(self, theme, 0.0, MEDIUM, decelerate())
         self.clicked.connect(lambda: self.set_checked(not self.checked, emit=True))
-        self.setAccessibleName(label)
+        self.setAccessibleName(f"{label}: off")
 
     def set_checked(self, on: bool, *, emit: bool = False) -> None:
         if on != self.checked:
@@ -1511,3 +1524,206 @@ class SwatchRow(Control):
             p.setFont(font)
             p.setPen(t.color("TextPrimary") if hc else fg)
             p.drawText(circle, int(Qt.AlignmentFlag.AlignCenter), "Aa")
+
+
+class NavRow(Control):
+    """A full-width settings row that opens something: label at the optical inset, an optional detail
+    right-aligned before the glyph (a chevron by default), whose right edge lines up with the toggle switches."""
+
+    def __init__(self, theme, tips, label: str, parent: QWidget | None = None, tooltip: str = "", *,
+                 glyph: str = G_CHEVRON, detail: str = ""):
+        super().__init__(theme, tips, parent, tooltip)
+        self.label = label
+        self.glyph = glyph
+        self.detail = detail
+        self.setAccessibleName(label)
+
+    def set_detail(self, text: str) -> None:
+        if text != self.detail:
+            self.detail = text
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        t = self.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        fill = mix(mix(TRANSPARENT, t.color("SubtleHover"), self.hover.value), t.color("SubtlePressed"),
+                   self.press.value)
+        if fill.alpha():
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(r, t.px(4), t.px(4))
+        hc_outline(p, t, r, t.px(4), self.hover.value)
+        enabled = self.isEnabled()
+        font = t.font("body")
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        p.setPen(t.color("TextPrimary" if enabled else "TextDisabled"))
+        baseline = (self.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
+        p.drawText(QPointF(t.px(10), baseline), self.label)
+        g = t.px(12)
+        glyph_rect = QRectF(self.width() - t.px(10) - g, (self.height() - g) / 2, g, g)
+        ink = t.color("TextSecondary" if enabled else "TextDisabled")
+        draw_glyph(p, glyph_rect, self.glyph, t.font("icon12"), ink)
+        if self.detail:
+            small = t.font("small")
+            sfm = QFontMetricsF(small)
+            p.setFont(small)
+            p.setPen(ink)
+            sb = (self.height() - (sfm.ascent() + sfm.descent())) / 2 + sfm.ascent()
+            p.drawText(QPointF(glyph_rect.left() - t.px(8) - sfm.horizontalAdvance(self.detail), sb), self.detail)
+
+
+class LinkText(Control):
+    """One line of text with inline links, such as "Saylight 1.3 is ready · What's new · Install".
+
+    Parts are ("text", s) in the line's colour, ("sep", s) in TextSecondary, or (key, label) for a link. A link is
+    Accent and underlined on hover (always in high contrast); a click on it emits linkClicked(key). A change of
+    parts crossfades in 120 ms. A press away from a link passes through, so the window can still be dragged."""
+
+    linkClicked = Signal(str)
+
+    def __init__(self, theme, tips, parent: QWidget | None = None, *, role: str = "body",
+                 color_token: str = "TextSecondary"):
+        super().__init__(theme, tips, parent, tooltip=self._tip)
+        self.role = role
+        self.color_token = color_token
+        self.parts: list[Part] = []
+        self._prev: list[Part] = []
+        self.link_tips: dict[str, str] = {}
+        self.text_tip = ""   # the tooltip over the plain text, if any
+        self.fade = Tween(self, theme, 1.0, 120)
+        self._hits: dict[str, QRectF] = {}
+        self._hover_key: str | None = None
+        self._press_key: str | None = None
+
+    def set_parts(self, parts: list[Part], color_token: str | None = None, *, animate: bool = True) -> None:
+        color_token = color_token or self.color_token
+        if parts == self.parts and color_token == self.color_token:
+            return
+        self._prev, self.parts, self.color_token = self.parts, list(parts), color_token
+        if animate and self._prev:
+            self.fade.snap(0.0)
+            self.fade.to(1.0)
+        else:
+            self.fade.snap(1.0)
+        self._hits = self._layout(self.parts)
+        self.setAccessibleName(spoken_parts(self.parts))
+        self._set_hover_key(None)
+        self.update()
+
+    def link_keys(self) -> list[str]:
+        return [k for k, _ in self.parts if k not in ("text", "sep")]
+
+    def content_width(self) -> float:
+        return QFontMetricsF(self.theme.font(self.role)).horizontalAdvance("".join(s for _, s in self.parts))
+
+    def link_rect(self, key: str) -> QRectF | None:
+        return self._hits.get(key)
+
+    def _layout(self, parts: list[Part]) -> dict[str, QRectF]:
+        fm = QFontMetricsF(self.theme.font(self.role))
+        hits, x = {}, 0.0
+        for kind, s in parts:
+            w = fm.horizontalAdvance(s)
+            if kind not in ("text", "sep"):
+                hits[kind] = QRectF(x, 0, w, self.height())
+            x += w
+        return hits
+
+    def resizeEvent(self, event) -> None:
+        self._hits = self._layout(self.parts)
+        super().resizeEvent(event)
+
+    def _key_at(self, pos) -> str | None:
+        if not self.isEnabled():
+            return None
+        pad = self.theme.px(2)
+        return next((k for k, r in self._hits.items() if r.adjusted(-pad, 0, pad, 0).contains(pos)), None)
+
+    def _set_hover_key(self, key: str | None) -> None:
+        if key == self._hover_key:
+            return
+        self._hover_key = key
+        if key is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+        if self.tooltip_text():
+            self.tips.hover(self, self._tip)
+        else:
+            self.tips.leave(self)
+        self.update()
+
+    def _tip(self) -> str:
+        if self._hover_key is not None:
+            return self.link_tips.get(self._hover_key, "")
+        return self.text_tip
+
+    def mouseMoveEvent(self, event) -> None:
+        self._set_hover_key(self._key_at(event.position()))
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._set_hover_key(None)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        key = self._key_at(event.position())
+        if event.button() == Qt.MouseButton.LeftButton and key is not None:
+            self._press_key = key
+            super().mousePressEvent(event)
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event) -> None:
+        key, self._press_key = self._press_key, None
+        if event.button() == Qt.MouseButton.LeftButton and key is not None:
+            self._pressed = False
+            self.press.to(0.0)
+            if self._key_at(event.position()) == key:
+                self.linkClicked.emit(key)
+            event.accept()
+            return
+        event.ignore()
+
+    def _paint(self, p: QPainter, parts: list[Part], opacity: float, current: bool) -> None:
+        if not parts or opacity <= 0:
+            return
+        t = self.theme
+        font = t.font(self.role)
+        fm = QFontMetricsF(font)
+        baseline = (self.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
+        p.setOpacity(opacity)
+        p.setFont(font)
+        x = 0.0
+        for kind, s in parts:
+            w = fm.horizontalAdvance(s)
+            if kind == "text":
+                color = t.color(self.color_token)
+            elif kind == "sep":
+                color = t.color("TextSecondary")
+            elif not self.isEnabled():
+                color = t.color("TextDisabled")
+            else:
+                hovered = current and kind == self._hover_key
+                pressed = current and kind == self._press_key
+                color = mix(mix(t.color("Accent"), t.color("AccentHover"), self.hover.value if hovered else 0.0),
+                            t.color("AccentPressed"), self.press.value if pressed else 0.0)
+                if hovered or t.high_contrast:
+                    p.setPen(QPen(color, max(1.0, t.k)))
+                    y = baseline + max(1.0, fm.underlinePos())
+                    p.drawLine(QPointF(x, y), QPointF(x + w, y))
+            p.setPen(color)
+            p.drawText(QPointF(x, baseline), s)
+            x += w
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        f = self.fade.value
+        if f < 1.0:
+            self._paint(p, self._prev, 1.0 - f, False)
+        self._paint(p, self.parts, f, True)

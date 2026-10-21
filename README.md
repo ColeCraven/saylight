@@ -42,6 +42,12 @@ The box uses your reading font, size and background, so what you type looks like
 **Reading display you can tune.** Choose the text size, font (Verdana, Segoe UI, Calibri or Sitka), letter and line
 spacing, highlight style, and background (Cream, Peach, Soft blue, Soft dark, or automatic with your Windows theme).
 
+**Pick the voice you like.** Ava is the default, and the Voice page lists Microsoft's other English voices, grouped
+by accent (US, UK, Australian, Canadian, Irish, Indian, New Zealand and South African). Press ▶ next to any of them
+to hear a short sample sentence first. **Show all languages** loads the full list of voices in every language.
+A few voices don't report word timing; they're marked *sentence highlight only*, and only the sentence is
+highlighted while they read.
+
 <p align="center">
   <img src="docs/images/settings.png" alt="The Reading display settings page" width="49%">
   <img src="docs/images/expanded.png" alt="The larger reading view" width="49%">
@@ -58,6 +64,7 @@ spacing, highlight style, and background (Cream, Peach, Soft blue, Soft dark, or
   or paste box takes the keyboard, and only while it's open; it hands it back when you read or press <kbd>Esc</kbd>.
 - A tray icon and a small status pill show what's happening while the panel is hidden.
 - Follows Windows dark and light mode, high-contrast themes, text scaling and the *Animation effects* setting.
+- When a new version is out, one quiet line in the panel says so, with **Install** and **Not now**. No pop-ups.
 
 ## Design choices
 
@@ -76,18 +83,69 @@ Every reading background keeps text contrast between 11:1 and 15:1 (WCAG AAA).
 
 ## Install
 
-**Easiest:** download `Saylight.zip` from the [latest release](../../releases/latest), unzip it, and double-click
-**Install Saylight.cmd**. It sets everything up, adds Saylight to the Start menu and starts it with Windows.
-Run **Uninstall Saylight.cmd** to remove it.
+1. Download **Saylight-Setup.exe** from the [latest release](../../releases/latest).
+2. Run it. Setup installs Saylight just for you, so it doesn't need administrator rights, and it doesn't need
+   Python or anything else.
+3. Leave *Start Saylight when I sign in* ticked if you want it ready whenever you highlight text.
 
-**From source:**
+Saylight works on Windows 10 and 11. It goes into `%LOCALAPPDATA%\Programs\Saylight` and appears in the Start
+menu. To remove it, open **Settings → Apps → Installed apps**, find Saylight and choose **Uninstall**. It asks
+whether to remove your settings too.
+
+**The Python version.** Each release also has **Saylight-Python.zip**, the same app run by Python instead of
+packaged as an .exe. Use it if Smart App Control is on (see below), or if you'd rather run it through Python.
+Unzip it and double-click *Install Saylight.cmd*. It needs Python 3.10 or newer, and it explains how to get
+Python if it's missing.
+
+**Upgrading from 1.0 or 1.1** (the zip with *Install Saylight.cmd*): run Saylight-Setup.exe, or the new
+Saylight-Python.zip if Smart App Control is on. Either one closes the running copy, replaces it and keeps your
+settings.
+
+### If Windows blocks Saylight
+
+Saylight isn't code-signed, so Windows may be cautious the first time you run it.
+
+- **"Windows protected your PC"** (SmartScreen): choose **More info**, then **Run anyway**.
+- **Smart App Control** (Windows 11) blocks apps it doesn't recognise, and it can't make an exception for just
+  one app. To check whether it's on, open **Windows Security → App & browser control → Smart App Control
+  settings**. If it is, use **Saylight-Python.zip** instead. It runs through Python, which Windows already trusts,
+  and it works the same way.
+
+### Checking the download
+
+Each release has a `Saylight-Setup.exe.sha256` file next to the installer, holding its SHA-256 checksum. To check
+your copy, open PowerShell in the folder you downloaded it to and run:
 
 ```
-pip install -r requirements.txt
+Get-FileHash .\Saylight-Setup.exe -Algorithm SHA256
+```
+
+The long number it prints should match the one in the `.sha256` file. If it doesn't, delete the download and get
+it again from the release page.
+
+### Updates
+
+Once a day, Saylight asks GitHub whether there's a newer release. The request carries no IDs or cookies, and it
+never happens while Saylight is reading. When there is one, a line in the panel offers **Install**: Saylight
+downloads Setup, checks its size and SHA-256, runs it, and opens again on the new version. **Not now** hides the
+line until the next version (the tray menu still offers it).
+
+On the Python version, or when Smart App Control is on, the line offers **Get it** instead. That opens the
+release page, so you can download the new version yourself. Saylight never swaps itself for a copy Windows
+might refuse to start.
+
+To stop the daily check, open ⚙ **Settings → General** and choose **Turn off** next to *Saylight checks GitHub
+for updates once a day*. **Check for updates** on the same page still works whenever you click it.
+
+### Running from source
+
+```
+python -m pip install --user -r requirements.txt
 python saylight_app.py --install
 ```
 
-Requires Windows 10 or 11 and Python 3.10 or newer.
+`requirements.txt` pins the exact versions the release is built and tested with, on Python 3.14.
+Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 
 | Command | What it does |
 |---|---|
@@ -104,7 +162,9 @@ Requires Windows 10 or 11 and Python 3.10 or newer.
 | Show / hide the panel | <kbd>Ctrl</kbd> + <kbd>`</kbd> with nothing highlighted (when not reading), or click the tray icon |
 | Jump to a sentence | Click it, or use the progress bar |
 | Re-read | Scroll over the text, or press ⏮ to replay the sentence |
-| Text size | <kbd>Ctrl</kbd> + scroll over the text, or the ⚙ Reading display page |
+| Text size | <kbd>Ctrl</kbd> + scroll over the text, or ⚙ **Settings → Reading display** |
+| Choose a voice | ⚙ **Settings → Voice**. Click a voice to use it, or ▶ to hear a sample first |
+| Start with Windows, updates | ⚙ **Settings → General** |
 | Speed | − / + buttons, or scroll over the speed control |
 | Media keys | Play/Pause, Next and Previous work while it's reading |
 | Read your own text | Click ✎ or the empty reading box, type or paste, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> or **Read aloud**. Highlight part of it to hear just that part. <kbd>Esc</kbd> goes back and keeps your text |
@@ -112,40 +172,63 @@ Requires Windows 10 or 11 and Python 3.10 or newer.
 
 ## Privacy
 
-The voice is Microsoft's online neural voice (the same voices as Microsoft Edge's Read Aloud), accessed through the
-open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read aloud is sent
-to Microsoft** to be turned into speech, so avoid using it on confidential material. Saylight itself stores no text:
-it's kept in memory only while you're reading, and the log records counts, never content.
+The voices are Microsoft's online neural voices (the same voices as Microsoft Edge's Read Aloud), accessed through
+the open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read aloud is
+sent to Microsoft** to be turned into speech, so avoid using it on confidential material. A voice preview sends
+only its fixed sample sentence, never your text.
 
-Text you type or paste stays in memory until you clear it or quit Saylight. It is never saved, and it is sent to
-Microsoft only when you have it read aloud.
+Saylight itself stores no text and no audio. Text is kept in memory only while you're reading, and the audio
+plays from short-lived files in a temporary folder that Saylight empties as it goes and deletes when it quits.
+Text you type or paste stays in memory until you clear it or quit Saylight, and is sent to Microsoft only when
+you have it read aloud.
+
+Saylight goes online for only these things:
+- speaking, and voice previews (Microsoft);
+- the full voice list, only when you switch on **Show all languages** (Microsoft);
+- the daily update check, which you can turn off, and the download when you click **Install** (GitHub).
+
+Everything Saylight saves is in `%LOCALAPPDATA%\Saylight`: your settings and a log. The log records counts and
+error types only, never text, file names or window titles. Uninstalling asks whether to delete your settings.
 
 ## Development
 
 ```
-saylight_app.py          entry point and command-line options
+saylight_app.py          entry point, command-line options and the start-up crash message
 saylight/
   academic_text.py       cleans copied text and splits sentences
   text_model.py          sentences, synthesis chunks and word timing
   engine.py              the reading state machine
-  synth.py, player.py    speech generation (edge-tts) and playback (Windows MCI)
+  voices/                the voice interface, the online voices (edge-tts), the voice list and previews
+  audio_cache.py         the temporary folder for audio chunks
+  player.py              playback (Windows MCI)
   input_thread.py        global shortcut and copying the selection
   settings.py, theme.py  saved settings, colours and fonts
-  ui/                    the panel, controls, reading view, tray, status pill and tooltips
+  paths.py               where Saylight keeps its data
+  updates.py             the update check, download and checksum
+  update_service.py      when to check, and Install
+  ui/                    the panel, settings tabs, controls, reading view, tray, status pill and tooltips
   ui/compose.py          the Type or paste box
-scripts/build_release.py builds the installer zip into dist/
+packaging/               the PyInstaller spec, the installer script, the licence gate and the build tests
+scripts/build_release.py builds dist/Saylight-Setup.exe and its .sha256 file
 ```
 
-Run the test suite (about 900 tests) from the project folder:
+Run the test suite (about 1,200 tests) from the project folder:
 
 ```
 python -m unittest discover -s saylight/tests -t .
 ```
 
+To build the installer you also need the tools in `requirements-build.txt` and Inno Setup 6.7.3. Then
+`python scripts/build_release.py` builds the app, checks every bundled licence, runs the frozen self-test and the
+installer lifecycle test on a separately named test install, and writes `dist\Saylight-Setup.exe` with its
+checksum. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists what's inside.
+
 ## Acknowledgements
 
 - [edge-tts](https://github.com/rany2/edge-tts) for access to the neural voices (LGPL-3.0)
 - [Qt for Python (PySide6)](https://doc.qt.io/qtforpython-6/) for the interface (LGPL-3.0)
+- [PyInstaller](https://pyinstaller.org/) and [Inno Setup](https://jrsoftware.org/isinfo.php) for the Windows app
+  and its installer
 - Segoe Fluent Icons and Segoe UI Variable, which ship with Windows 11
 
 Saylight is an independent project and is not affiliated with Microsoft.

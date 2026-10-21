@@ -18,10 +18,12 @@ from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 
+from .voices.base import BACKENDS, DEFAULT_VOICE_ID, make_voice_id, parse_voice_id
+
 log = logging.getLogger("saylight.settings")
 
 SETTINGS_VERSION = 1
-DEFAULT_VOICE = "en-US-AvaNeural"
+DEFAULT_VOICE = DEFAULT_VOICE_ID
 SPEEDS = (0.5, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.5, 1.75, 2.0)
 TEXT_SIZES = ("small", "medium", "large", "xlarge")
 # Reading backgrounds: "auto" is Cream in light mode and Soft dark in dark mode.
@@ -88,6 +90,26 @@ def _text(value: Any) -> str:
     raise ValueError("expected a non-empty string")
 
 
+def _str(value: Any) -> str:
+    """Any string, "" included."""
+    if isinstance(value, str):
+        return value.strip()
+    raise ValueError("expected a string")
+
+
+def _voice(value: Any) -> str:
+    """A voice ID, "backend:name". A bare name from Saylight 1.0 or 1.1 is an online voice: "edge:<name>"."""
+    backend, name = parse_voice_id(_text(value))
+    if backend not in BACKENDS or not name:
+        raise ValueError("expected a voice ID")
+    return make_voice_id(backend, name)
+
+
+def _timestamp(value: Any) -> float:
+    """Seconds since 1970; 0.0 for never."""
+    return max(0.0, _number(value))
+
+
 _MODIFIERS = {"ctrl": "Ctrl", "control": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "windows": "Win"}
 _MODIFIER_ORDER = ("Ctrl", "Alt", "Shift", "Win")
 _FUNCTION_KEY = re.compile(r"[Ff]([1-9]|1[0-9]|2[0-4])")
@@ -148,7 +170,7 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "version": (SETTINGS_VERSION, _int_range(1, 1_000_000)),
     "speed": (0.95, _speed),
     "volume": (100, _int_range(0, 100)),
-    "voice": (DEFAULT_VOICE, _text),
+    "voice": (DEFAULT_VOICE, _voice),
     "panel.visible": (True, _bool),
     "panel.position": (None, _position),
     "panel.expanded": (False, _bool),
@@ -166,6 +188,10 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "reading_font": ("verdana", _choice(*READING_FONTS)),
     "spacing": ("wide", _choice(*SPACINGS)),
     "highlight": ("word", _choice(*HIGHLIGHTS)),
+    "updates.check": (True, _bool),
+    "updates.last_check": (0.0, _timestamp),
+    "updates.etag": ("", _str),
+    "updates.skipped": ("", _str),
 }
 
 

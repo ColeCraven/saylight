@@ -1,0 +1,75 @@
+Third-party code in the Qt modules Saylight ships
+==================================================
+
+Saylight ships these Qt 6.12 modules from PySide6-Essentials: Qt Core, Qt GUI, Qt Widgets and Qt Network,
+with the plugins qwindows (platform), qico (image format), qnetworklistmanager (network information) and
+qmodernwindowsstyle (style). Qt itself is used under the LGPL-3.0 (see LGPL-3.0.txt and GPL-3.0.txt).
+
+Qt lists the following third-party code for these modules in "Licenses Used in Qt" for Qt 6.12:
+https://doc.qt.io/qt-6/licenses-used-in-qt.html
+Qt Widgets has no entries of its own. Some entries apply only to other platforms; they are kept so the list
+matches Qt's. The copyright lines and the full licence text of each entry are in the Qt 6.12.0 source
+archive (qt_attribution.json and the LICENSES folder of qtbase):
+https://download.qt.io/official_releases/qt/6.12/6.12.0/
+Qt's Software Bill of Materials for 6.12 gives the same list as SPDX 2.3 data.
+
+
+Qt Core
+-------
+Apache Tika MimeType Definitions                     Apache-2.0
+BLAKE2 reference implementation                      CC0-1.0 OR Apache-2.0
+Data Compression Library (zlib) 1.3.2                Zlib
+Easing Equations by Robert Penner                    BSD-3-Clause
+Efficient Binary-Decimal Conversion
+  (double-conversion) 3.4.0                          BSD-3-Clause
+MD4                                                  Public domain
+MD5                                                  Public domain
+PCRE2 10.48                                          BSD-3-Clause WITH PCRE2-exception
+PCRE2 stack-less JIT compiler 10.48                  BSD-2-Clause
+QEventDispatcher on macOS                            BSD-3-Clause
+Secure Hash Algorithm SHA-1                          Public domain
+SHA-3 Keccak 3.2                                     CC0-1.0
+SHA-3 brg_endian 1.0.0                               BSD-2-Clause
+SHA-384 and SHA-512 (RFC 6234)                       BSD-3-Clause
+SipHash algorithm                                    CC0-1.0
+TinyCBOR 7.0                                         MIT
+Unicode Character Database 36                        Unicode-DFS-2016
+Unicode CLDR v48.2                                   Unicode-3.0
+forkfd                                               MIT
+tl::expected                                         CC0-1.0
+
+
+Qt GUI
+------
+Adobe Glyph List For New Fonts 1.7                   BSD-3-Clause
+Anti-aliasing rasterizer from FreeType 2             FTL OR GPL-2.0-only (used under FTL)
+D3D12 Memory Allocator 3.1.0                         MIT
+DejaVu Fonts 2.37                                    Bitstream-Vera
+Emoji Segmenter 0.4.0                                Apache-2.0
+FreeType 2.14.3                                      FTL OR GPL-2.0-only (used under FTL)
+FreeType 2 BDF support                               MIT
+FreeType 2 PCF support                               MIT AND MIT-open-group
+FreeType 2 zlib                                      Zlib
+HarfBuzz-NG 14.5.0                                   MIT
+libjpeg-turbo 3.2.0                                  IJG AND BSD-3-Clause
+libpng 1.6.58                                        Libpng AND libpng-2.0
+MD4C 0.5.3                                           MIT
+Mipmap generator for D3D12                           MIT
+Native Style for Android                             Apache-2.0
+OpenGL ES 2 headers                                  MIT
+OpenGL headers                                       MIT
+Pixman 0.17.12                                       MIT
+Smooth Scaling Algorithm                             BSD-2-Clause AND Imlib2
+Vulkan API Registry 1.4.308                          Apache-2.0 OR MIT
+Vulkan Memory Allocator 3.3.0                        MIT
+WebGradients                                         MIT
+Wintab API                                           LCS-Telegraphics
+X Server helper                                      X11 AND HPND
+XCB-XInput                                           MIT
+sRGB colour profile ICC file                         ICC
+
+
+Qt Network
+----------
+The Public Suffix List (2026-05-14)                  MPL-2.0
+libpsl                                               BSD-3-Clause

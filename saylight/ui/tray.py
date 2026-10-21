@@ -225,6 +225,11 @@ class Tray:
         if self.icon.isVisible() and self.icon.supportsMessages():
             self.icon.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 8000)
 
+    def _update_item(self):
+        """The update line's tray twin: (text, enabled, action), or None without a newer version."""
+        bar = getattr(getattr(self.ctl, "panel", None), "update_bar", None)
+        return bar.tray_item() if bar is not None else None
+
     def _build_menu(self) -> None:
         ctl = self.ctl
         if ctl.composing():
@@ -243,6 +248,7 @@ class Tray:
         hud.setChecked(bool(ctl.settings.get("hud_when_hidden")))
         hud.triggered.connect(lambda on: ctl.settings.set("hud_when_hidden", on))
         m.addSeparator()
+        m.addAction("Open a file…").setEnabled(False)  # a placeholder until Saylight can open documents
         can_type = bool(self._info.get("can_type"))
         compose = m.addAction("Type or paste text…", lambda: ctl.open_compose("tray"))
         compose.setEnabled(can_type)
@@ -266,9 +272,13 @@ class Tray:
             a.triggered.connect(lambda _=False, v=v: ctl.set_speed(v))
             group.addAction(a)
             speed_menu.addAction(a)
-        display = m.addAction("Reading display…")
-        display.triggered.connect(lambda: ctl.open_settings())
+        m.addAction("Settings…", ctl.open_settings)
         m.addSeparator()
+        update = self._update_item()
+        if update is not None:
+            text, enabled, action = update
+            item = m.addAction(text, action) if action else m.addAction(text)
+            item.setEnabled(enabled)
         if self._state == "shortcut_unavailable":
             m.addAction("Retry shortcut", ctl.retry_shortcut)
         m.addAction("Reset panel position", ctl.reset_position)

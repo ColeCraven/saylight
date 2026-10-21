@@ -835,6 +835,110 @@ class RegressionLayout(unittest.TestCase):
         self.assertEqual(N("See <https://example.com> for details."), "See link for details.")
 
 
+class RegressionPdfJoins(unittest.TestCase):
+    """Line joins that went wrong on text copied from an arXiv PDF."""
+
+    def test_numbered_heading_is_not_glued_onto_a_url(self):
+        # was "... available at link Related Work There is ..." (the "2" went into the URL)
+        text = ("The code is available at https://github.com/\ngoogle-research/bert.\n2 Related Work\n"
+                "There is a long history of pre-training.")
+        self.assertEqual(N(text).split("\n\n"),
+                         ["The code is available at link.", "2 Related Work",
+                          "There is a long history of pre-training."])
+        self.assertEqual(N(text, skip_urls=False).split("\n\n")[:2],
+                         ["The code is available at https://github.com/google-research/bert.", "2 Related Work"])
+        unbroken = "Code is at https://github.com/lab/tool.\n2 Related Work\nThere is a long history."
+        self.assertEqual(N(unbroken).split("\n\n"), ["Code is at link.", "2 Related Work", "There is a long history."])
+
+    def test_sub_numbered_heading_and_url_ending_in_slash(self):
+        self.assertEqual(N("Code at https://example.org/page.\n2.1 Data Sets\nWe used three data sets.").split("\n\n"),
+                         ["Code at link.", "2.1 Data Sets", "We used three data sets."])
+        self.assertEqual(N("Code at https://example.org/\n3 Methods\nWe recruited forty adults.").split("\n\n"),
+                         ["Code at link", "3 Methods", "We recruited forty adults."])
+
+    def test_real_url_continuations_still_join(self):
+        self.assertEqual(N("See the preprint at https://arxiv.org/abs/1810.\n04805 for details."),
+                         "See the preprint at link for details.")
+        self.assertEqual(N("See https://osf.io/\nx7k2q/ for the data.", skip_urls=False),
+                         "See https://osf.io/x7k2q/ for the data.")
+
+    def test_footnote_number_stuck_to_url(self):
+        # was read out raw: no word boundary between "1" and "https"
+        text = ("Each token attends only to context to its left.\n1https://github.com/tensorflow/tensor2tensor\n"
+                "We primarily report results on two model sizes.")
+        self.assertEqual(N(text), "Each token attends only to context to its left.\n\n"
+                                  "We primarily report results on two model sizes.")
+        self.assertEqual(N("It was shown before. 10http://example.org/x We then ran it."),
+                         "It was shown before. We then ran it.")
+        self.assertEqual(N("Data are online.\n12www.example.org/data\nWe then ran the model."),
+                         "Data are online.\n\nWe then ran the model.")
+        self.assertEqual(N("See the guide (1https://example.org/guide) for details."), "See the guide for details.")
+
+    def test_footnote_url_is_removed_not_read_as_link(self):
+        text = ("Every token can only attend to context to its left.4\n"
+                "1https://github.com/tensorflow/tensor2tensor\n"
+                "2http://nlp.seas.harvard.edu/2018/04/03/attention.html\n"
+                "3In all cases we set the size to 4H.")
+        self.assertEqual(N(text), "Every token can only attend to context to its left.\n\n3In all cases we set the size to 4H.")
+
+    def test_footnote_url_kept_when_urls_are_read(self):
+        text = "Its left.\n1https://github.com/tensorflow/tensor2tensor\nWe report results."
+        self.assertEqual(N(text, skip_urls=False),
+                         "Its left.\n\n1https://github.com/tensorflow/tensor2tensor\n\nWe report results.")
+        # a lone footnote URL is still not silenced
+        self.assertEqual(N("1https://github.com/google-research/bert"), "1https://github.com/google-research/bert")
+
+    def test_number_before_a_spaced_url_is_kept(self):
+        self.assertEqual(N("Version 2 https://example.org/x is out."), "Version 2 link is out.")
+        self.assertEqual(N("Values at 10.1037/abc0000123 are shown."), "Values at link are shown.")
+
+    def test_footnote_url_inside_a_running_line_is_removed_not_read_as_link(self):
+        # after a word an ordinary URL is read as "link"; a footnote URL there is still removed
+        self.assertEqual(N("The batch size was 32 https://example.org/pricing and more."),
+                         "The batch size was 32 link and more.")
+        for url in ("13https://example.org/pricing", "13HTTPS://EXAMPLE.ORG/PRICING",
+                    "13ftp://ftp.example.org/pub", "13www.example.org/pricing", "13https://x.org/10.1037/abc"):
+            with self.subTest(url=url):
+                self.assertEqual(N(f"The batch size was 32\n{url}\nand the rate was small."),
+                                 "The batch size was 32 and the rate was small.")
+
+    def test_footnote_url_in_square_brackets_and_doi_link(self):
+        self.assertEqual(N("A footnote [2https://example.org/x] here."), "A footnote here.")
+        # was "5https://doi.org/" read out: the DOI pattern took the tail and left the head behind
+        for sc in (True, False):
+            with self.subTest(skip_citations=sc):
+                self.assertEqual(
+                    N("Shown before.\n5https://doi.org/10.1037/abc0000123\nWe then ran it.", skip_citations=sc),
+                    "Shown before.\n\nWe then ran it.")
+
+    def test_longer_number_before_url_is_not_a_footnote_mark(self):
+        # only 1-3 digits count as a footnote mark; a year stays with the sentence
+        self.assertEqual(N("Data for 2019www.example.org/data are online."), "Data for link are online.")
+
+    def test_heading_after_url_ending_in_question_mark(self):
+        # "?" and ":" can end the sentence, so the heading after them is not part of the URL
+        self.assertEqual(N("Have you seen https://x.org/a?\n2 Methods\nWe did.").split("\n\n"),
+                         ["Have you seen link?", "2 Methods", "We did."])
+        self.assertEqual(N("Is it at https://x.org/a?\nIV. Results\nWe found it.").split("\n\n"),
+                         ["Is it at link?", "IV. Results", "We found it."])
+
+    def test_hyphen_not_joined_across_blank_line_onto_capital(self):
+        # was "Without TriviaQA fine-Table 2: ..."
+        text = "Without TriviaQA fine-\n\nTable 2: SQuAD 1.1 results.\n\ntuning data, we lose only 0.1 F1."
+        self.assertEqual(N(text).split("\n\n"),
+                         ["Without TriviaQA fine-", "Table 2: SQuAD 1.1 results.", "tuning data, we lose only 0.1 F1."])
+        self.assertEqual(N("the model architec-\n\n2.3 Pre-training\n\nWe train it.").split("\n\n")[:2],
+                         ["the model architec-", "2.3 Pre-training"])
+        self.assertEqual(N("Ein Über-\n\nÜbersicht folgt."), "Ein Über-\n\nÜbersicht folgt.")
+
+    def test_hyphen_still_joined_across_blank_line_onto_lower_case(self):
+        self.assertEqual(N("Reading compre-\n\nhension improved."), "Reading comprehension improved.")
+        self.assertEqual(N("The so-\n\n\n\ncalled effect is real."), "The so-called effect is real.")
+        self.assertEqual(N("ein über-\n\nblick"), "ein überblick")
+        # a single line break still keeps the hyphen before a capital or digit
+        self.assertEqual(N("during COVID-\n19 and in non-\nHispanic samples"), "during COVID-19 and in non-Hispanic samples")
+
+
 class RegressionWholeSelection(unittest.TestCase):
     def test_selection_that_is_only_a_number_citation_or_url_is_not_silenced(self):
         self.assertEqual(N("42"), "42")
@@ -875,7 +979,8 @@ class RegressionPerformance(unittest.TestCase):
     def test_pathological_30k_documents(self):
         # "....." took 13 s, "A. A. A." 23 s and "Smith et al. " 7.7 s before the fix
         for unit in (".", "A. ", "Smith et al. ", "... ", "Ab\n", "A.\n\n", "• item\n", "(Aa Bb, ",
-                     "e.g. ", "x" * 50 + " ", "1. Item\n", "ab-\n", "12,13,", "[1]-[2]-", "mRNA. "):
+                     "e.g. ", "x" * 50 + " ", "1. Item\n", "ab-\n", "12,13,", "[1]-[2]-", "mRNA. ",
+                     "ab-\n\nAb ", "ab-\n\n\n\n", "1https://a.org/b ", "https://a.org/b.\n2 A\n"):
             with self.subTest(unit=unit[:12]):
                 self.assertLess(self._best_time(self._fit(unit)), self.LIMIT)
 

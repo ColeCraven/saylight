@@ -78,7 +78,8 @@ class TestDefaults(Base):
         expected = {"version": 1, "speed": 0.95, "volume": 100, "hud_when_hidden": True, "media_keys": True,
                     "first_hide_tip_shown": False, "skip_citations": True, "skip_urls": True,
                     "text_size": "medium", "reading_tint": "auto", "reading_font": "verdana", "spacing": "wide",
-                    "highlight": "word"}
+                    "highlight": "word", "voice": "edge:en-US-AvaNeural", "updates.check": True,
+                    "updates.last_check": 0.0, "updates.etag": "", "updates.skipped": ""}
         for key, value in expected.items():
             self.assertEqual(s.get(key), value, key)
 
@@ -95,7 +96,7 @@ class TestLoad(Base):
         s = Settings(self.path)
         self.assertEqual(s.get("speed"), 1.25)
         self.assertEqual(s.get("volume"), 40)
-        self.assertEqual(s.get("voice"), "en-GB-SoniaNeural")
+        self.assertEqual(s.get("voice"), "edge:en-GB-SoniaNeural")
         self.assertFalse(s.get("panel.visible"))
         self.assertTrue(s.get("panel.expanded"))
         self.assertEqual(s.get("hotkeys.toggle_panel"), "Ctrl+Alt+`")
@@ -118,7 +119,7 @@ class TestLoad(Base):
         cases = [("speed", 0.97, 0.95), ("speed", 3, 2.0), ("speed", 0.1, 0.5), ("speed", "1.25", 1.25),
                  ("speed", 1, 1.0), ("volume", 130, 100), ("volume", -4, 0), ("volume", 50.5, 51),
                  ("volume", "70", 70), ("panel.visible", 0, False), ("text_size", "LARGE", "large"),
-                 ("voice", " en-US-AvaNeural ", "en-US-AvaNeural")]
+                 ("voice", " en-US-AvaNeural ", "edge:en-US-AvaNeural")]
         for key, given, expected in cases:
             with self.subTest(key=key, given=given):
                 *parents, leaf = key.split(".")
@@ -165,7 +166,7 @@ class TestLoad(Base):
             with self.subTest(encoding=encoding):
                 self.write_raw(json.dumps({"volume": 33, "voice": "en-GB-SoniaNeural"}).encode(encoding))
                 s = Settings(self.path)
-                self.assertEqual((s.get("volume"), s.get("voice")), (33, "en-GB-SoniaNeural"))
+                self.assertEqual((s.get("volume"), s.get("voice")), (33, "edge:en-GB-SoniaNeural"))
                 self.assertFalse(os.path.exists(self.path + ".bad"))
                 s.set("volume", 34)
                 self.assertTrue(s.flush())
@@ -175,13 +176,13 @@ class TestLoad(Base):
         """\\ud800 escapes are legal JSON but can't be encoded as UTF-8; saving must neither raise nor lose them."""
         self.write_raw(b'{"note": "\\ud800x", "voice": "a\\udfffb"}')
         s = Settings(self.path)
-        self.assertEqual(s.get("voice"), "a\udfffb")
+        self.assertEqual(s.get("voice"), "edge:a\udfffb")
         s.set("volume", 41)
         self.assertTrue(s.flush())
         self.assertFalse(os.path.exists(self.path + ".tmp"))
         data = self.read_json()
         self.assertEqual((data["note"], data["volume"]), ("\ud800x", 41))
-        self.assertEqual(Settings(self.path).get("voice"), "a\udfffb")
+        self.assertEqual(Settings(self.path).get("voice"), "edge:a\udfffb")
 
     def test_loading_emits_nothing_and_does_not_rewrite(self) -> None:
         self.write_json({"volume": 130})
@@ -190,6 +191,119 @@ class TestLoad(Base):
         self.assertTrue(s.flush())
         self.assertEqual(os.path.getmtime(self.path), before)
         self.assertEqual(self.read_json(), {"volume": 130})
+
+
+class TestVoice(Base):
+    def test_earlier_bare_names_become_online_voice_ids(self) -> None:
+        cases = [("en-US-AvaNeural", "edge:en-US-AvaNeural"), (" en-GB-SoniaNeural ", "edge:en-GB-SoniaNeural"),
+                 ("edge:en-US-AvaNeural", "edge:en-US-AvaNeural"), ("EDGE: en-IE-EmilyNeural", "edge:en-IE-EmilyNeural"),
+                 ("windows:David", "windows:David")]
+        for given, expected in cases:
+            with self.subTest(given=given):
+                self.write_json({"voice": given})
+                self.assertEqual(Settings(self.path).get("voice"), expected)
+
+    def test_values_that_are_not_voices_fall_back_to_ava(self) -> None:
+        for given in ("", "  ", "edge:", "nosuch:Voice", 7, None, ["en-US-AvaNeural"]):
+            with self.subTest(given=given):
+                self.write_json({"voice": given})
+                with self.assertLogs("saylight.settings", "WARNING"):
+                    self.assertEqual(Settings(self.path).get("voice"), "edge:en-US-AvaNeural")
+
+    def test_set_stores_the_full_id(self) -> None:
+        s = Settings(self.path)
+        s.set("voice", "en-GB-RyanNeural")
+        self.assertEqual(s.get("voice"), "edge:en-GB-RyanNeural")
+        self.assertTrue(s.flush())
+        self.assertEqual(self.read_json()["voice"], "edge:en-GB-RyanNeural")
+        with self.assertRaises(ValueError):
+            s.set("voice", "nosuch:Voice")
+
+
+class TestUpdateKeys(Base):
+    def test_defaults(self) -> None:
+        s = Settings(self.path)
+        self.assertEqual(s.get("updates"), {"check": True, "last_check": 0.0, "etag": "", "skipped": ""})
+
+    def test_empty_strings_are_allowed_and_kept(self) -> None:
+        s = Settings(self.path)
+        for key, value in (("updates.etag", 'W/"abc"'), ("updates.skipped", "1.3.0"), ("updates.check", False),
+                           ("updates.last_check", 1_760_000_000.5)):
+            s.set(key, value)
+        s.set("updates.etag", "")
+        self.assertTrue(s.flush())
+        self.assertEqual(self.read_json()["updates"],
+                         {"check": False, "last_check": 1_760_000_000.5, "etag": "", "skipped": "1.3.0"})
+        self.assertEqual(Settings(self.path).get("updates.skipped"), "1.3.0")
+
+    def test_bad_values_fall_back(self) -> None:
+        self.write_json({"updates": {"check": "sometimes", "last_check": "SECRET", "etag": 5, "skipped": None}})
+        with self.assertLogs("saylight.settings", "WARNING") as logs:
+            s = Settings(self.path)
+        self.assertEqual(s.get("updates"), {"check": True, "last_check": 0.0, "etag": "", "skipped": ""})
+        self.assertFalse(any("SECRET" in line for line in logs.output))
+
+    def test_a_time_before_1970_is_never(self) -> None:
+        self.write_json({"updates": {"last_check": -5}})
+        self.assertEqual(Settings(self.path).get("updates.last_check"), 0.0)
+
+
+# The files Saylight 1.0 and 1.1 wrote: every key of their schema, indent 2, in schema order.
+EARLIER_FILES = {
+    "1.0": {"version": 1, "speed": 1.15, "volume": 70, "voice": "en-GB-SoniaNeural",
+            "panel": {"visible": False, "position": {"screen": "\\\\.\\DISPLAY2", "serial": "AB12", "fx": 0.25,
+                                                     "fy": 0.9, "snap_x": "right", "snap_y": None},
+                      "expanded": True},
+            "hud_when_hidden": False, "media_keys": False,
+            "hotkeys": {"read": "Ctrl+`", "toggle_panel": "Ctrl+Alt+F23", "pause_resume": ""},
+            "first_hide_tip_shown": True, "skip_citations": False, "skip_urls": True, "text_size": "large",
+            "reading_tint": "peach", "reading_font": "sitka", "spacing": "extra", "highlight": "sentence"},
+}
+EARLIER_FILES["1.1"] = {**EARLIER_FILES["1.0"], "voice": "en-US-AvaNeural",
+                        "hotkeys": {"read": "Ctrl+`", "toggle_panel": "", "pause_resume": "Ctrl+Alt+F24",
+                                    "compose": "Ctrl+Alt+Shift+F24"}}
+
+
+class TestEarlierFiles(Base):
+    def test_files_from_1_0_and_1_1_load_unchanged(self) -> None:
+        for release, tree in EARLIER_FILES.items():
+            with self.subTest(release=release):
+                raw = (json.dumps(tree, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+                self.write_raw(raw)
+                before = os.path.getmtime(self.path)
+                with self.assertNoLogs("saylight.settings", "WARNING"):
+                    s = Settings(self.path)
+                flat = {}
+                self._flatten(tree, "", flat)
+                for key, value in flat.items():
+                    expected = "edge:" + value if key == "voice" else value
+                    self.assertEqual(s.get(key), expected, key)
+                self.assertEqual(s.get("updates.check"), True)
+                self.assertTrue(s.flush())
+                self.assertEqual(os.path.getmtime(self.path), before)
+                with open(self.path, "rb") as f:
+                    self.assertEqual(f.read(), raw)  # loading never rewrites the file
+
+    def test_the_first_save_keeps_every_earlier_value(self) -> None:
+        tree = EARLIER_FILES["1.1"]
+        self.write_json(tree)
+        s = Settings(self.path)
+        s.set("updates.skipped", "1.3.0")
+        self.assertTrue(s.flush())
+        data = self.read_json()
+        self.assertEqual(data["voice"], "edge:en-US-AvaNeural")
+        self.assertEqual(data["updates"]["skipped"], "1.3.0")
+        for key in tree:
+            if key != "voice":
+                self.assertEqual(data[key], tree[key], key)
+
+    def _flatten(self, node: dict, prefix: str, out: dict) -> None:
+        for key, value in node.items():
+            name = prefix + key
+            if isinstance(value, dict) and name != "panel.position":
+                self._flatten(value, name + ".", out)
+            else:
+                out[name] = value
 
 
 class TestBadFile(Base):
@@ -422,16 +536,16 @@ class TestSaving(Base):
         with mock.patch.object(S, "_atomic_write", timed):
             s.set("volume", 10)
             s.set("volume", 20)
-            QTest.qWait(150)
+            time.sleep(0.15)  # no event loop here, so a stall under load can't let the first timer fire early
             s.set("speed", 1.5)
             last = time.monotonic()
             self.assertFalse(os.path.exists(self.path))
             self.assertTrue(self.wait_for(lambda: os.path.exists(self.path)))
             QTest.qWait(100)
         self.assertEqual(len(writes), 1)
-        # Measured from the last change; a Qt coarse timer may fire up to 5% early. No upper bound: a busy
-        # machine may stall the event loop.
-        self.assertGreaterEqual(writes[0] - last, 0.47, "wrote before 500 ms of quiet")
+        # Measured from the last change; a Qt coarse timer may fire up to 5% early, and Windows rounds to its
+        # timer tick. No upper bound: a busy machine may stall the event loop.
+        self.assertGreaterEqual(writes[0] - last, 0.45, "wrote before 500 ms of quiet")
         data = self.read_json()
         self.assertEqual((data["volume"], data["speed"]), (20, 1.5))
 
@@ -462,7 +576,7 @@ class TestSaving(Base):
 
     def test_round_trip(self) -> None:
         s = Settings(self.path)
-        values = {"speed": 0.8, "volume": 0, "voice": "en-GB-RyanNeural", "panel.visible": False,
+        values = {"speed": 0.8, "volume": 0, "voice": "edge:en-GB-RyanNeural", "panel.visible": False,
                   "panel.position": dict(TestPosition.GOOD, fy=0.9201), "panel.expanded": True,
                   "hotkeys.pause_resume": "Ctrl+Alt+Shift+`", "first_hide_tip_shown": True,
                   "text_size": "small", "highlight": "off", "reading_tint": "peach", "reading_font": "sitka",

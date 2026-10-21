@@ -366,6 +366,17 @@ def _reg_value(path: str, name: str):
         return None
 
 
+def smart_app_control_on() -> bool:
+    """Smart App Control is enforcing (not just evaluating), so it may block an unsigned program it hasn't seen
+    before, with no way for the person to allow it."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\CI\Policy", 0,
+                            winreg.KEY_READ) as key:
+            return winreg.QueryValueEx(key, "VerifiedAndReputablePolicyState")[0] == 1
+    except OSError:
+        return False
+
+
 def _reg_flag(path: str, name: str, default: bool) -> bool:
     value = _reg_value(path, name)
     return bool(value) if isinstance(value, int) else default

@@ -8,8 +8,10 @@ text and hands back a token that restore() can bring it back from.
 The synth, player, input thread and settings are duck-typed. The engine connects to their signals
 itself; if the app also connects input_thread.hotkeyPressed / copied to the on_hotkey / on_copied
 slots, those duplicate deliveries are recognised and ignored. The synth and player are started by
-start(), or on the first event-loop pass if the app never calls it. Timers come from an injectable
-factory so tests can drive them with a fake clock. Never logs text, only counts and ids.
+start(), or on the first event-loop pass if the app never calls it. The synth gets the speed as a
+multiplier (0.95); a synth with limits_for(voice) sets the chunk sizes, and one with new_reading() hears
+when each reading starts. Timers come from an injectable factory so tests can drive them with a fake
+clock. Never logs text, only counts and ids.
 """
 
 import logging
@@ -21,6 +23,7 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from .text_model import ChunkPlan, ChunkTiming, Document, map_words, plan_chunks
+from .voices.base import DEFAULT_VOICE_ID
 
 log = logging.getLogger("saylight.engine")
 
@@ -54,7 +57,7 @@ _PREV_ACTIONS = {READING: "prev", WAITING: "prev", PAUSED: "prev", FINISHED: "re
                  STOPPED: "read_from"}
 
 SPEEDS = (0.5, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.5, 1.75, 2.0)
-DEFAULT_VOICE = "en-US-AvaNeural"
+DEFAULT_VOICE = DEFAULT_VOICE_ID
 
 COPY_SHOW_MS = 150            # Copying is shown only after this long, so quick copies don't flicker
 COPY_WATCHDOG_MS = 5000       # give up on a copy result that never comes
@@ -71,7 +74,7 @@ PREFETCH_RETRY_MS = 1500      # silent retry of a failed prefetch
 PURGE_MS = 10 * 60 * 1000     # privacy purge after this long at rest
 MEDIA_PAUSE_MS = 10 * 60 * 1000  # media keys stay registered this long into a pause
 VOLUME_INTERVAL_MS = 33       # volume changes throttled to 30 Hz
-FIRST_LIMIT, LIMIT = 250, 1500
+FIRST_LIMIT, LIMIT = 250, 1500  # chunk sizes in characters for a synth without limits_for()
 PREFETCH = 2                  # at most this many unplayed chunks requested or ready
 MAX_CACHED_CHUNKS = 24        # ready chunks kept for Previous / jumps (bounded temp disk use)
 DEFAULT_MS_PER_CHAR = 65.0    # length estimate at 1.0x before anything has been measured
@@ -964,6 +967,9 @@ class Engine(QObject):
         self._mid_session = self._back_online = False
         self._time_left_value = None
         log.info("New reading: %d sentences, %d characters", len(doc.sentences), len(doc.text))
+        new_reading = getattr(self._synth, "new_reading", None)
+        if new_reading is not None:  # each reading starts on the chosen voice again
+            new_reading()
         self.sessionChanged.emit(doc)
         self._cur = 0
         self._set_state(PREPARING)
@@ -1046,13 +1052,16 @@ class Engine(QObject):
         else:
             nxt, unplayed, short = self._cur, 0, True
         while nxt < n and unplayed < PREFETCH:
-            chunk = self._find(nxt) or self._request(nxt, FIRST_LIMIT if short else LIMIT)
+            chunk = self._find(nxt) or self._request(nxt, short)
             unplayed += 1
             short = False
             nxt = chunk.plan.last + 1
 
-    def _request(self, start: int, first_limit: int) -> _Chunk:
-        plan = plan_chunks(self._doc, start, first_limit=first_limit, limit=LIMIT,
+    def _request(self, start: int, short: bool) -> _Chunk:
+        """Ask for the chunk starting at sentence `start`: a short one when audio is wanted soon."""
+        limits_for = getattr(self._synth, "limits_for", lambda _voice: (FIRST_LIMIT, LIMIT))
+        first, later = limits_for(self._voice())
+        plan = plan_chunks(self._doc, start, first_limit=first if short else later, limit=later,
                            first_chunk_id=self._next_id, max_chunks=1)[0]
         self._next_id += 1
         chunk = _Chunk(plan, self._rate, self._gen)
@@ -1064,8 +1073,7 @@ class Engine(QObject):
         log.info("Synthesizing chunk %d (gen %d): sentences %d-%d, %d characters, rate %s",
                  chunk.id, chunk.gen, chunk.plan.first + 1, chunk.plan.last + 1, len(chunk.plan.text),
                  rate_string(chunk.speed))
-        self._synth.synthesize(chunk.gen, chunk.id, chunk.plan.text, str(self._get("voice", DEFAULT_VOICE)),
-                               rate_string(chunk.speed))
+        self._synth.synthesize(chunk.gen, chunk.id, chunk.plan.text, self._voice(), chunk.speed)
 
     def _delete_chunk(self, chunk: _Chunk) -> None:
         self._chunks.pop(chunk.id, None)
@@ -1486,6 +1494,9 @@ class Engine(QObject):
         except KeyError:
             return default
         return default if value is None else value
+
+    def _voice(self) -> str:
+        return str(self._get("voice", DEFAULT_VOICE))
 
     def _do_beep(self, kind: str) -> None:
         if self._beep is not None:

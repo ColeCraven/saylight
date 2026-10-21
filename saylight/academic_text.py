@@ -309,6 +309,10 @@ def _strip_page_furniture(lines):
 #      of 4+ letters (or a known short word such as "age");
 #   7. otherwise join (most PDF line-end hyphens are syllable breaks).
 # Suspended hyphens ("pre-\nand post-test") are left as "pre- and".
+# Across a blank line the break is only joined when the next text starts
+# lower-case.  A capital or digit there belongs to something that interrupted
+# the sentence (a caption, table or heading: "fine-\n\nTable 2: ..."), so the
+# hyphen is left where it is.
 # The joined word stays on the first line and the rest of the second line
 # keeps its own line, but the first line is marked with _CONT: it is the
 # front half of a wrapped line, so it can never be a heading or the end of a
@@ -317,7 +321,8 @@ def _strip_page_furniture(lines):
 
 _CONT = ""
 _LB_HYPHEN_RE = re.compile(
-    r"(?<![\w/.:@\-])([^\W_]+(?:-[^\W_]+)*)-[ ]*\n\s*(?=[^\W_])(\S+)")
+    r"(?<![\w/.:@\-])([^\W_]+(?:-[^\W_]+)*)-[ ]*\n"
+    rf"(?:[ ]*(?=[^\W_])|(?:[ ]*\n)++[ ]*+(?=(?![{_UC}])[^\W\d_]))(\S+)")
 _WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")
 _HYPHEN_PREFIXES = frozenset(
     "self well ill cross quasi half non all high low long short full first second third "
@@ -393,6 +398,10 @@ _URL_TAIL_RE = re.compile(r"(?:https?://|ftp://|www\.|doi:\s*|(?:dx\.)?doi\.org/
 
 
 def _url_continues(line, nxt):
+    # A numbered heading ("2 Related Work", "3.1 Data") starts a new unit even
+    # when the URL before it ends in "." or "/", so it must not be glued on.
+    if _SECTION_HEADING_RE.match(nxt):
+        return False
     tok = nxt.split()[0]
     core = tok.rstrip(".,;:!?)")
     if not core or not re.fullmatch(r"[\w\-./?&=#%~+:]+", core):
@@ -619,16 +628,21 @@ def _build_paragraphs(lines):
 # after a full stop or comma, after a "doi:" label, "Retrieved from" or
 # "Available at:") is removed entirely,
 # because "link" there is pure noise.  Raw URLs are never read out.
+# A PDF footnote pastes its number straight onto the URL ("1https://...",
+# "10www.example.org"): a short number standing alone before http(s)://, ftp://
+# or www. is taken as part of the URL.  Such a URL is the footnote itself, not
+# part of the sentence around it, so it is removed rather than read as "link".
 
 _DROP, _LINK = "\ue000", "\ue001"
 _URL_RE = re.compile(r"""
     (?P<doi>(?:\bdoi\s*:?\s*|\bhttps?://(?:dx\.)?doi\.org/|(?<![\w.@/-])(?:dx\.)?doi\.org/)?\b10\.\d{4,9}/[^\s"<>]+)
-  | (?P<url>\b(?:https?|ftp)://[^\s"<>]+
-     | (?<![\w.@/-])www\.[^\s"<>]+
+  | (?P<url>(?:(?<![^\s(\[])\d{1,3}|(?<!\w))(?:https?|ftp)://[^\s"<>]+
+     | (?:(?<![^\s(\[])\d{1,3}|(?<![\w.@/-]))www\.[^\s"<>]+
      | (?<![\w.@/-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|org|net|edu|gov|io|ai|uk|de|ca|au|info|eu|int|dev
          |app|co|us|nl|fr|jp|ch|se|no|fi|dk|nz|ie|be|at|es|it|ly|me|tv)/[^\s"<>]*)
 """, re.I | re.X)
 _SENT_CLASS = f"[{_DROP}{_LINK}]"
+_FOOTNOTE_URL_RE = re.compile(r"\d{1,3}(?:(?:https?|ftp)://|www\.)", re.I)
 
 
 def _trim_url(u):
@@ -646,6 +660,8 @@ def _remove_urls(text):
         # "<https://...>" is wrapped, not detached: look past the "<"
         before = m.string[max(0, m.start() - 4):m.start()].rstrip().rstrip("<").rstrip()
         token = _LINK if before and (before[-1].isalnum() or before[-1] == ":") else _DROP
+        if _FOOTNOTE_URL_RE.match(s):
+            token = _DROP
         return token + s[len(url):]
 
     if not _URL_RE.search(text):

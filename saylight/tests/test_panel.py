@@ -157,6 +157,7 @@ class PanelCase(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="saylight_panel_test_")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.settings = Settings(os.path.join(self.dir, "s.json"))
+        self.addCleanup(self.settings.flush)  # before the folder goes, or a pending save brings it back
         self.settings.set("panel.expanded", self.expanded)
         self.theme = Theme(self.settings, system=FakeSystem(k=self.k))
         self.ctl = FakeCtl(self.settings, self.theme)

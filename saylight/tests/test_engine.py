@@ -223,7 +223,7 @@ class FakeSettings(QObject):
 
     def __init__(self, **values):
         super().__init__()
-        self.values = {"speed": 0.95, "volume": 100, "voice": "en-US-AvaNeural", "media_keys": True,
+        self.values = {"speed": 0.95, "volume": 100, "voice": "edge:en-US-AvaNeural", "media_keys": True,
                        "skip_citations": True, "skip_urls": True}
         self.values.update(values)
         self.sets: list[tuple] = []
@@ -241,9 +241,9 @@ class FakeSettings(QObject):
 class H:
     """Test harness: an engine wired to fakes, with recorders for every engine signal."""
 
-    def __init__(self, **settings):
+    def __init__(self, synth=None, **settings):
         self.clock = FakeClock()
-        self.synth, self.player, self.input = FakeSynth(), FakePlayer(), FakeInput()
+        self.synth, self.player, self.input = synth or FakeSynth(), FakePlayer(), FakeInput()
         self.settings = FakeSettings(**settings)
         self.beeps: list[str] = []
         self.engine = E.Engine(synth=self.synth, player=self.player, input_thread=self.input,
@@ -823,8 +823,9 @@ class SessionTests(unittest.TestCase):
         self.assertLessEqual(len(first["text"]), 250)
         self.assertEqual(first["text"], " ".join(sentence(i) for i in range(4)))
         self.assertEqual(second["text"], " ".join(sentence(i) for i in range(4, 12)))
-        self.assertEqual(first["rate"], "-5%")
-        self.assertEqual(first["voice"], "en-US-AvaNeural")
+        self.assertEqual(first["rate"], 0.95)  # a number; the synth makes its own rate format
+        self.assertIsInstance(first["rate"], float)
+        self.assertEqual(first["voice"], "edge:en-US-AvaNeural")
         self.assertNotEqual(first["chunk_id"], second["chunk_id"])
         self.assertEqual(h.shown, E.PREPARING)
         self.assertEqual(h.info["total"], 12)
@@ -1338,7 +1339,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(self.speeds_set(h), [1.15])
         new = h.synth.requests[before:]
         self.assertTrue(new)
-        self.assertTrue(all(r["rate"] == "+15%" for r in new))
+        self.assertTrue(all(r["rate"] == 1.15 for r in new))
         self.assertEqual(len(h.cmds("set_cut")), 1)
 
     def test_snaps_to_speed_list(self):
@@ -1375,13 +1376,13 @@ class SpeedTests(unittest.TestCase):
         h.advance(400)
         self.assertEqual(h.speeds[-1], (1.25, ""))
         h.begin()
-        self.assertEqual(h.req(0)["rate"], "+25%")
+        self.assertEqual(h.req(0)["rate"], 1.25)
 
     def test_new_reading_commits_a_pending_change_first(self):
         h = H()
         h.engine.set_speed(1.5)
         h.begin()
-        self.assertEqual(h.req(0)["rate"], "+50%")
+        self.assertEqual(h.req(0)["rate"], 1.5)
         self.assertEqual(self.speeds_set(h), [1.5])
 
     def test_preparing_commit_replans_from_start(self):
@@ -1393,7 +1394,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(h.state, E.PREPARING)
         self.assertGreater(h.synth.cancelled_before[-1], gen)
         new = [r for r in h.synth.requests if r["gen"] > gen]
-        self.assertEqual(new[0]["rate"], "+25%")
+        self.assertEqual(new[0]["rate"], 1.25)
         self.assertTrue(new[0]["text"].startswith(sentence(0)))
         self.assertLessEqual(len(new[0]["text"]), 250)
         self.assertTrue(h.engine.speed_pending)
@@ -1416,7 +1417,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(len(new), 2)
         self.assertTrue(new[0]["text"].startswith(sentence(2)))
         self.assertLessEqual(len(new[0]["text"]), 250)
-        self.assertEqual(new[0]["rate"], "+25%")
+        self.assertEqual(new[0]["rate"], 1.25)
         self.assertEqual(h.engine.pending_note, "1.25× from next sentence")
         self.assertEqual(h.info["pending_note"], "1.25× from next sentence")
         self.assertEqual(self.speeds_set(h), [1.25])
@@ -1451,7 +1452,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(h.cmds("set_cut"), [])
         new = [r for r in h.synth.requests if r["gen"] > gen]
         self.assertTrue(new[0]["text"].startswith(sentence(4)))
-        self.assertEqual(new[0]["rate"], "+25%")
+        self.assertEqual(new[0]["rate"], 1.25)
 
     def test_reading_last_sentence_applies_to_next_reading(self):
         h = H()
@@ -1470,7 +1471,7 @@ class SpeedTests(unittest.TestCase):
         h.end(a)
         self.assertEqual(h.state, E.FINISHED)
         h.begin()
-        self.assertEqual(h.req()["rate"], "+25%")
+        self.assertEqual(h.req()["rate"], 1.25)
 
     def test_before_sentence_start_cuts_now(self):
         h = H()
@@ -1531,7 +1532,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(h.state, E.PAUSED)
         new = [r for r in h.synth.requests if r["gen"] > gen]
         self.assertTrue(new[0]["text"].startswith(sentence(1)))
-        self.assertEqual(new[0]["rate"], "+50%")
+        self.assertEqual(new[0]["rate"], 1.5)
         self.assertEqual(h.info["pending_note"], "1.5× when resumed")
         self.assertEqual(h.info["sentence"], 1)
         h.ready(new[0]["chunk_id"])
@@ -1553,7 +1554,7 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(h.state, E.WAITING)
         new = [r for r in h.synth.requests if r["gen"] > gen]
         self.assertTrue(new[0]["text"].startswith(sentence(4)))
-        self.assertEqual(new[0]["rate"], "-25%")
+        self.assertEqual(new[0]["rate"], 0.75)
         self.assertIn(h.path(a), h.synth.deleted)
         self.assertEqual(h.info["pending_note"], "0.75× from next sentence")
 
@@ -1579,7 +1580,7 @@ class SpeedTests(unittest.TestCase):
         h.advance(400)
         self.assertEqual(h.cmds("set_cut")[-1], ("set_cut", None))
         self.assertTrue(h.req()["text"].startswith(sentence(4)))
-        self.assertEqual(h.req()["rate"], "-5%")
+        self.assertEqual(h.req()["rate"], 0.95)
         self.assertFalse(h.engine.speed_pending)
         self.assertEqual(h.speeds[-1], (0.95, ""))
         h.end(a)
@@ -1619,7 +1620,7 @@ class SpeedTests(unittest.TestCase):
         self.assertFalse(h.engine.speed_pending)
         self.assertEqual(h.speeds[-1], (1.25, ""))
         h.engine.prev()                  # reads on at the committed speed
-        self.assertEqual(h.req()["rate"], "+25%")
+        self.assertEqual(h.req()["rate"], 1.25)
 
     def test_pending_note_is_cleared_on_error(self):
         h = H()
@@ -1661,7 +1662,7 @@ class SpeedTests(unittest.TestCase):
         h.advance(400)
         self.assertIn(h.path(a), h.synth.deleted)
         h.engine.prev()
-        self.assertEqual(h.req()["rate"], "+25%")
+        self.assertEqual(h.req()["rate"], 1.25)
         self.assertTrue(h.req()["text"].startswith(sentence(3)))
 
 
@@ -1780,7 +1781,7 @@ class ErrorTests(unittest.TestCase):
         h.advance(400)
         h.engine.toggle_pause()  # Play button / pause hotkey in an error state = Try again
         self.assertEqual(h.state, E.PREPARING)
-        self.assertEqual(h.req(-2)["rate"], "+25%")
+        self.assertEqual(h.req(-2)["rate"], 1.25)
         self.assertTrue(h.req(-2)["text"].startswith(sentence(0)))
 
     def test_back_online_variant(self):
@@ -1967,7 +1968,7 @@ class SettingsFollowTests(unittest.TestCase):
         self.assertEqual(h.engine.speed, 1.5)
         h.advance(400)
         h.begin()
-        self.assertEqual(h.req()["rate"], "+50%")
+        self.assertEqual(h.req()["rate"], 1.5)
 
     def test_volume_changed_elsewhere(self):
         h = H()
@@ -1983,7 +1984,7 @@ class SettingsFollowTests(unittest.TestCase):
         h.press()
         h.copied(make_text(3))
         self.assertEqual(h.state, E.PREPARING)
-        self.assertEqual(h.req()["rate"], "+50%")
+        self.assertEqual(h.req()["rate"], 1.5)
         for state, info in h.states:
             if state in E.SESSION:
                 self.assertTrue(info["has_text"], state)
@@ -2264,7 +2265,7 @@ class TypedTextTests(unittest.TestCase):
         h = H()
         h.engine.set_speed(1.25)
         h.engine.read_text(typed_text(3))
-        self.assertEqual(h.req()["rate"], "+25%")
+        self.assertEqual(h.req()["rate"], 1.25)
         self.assertEqual(h.settings.values["speed"], 1.25)
 
     def test_the_compose_shortcut_is_not_the_engines(self):
@@ -2758,6 +2759,56 @@ class ShutdownTests(unittest.TestCase):
         h.press()
         h.copied(make_text(2))
         self.assertEqual(len(h.states), count)
+
+
+class RouterSynth(FakeSynth):
+    """A synth with the router's extras: chunk sizes per voice, and a call at each new reading."""
+
+    def __init__(self, limits=(130, 300)):
+        super().__init__()
+        self.limits = limits
+        self.asked: list[str] = []
+        self.readings = 0
+
+    def limits_for(self, voice):
+        self.asked.append(voice)
+        return self.limits
+
+    def new_reading(self):
+        self.readings += 1
+
+
+class SynthExtrasTests(unittest.TestCase):
+    def test_chunk_sizes_come_from_the_synth_for_the_chosen_voice(self):
+        h = H(synth=RouterSynth(), voice="edge:en-GB-SoniaNeural")
+        h.begin(12)
+        first, second = h.synth.requests
+        self.assertEqual(first["text"], " ".join(sentence(i) for i in range(2)))      # up to 130 characters
+        self.assertEqual(second["text"], " ".join(sentence(i) for i in range(2, 7)))  # up to 300
+        self.assertEqual(set(h.synth.asked), {"edge:en-GB-SoniaNeural"})
+        self.assertEqual(first["voice"], "edge:en-GB-SoniaNeural")
+
+    def test_a_synth_without_limits_gets_the_default_sizes(self):
+        h = H()
+        h.begin(12)
+        self.assertFalse(hasattr(h.synth, "limits_for"))
+        self.assertEqual([len(r["text"]) <= limit for r, limit in zip(h.synth.requests, (E.FIRST_LIMIT, E.LIMIT))],
+                         [True, True])
+        self.assertEqual(h.synth.requests[1]["text"], " ".join(sentence(i) for i in range(4, 12)))
+
+    def test_each_new_reading_is_announced_once(self):
+        h = H(synth=RouterSynth())
+        a, _ = h.play()
+        self.assertEqual(h.synth.readings, 1)
+        self.assertTrue(h.engine.pause())
+        self.assertTrue(h.engine.resume())
+        h.engine.next()
+        self.assertEqual(h.synth.readings, 1)
+        h.press()
+        h.copied(make_text(3))       # a new selection is a new reading
+        self.assertEqual(h.synth.readings, 2)
+        self.assertTrue(h.engine.read_text(make_text(2)))
+        self.assertEqual(h.synth.readings, 3)
 
 
 if __name__ == "__main__":

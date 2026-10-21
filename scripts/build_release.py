@@ -1,198 +1,191 @@
-"""Build the release zip: the app, a one-click installer and uninstaller, and a short guide.
+"""Build the Windows release: dist/Saylight-Setup.exe and dist/Saylight-Setup.exe.sha256.
 
-Only source files are copied (no settings, logs, caches or tests).
-Usage: python scripts/build_release.py [output.zip]   (default: dist/Saylight.zip)
+    python scripts/build_release.py [--tag v1.2.0] [--out dist] [--legacy-ref v1.1.0] [--skip-tests]
+                                    [--skip-lifecycle] [--keep-work]
+
+Steps, stopping at the first failure:
+ 1. the version in saylight/__init__.py must match the tag (when one is given);
+ 2. the unit tests;
+ 3. the release build (PyInstaller, one folder) and its notices, which run the licence gate;
+ 4. a build of a test copy (the TEST names from packaging/identity.iss), its notices and its frozen self-test
+    in a clean environment;
+ 5. the installers: Saylight-Setup.exe from the release build, SaylightTest-Setup.exe from the test build;
+ 6. the installer lifecycle test on the test installer (never on the real one). With --legacy-ref it also
+    upgrades over a 1.1 source install made from that git ref;
+ 7. the SHA-256 file next to Saylight-Setup.exe.
+
+Builds happen in a short folder under %TEMP%: Inno Setup fails on paths over 260 characters. Run it with the
+Python that has the packages from requirements.txt and requirements-build.txt.
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
 import os
+import re
 import shutil
+import subprocess
 import sys
+import tarfile
 import tempfile
-import zipfile
 
-SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_FILES = ["saylight_app.py", "requirements.txt"]
-PACKAGE = "saylight"
-SKIP_DIRS = {"tests", "__pycache__"}
-
-INSTALL_CMD = r"""@echo off
-setlocal EnableExtensions
-title Saylight setup
-cd /d "%~dp0"
-echo.
-echo   Saylight setup
-echo   --------------
-echo.
-
-set "PY="
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul && set "PY=python"
-if not defined PY py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul && set "PY=py -3"
-if not defined PY goto :nopython
-
-set "DEST=%LOCALAPPDATA%\Programs\Saylight"
-echo   1/3  Copying Saylight to "%DEST%"
-if exist "%DEST%\saylight_app.py" %PY% "%DEST%\saylight_app.py" --quit >nul 2>nul
-robocopy "%~dp0app" "%DEST%" /E /NFL /NDL /NJH /NJS /NP >nul
-if errorlevel 8 goto :fail
-
-echo   2/3  Installing the voice and window components (about 80 MB, one time only)
-%PY% -m pip install --user --upgrade --disable-pip-version-check -q -r "%DEST%\requirements.txt"
-if errorlevel 1 goto :fail
-
-echo   3/3  Starting Saylight and adding it to sign-in and the Start menu
-%PY% "%DEST%\saylight_app.py" --install >nul
-if errorlevel 1 goto :fail
-
-echo.
-echo   All done!
-echo.
-echo   Highlight text in any app and press  Ctrl + `  (the key left of 1) to hear it.
-echo   Press it with nothing highlighted to show or hide the panel.
-echo   You can now delete the folder you unzipped.
-echo.
-pause
-exit /b 0
-
-:nopython
-echo   Saylight needs Python 3.10 or newer, which is free.
-echo.
-echo   1. Install it from https://www.python.org/downloads/
-echo      (on the first screen, tick "Add python.exe to PATH").
-echo   2. Then run this installer again.
-echo.
-pause
-exit /b 1
-
-:fail
-echo.
-echo   Something went wrong (see the messages above). Check your internet connection and try again.
-echo.
-pause
-exit /b 1
-"""
-
-UNINSTALL_CMD = r"""@echo off
-setlocal EnableExtensions
-title Uninstall Saylight
-set "DEST=%LOCALAPPDATA%\Programs\Saylight"
-set "PY=python"
-python -c "" >nul 2>nul || set "PY=py -3"
-if exist "%DEST%\saylight_app.py" %PY% "%DEST%\saylight_app.py" --uninstall
-timeout /t 2 /nobreak >nul
-rmdir /s /q "%DEST%" >nul 2>nul
-echo.
-echo   Saylight has been removed. (The Python components it installed are left in place.)
-echo.
-pause
-"""
-
-README = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Saylight</title>
-<style>
-:root { --bg:#faf5e9; --card:#fffdf8; --text:#24211c; --muted:#6b655b; --accent:#2b4f8c; --line:#e8dfcc; }
-@media (prefers-color-scheme: dark) { :root { --bg:#1f2023; --card:#26282c; --text:#e6e1d6; --muted:#9c978d;
-  --accent:#8fb4f0; --line:#34363b; } }
-* { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font:17px/1.6 Verdana, "Segoe UI", sans-serif;
-  letter-spacing:.01em; word-spacing:.08em; }
-main { max-width:680px; margin:0 auto; padding:40px 20px 60px; }
-h1 { font:600 30px/1.2 "Segoe UI Variable Display", "Segoe UI", sans-serif; margin:0 0 6px; letter-spacing:0; }
-h2 { font:600 19px/1.3 "Segoe UI Variable Text", "Segoe UI", sans-serif; margin:34px 0 10px; letter-spacing:0; }
-.lead { color:var(--muted); margin:0 0 26px; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 22px; }
-kbd { font:600 14px "Segoe UI", sans-serif; border:1px solid var(--line); border-bottom-width:2px; border-radius:6px;
-  padding:1px 7px; background:var(--card); }
-ol, ul { padding-left:22px; } li { margin:6px 0; }
-.note { color:var(--muted); font-size:15px; }
-a { color:var(--accent); }
-</style></head>
-<body><main>
-<h1>Saylight</h1>
-<p class="lead"><b>Highlight it, and it says it.</b> Highlight text anywhere on your PC and hear it read in a natural voice, with the words highlighted as
-they are spoken. Made with dyslexic readers in mind.</p>
-
-<div class="card">
-<h2 style="margin-top:0">Install</h2>
-<ol>
-<li>Unzip this folder anywhere.</li>
-<li>Double-click <b>Install Saylight.cmd</b>. It takes a minute and needs an internet connection.
- If Windows asks whether to run it, choose <i>More info</i> then <i>Run anyway</i>.</li>
-<li>If it says Python is missing, install it free from <a href="https://www.python.org/downloads/">python.org</a>
- (tick <i>Add python.exe to PATH</i>), then run the installer again.</li>
-</ol>
-</div>
-
-<h2>Use it</h2>
-<ul>
-<li>Highlight text in any app, then press <kbd>Ctrl</kbd> <kbd>`</kbd> (the key left of <kbd>1</kbd>).</li>
-<li>Press <kbd>Ctrl</kbd> <kbd>`</kbd> with nothing highlighted to <b>show or hide the panel</b>, or to
- <b>pause and resume</b> while it is reading.</li>
-<li>In the panel: go back or forward a sentence, change the speed, or click any sentence to read from there.
- Scroll over the text to look back; <kbd>Ctrl</kbd>+scroll changes the text size.</li>
-<li>Click &#9998; (or the empty reading box) to <b>type or paste your own text</b>, then press <b>Read aloud</b> or
- <kbd>Ctrl</kbd> <kbd>Enter</kbd>. <kbd>Esc</kbd> goes back and keeps your text.</li>
-<li>The eraser button <b>clears</b> the reading box. <b>Undo</b> appears for 10 seconds if you change your mind.</li>
-<li>The gear button opens <b>Reading display</b>: text size, font, spacing, highlight style and background colour,
- and options to skip citations and web links in academic papers.</li>
-<li>The tray icon (near the clock) shows when it is reading. Right-click it for more options, including Quit.</li>
-</ul>
-
-<h2>Good to know</h2>
-<ul>
-<li>It starts automatically when you sign in. To stop that, use <i>Task Manager &rarr; Startup apps</i>, or run
- <b>Uninstall Saylight.cmd</b> to remove it completely.</li>
-<li><b>Privacy:</b> the voice is Microsoft's online neural voice (the same voices as Microsoft Edge's Read Aloud,
- via the open-source <a href="https://github.com/rany2/edge-tts">edge-tts</a> project), so the text you have read
- aloud is sent to Microsoft to be spoken. Avoid using it on confidential text. Nothing is stored or logged by
- Saylight itself.</li>
-<li>It needs an internet connection to speak.</li>
-</ul>
-<p class="note">Saylight is a personal project and is not affiliated with Microsoft.</p>
-</main></body></html>
-"""
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGING = os.path.join(REPO, "packaging")
+SETUP_NAME = "Saylight-Setup.exe"
+TEST_SETUP_NAME = "SaylightTest-Setup.exe"
+BLOCKED_BY_POLICY = 4551  # ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION, as Smart App Control reports a refused file
 
 
-def stage(root: str) -> None:
-    app = os.path.join(root, "app")
-    os.makedirs(app)
-    for name in APP_FILES:
-        shutil.copy2(os.path.join(SRC, name), app)
-    for dirpath, dirnames, filenames in os.walk(os.path.join(SRC, PACKAGE)):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        rel = os.path.relpath(dirpath, SRC)
-        os.makedirs(os.path.join(app, rel), exist_ok=True)
-        for f in filenames:
-            if f.endswith(".py"):
-                shutil.copy2(os.path.join(dirpath, f), os.path.join(app, rel, f))
-    for name, text in (("Install Saylight.cmd", INSTALL_CMD), ("Uninstall Saylight.cmd", UNINSTALL_CMD)):
-        with open(os.path.join(root, name), "w", encoding="ascii", newline="\r\n") as f:
-            f.write(text)
-    with open(os.path.join(root, "Read Me.html"), "w", encoding="utf-8") as f:
-        f.write(README)
+class BuildError(Exception):
+    pass
 
 
-def main() -> None:
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SRC, "dist", "Saylight.zip")
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    work = tempfile.mkdtemp(prefix="ra_pkg_")
-    root = os.path.join(work, "Saylight")
-    stage(root)
-    if os.path.exists(out):
-        os.remove(out)
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for dirpath, _dirs, files in os.walk(root):
-            for f in files:
-                full = os.path.join(dirpath, f)
-                z.write(full, os.path.relpath(full, work))
-    shutil.rmtree(work, ignore_errors=True)
-    with zipfile.ZipFile(out) as z:
-        names = z.namelist()
-    print(f"{out}: {len(names)} files, {os.path.getsize(out) // 1024} KB")
-    for n in names:
-        if not n.startswith("Saylight/app/saylight/"):
-            print("  ", n)
+def step(title: str) -> None:
+    print(f"\n== {title}", flush=True)
+
+
+def run(what: str, cmd: list[str], **kw) -> None:
+    try:
+        code = subprocess.run(cmd, **kw).returncode
+    except OSError as e:
+        if getattr(e, "winerror", None) != BLOCKED_BY_POLICY:
+            raise
+        raise BuildError(f"{what}: Windows blocked {os.path.basename(cmd[0])} (Smart App Control); "
+                         "rebuild or sign it") from None
+    if code != 0:
+        raise BuildError(f"{what} failed (exit code {code})")
+
+
+def source_version() -> str:
+    with open(os.path.join(REPO, "saylight", "__init__.py"), encoding="utf-8-sig") as f:
+        m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', f.read(), re.MULTILINE)
+    if not m:
+        raise BuildError("saylight/__init__.py has no __version__")
+    return m.group(1)
+
+
+def _packaging_module(name: str):
+    spec = importlib.util.spec_from_file_location(f"_build_{name}", os.path.join(PACKAGING, f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up while it loads
+    spec.loader.exec_module(module)
+    return module
+
+
+def pyinstaller(src: str, dist: str, work: str) -> str:
+    """One-folder build of `src`; returns <dist>\\Saylight."""
+    run("PyInstaller", [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", dist,
+                        "--workpath", work, os.path.join(PACKAGING, "saylight.spec")],
+        env=dict(os.environ, SAYLIGHT_SRC=src))
+    return os.path.join(dist, "Saylight")
+
+
+def notices(build: str) -> None:
+    run("The licence gate", [sys.executable, os.path.join(PACKAGING, "collect_notices.py"), build])
+
+
+def iscc(build: str, out: str, *, test: bool) -> str:
+    _version, licence = _packaging_module("collect_notices").inno_setup()  # found next to ISCC.exe when installed
+    compiler = os.path.join(os.path.dirname(licence), "ISCC.exe")
+    if not os.path.isfile(compiler):
+        raise BuildError("Inno Setup 6 not found (install it, or set INNO_SETUP_DIR)")
+    defines = ["/DTEST"] if test else []
+    run("Inno Setup", [compiler, "/Q", *defines, f"/DSourceDir={build}", f"/O{out}",
+                       os.path.join(PACKAGING, "saylight.iss")])
+    path = os.path.join(out, TEST_SETUP_NAME if test else SETUP_NAME)
+    if not os.path.isfile(path):
+        raise BuildError(f"ISCC wrote no {os.path.basename(path)}")
+    return path
+
+
+def legacy_copy(ref: str, work: str) -> str:
+    """A test copy of the source at git `ref` (the 1.1 install the lifecycle test upgrades over)."""
+    tar = os.path.join(work, "legacy.tar")
+    run("git archive", ["git", "-C", REPO, "archive", "--format=tar", "-o", tar, ref])
+    raw = os.path.join(work, "legacy_src")
+    with tarfile.open(tar) as t:
+        t.extractall(raw, filter="data")
+    dest = os.path.join(work, "legacy")
+    run("make_test_copy", [sys.executable, os.path.join(PACKAGING, "make_test_copy.py"), dest, "--src", raw])
+    return dest
+
+
+def write_checksum(setup: str) -> str:
+    h = hashlib.sha256()
+    with open(setup, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    path = setup + ".sha256"
+    with open(path, "w", encoding="ascii", newline="\n") as f:
+        f.write(f"{h.hexdigest()}  {os.path.basename(setup)}\n")
+    return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Build Saylight-Setup.exe and its SHA-256 file.")
+    parser.add_argument("--tag", help="the release tag, for example v1.2.0; must match __version__")
+    parser.add_argument("--out", default=os.path.join(REPO, "dist"), help="where the installer goes")
+    parser.add_argument("--legacy-ref", help="also test an upgrade over a 1.1 source install from this git ref")
+    parser.add_argument("--skip-tests", action="store_true", help="skip the unit tests")
+    parser.add_argument("--skip-lifecycle", action="store_true", help="skip the installer lifecycle test")
+    parser.add_argument("--keep-work", action="store_true", help="keep the build folder")
+    args = parser.parse_args(argv)
+
+    version = source_version()
+    work = tempfile.mkdtemp(prefix="slb_")
+    try:
+        if len(work) > 60:
+            raise BuildError(f"the temp folder {work} is too long for Inno Setup; set TEMP to a short folder")
+        step(f"Saylight {version}")
+        if args.tag and args.tag.removeprefix("v") != version:
+            raise BuildError(f"tag {args.tag} doesn't match __version__ {version}")
+        if not args.skip_tests:
+            step("Unit tests")
+            run("The unit tests", [sys.executable, "-m", "unittest", "discover", "-s", "saylight/tests", "-t", "."],
+                cwd=REPO)
+
+        step("Release build")
+        release = pyinstaller(REPO, os.path.join(work, "rel"), os.path.join(work, "build_rel"))
+        notices(release)
+
+        step("Test build and frozen self-test")
+        test_src = os.path.join(work, "test_src")
+        run("make_test_copy", [sys.executable, os.path.join(PACKAGING, "make_test_copy.py"), test_src, "--src", REPO])
+        test_build = pyinstaller(test_src, os.path.join(work, "test"), os.path.join(work, "build_test"))
+        notices(test_build)
+        run("The frozen self-test", [sys.executable, os.path.join(PACKAGING, "selftest.py"), test_build,
+                                     "--src", test_src, "--report", os.path.join(work, "selftest.json")])
+
+        step("Installers")
+        os.makedirs(args.out, exist_ok=True)
+        setup = iscc(release, args.out, test=False)
+        test_setup = iscc(test_build, work, test=True)
+
+        if not args.skip_lifecycle:
+            step("Installer lifecycle (test installer)")
+            cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                   os.path.join(PACKAGING, "lifecycle_test.ps1"), "-Setup", test_setup,
+                   "-Sandbox", os.path.join(work, "lc"), "-Report", os.path.join(work, "lifecycle.json")]
+            if args.legacy_ref:
+                cmd += ["-Legacy", legacy_copy(args.legacy_ref, work), "-Python", sys.executable]
+            run("The lifecycle test", cmd)
+
+        step("Checksum")
+        checksum = write_checksum(setup)
+        print(f"{setup}: {os.path.getsize(setup):,} bytes")
+        print(f"{checksum}")
+        return 0
+    finally:
+        if args.keep_work:
+            print(f"Build folder kept: {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except BuildError as e:
+        sys.exit(f"build_release: {e}")

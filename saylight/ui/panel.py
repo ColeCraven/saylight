@@ -1,4 +1,4 @@
-"""The floating mini-player with its inline "Reading display" page.
+"""The floating mini-player with its inline settings page.
 
 The window is a frameless, always-on-top tool window that never activates: clicks, drags and the
 wheel all work while the user's own app keeps the foreground (so Ctrl+C still reaches it).
@@ -8,18 +8,22 @@ from __future__ import annotations
 
 from ctypes import wintypes
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer
-from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter, QPen
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 from .. import win32
 from .controls import (ACTION_PARTS, G_BACK, G_CLEAR, G_COLLAPSE, G_ERROR, G_EXPAND, G_HIDE, G_NEXT, G_NOTHING,
                        G_OFFLINE, G_PAUSE, G_PLAY, G_PREV, G_RETRY, G_SETTINGS, G_TYPE, FadeLabel, IconButton,
-                       Indicator, Part, PlayButton, ProgressBar, Segmented, SpeedStepper, SwatchRow, ToggleRow,
-                       VolumeSlider, paint_stop_square, volume_glyph)
+                       Indicator, Part, PlayButton, ProgressBar, SpeedStepper, VolumeSlider, paint_stop_square,
+                       volume_glyph)
+from .general_page import GeneralPage
 from .motion import MEDIUM, SLOW, Tween, decelerate, exit_curve
 from .sentence_view import SentenceView
+from .settings_pages import EDGE, TEXT_SIZES, DisplayPage, SettingsTabs
 from .tray import SPEEDS, speed_label
+from .update_bar import STRIP_H, NoticeStrip, UpdateBar
+from .voice_page import VoicePage
 
 PANEL_FLAGS = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                | Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -32,23 +36,9 @@ COMPACT_W, EXPANDED_W = 440, 640   # base widths: ~36 and ~56 characters per lin
 WIDTH_SAMPLE = "reading comprehension in adults with dyslexia "
 COMPACT_CPL, EXPANDED_CPL = 36, 56
 MAX_COMPACT_W, MAX_EXPANDED_W = 600, 900
-EDGE, SNAP = 12, 24
+SNAP = 24
 TASKBAR_GAP = 60  # bottom margin when the taskbar auto-hides (48 + 12)
 WPM_AT_1X = 142   # Ava on academic prose at +0% (measured)
-
-# Reading display options: (setting value, segment label, label px, tooltip[, label font family]).
-TEXT_SIZES = (("small", "Aa", 12, "Small text"), ("medium", "Aa", 14, "Medium text (default)"),
-              ("large", "Aa", 17, "Large text"), ("xlarge", "Aa", 20, "Extra large text"))
-FONTS = (("verdana", "Verdana", 13, "Verdana (default): large letters, clear I l 1 and O 0", "Verdana"),
-         ("segoe", "Segoe", 13, "Segoe UI, the Windows interface font", "Segoe UI Variable Text"),
-         ("calibri", "Calibri", 14, "Calibri", "Calibri"),
-         ("sitka", "Sitka", 13, "Sitka Small, a serif designed for legibility", "Sitka Small"))
-SPACINGS = (("standard", "Standard", 13, "Standard letter and word spacing"),
-            ("wide", "Wide", 13, "Slightly wider letters and words (default)"),
-            ("extra", "Extra wide", 13, "Extra wide spacing and taller lines"))
-HIGHLIGHTS = (("word", "Word", 13, "Highlight the sentence and the word being read (default)"),
-              ("sentence", "Sentence", 13, "Highlight only the sentence being read"),
-              ("off", "Off", 13, "No highlight"))
 
 ACTIVE = {"copying", "preparing", "reading", "waiting", "paused"}
 SESSION = {"preparing", "reading", "waiting", "paused"}
@@ -81,7 +71,6 @@ NOTHING_TEXT = {
     "busy": [K(("text", "The clipboard was busy. Please try again."))],
 }
 NOTHING_TEXT["line_copy"] = NOTHING_TEXT["empty"]
-TINT_SHORT = {"auto": "Automatic", "cream": "Cream", "peach": "Peach", "blue": "Soft blue", "dark": "Soft dark"}
 
 
 class Panel(QWidget):
@@ -107,8 +96,7 @@ class Panel(QWidget):
         self.btn_expand = IconButton(t, tips, G_EXPAND, size=32, small_glyph=True, parent=self,
                                      tooltip=self._expand_tip, name="Larger reading view")
         self.btn_settings = IconButton(t, tips, G_SETTINGS, size=32, small_glyph=True, parent=self,
-                                       tooltip="Reading display: text size, background and more",
-                                       name="Reading display settings")
+                                       tooltip="Settings: reading display, voice and more", name="Settings")
         self.btn_hide = IconButton(t, tips, G_HIDE, size=32, small_glyph=True, parent=self,
                                    tooltip="Hide panel. Press Ctrl+` with nothing highlighted to bring it back.",
                                    name="Hide panel")
@@ -136,45 +124,21 @@ class Panel(QWidget):
         self.slider = VolumeSlider(t, tips, self)
         self.slider.hide()
 
-        # Reading display page: label on the left, control on the right, one row each.
-        def label(text: str) -> FadeLabel:
-            lbl = FadeLabel(t, "body", "TextPrimary", self)
-            lbl.set_text(text, animate=False)
-            return lbl
-
-        def segmented(options, name: str) -> Segmented:
-            return Segmented(t, tips, [opt[1:] for opt in options], self, name=name)
-
-        self.option_rows = [
-            ("text_size", label("Text size"), segmented(TEXT_SIZES, "Text size"), TEXT_SIZES),
-            ("reading_font", label("Font"), segmented(FONTS, "Font"), FONTS),
-            ("spacing", label("Spacing"), segmented(SPACINGS, "Spacing"), SPACINGS),
-            ("highlight", label("Highlight"), segmented(HIGHLIGHTS, "Highlight"), HIGHLIGHTS),
-        ]
-        self.lbl_bg = label("Background")
-        self.swatches = SwatchRow(t, tips, self)
-        self.lbl_bg_name = FadeLabel(t, "small", "TextSecondary", self)  # names the chosen background
-        self.lbl_group = FadeLabel(t, "small", "TextSecondary", self)
-        self.lbl_group.set_text("Reading aloud · applies from the next reading", animate=False)
-        self.row_citations = ToggleRow(t, tips, "Skip citations", self,
-                                       tooltip="Leave out references such as (Smith et al., 2019) and [12]. "
-                                               "Applies from the next reading.")
-        self.row_links = ToggleRow(t, tips, "Skip links and DOIs", self,
-                                   tooltip="Say “link” instead of reading web addresses and DOIs. "
-                                           "Applies from the next reading.")
-        self._settings_widgets = [self.btn_back, self.lbl_bg, self.swatches, self.lbl_bg_name, self.lbl_group,
-                                  self.row_citations, self.row_links]
-        for _key, lbl, seg, _opts in self.option_rows:
-            self._settings_widgets += [lbl, seg]
-        self._reading_widgets = [self.indicator, self.btn_expand, self.btn_settings, self.view, self.progress,
-                                 self.btn_prev, self.play, self.btn_next, self.btn_stop, self.btn_type,
+        # Settings page: the tab bar in the header, one tab of rows below it.
+        self.tabs = SettingsTabs(self, ctl, [DisplayPage, VoicePage, GeneralPage])
+        self._settings_widgets = [self.btn_back, self.tabs, self.tabs.bar]
+        # The update line between the header and the card, while nothing is being read.
+        self.strip = NoticeStrip(t, tips, self)
+        self.update_bar = UpdateBar(getattr(ctl, "updates", None), self.strip, self)
+        self.update_bar.changed.connect(self.relayout)
+        self._reading_widgets = [self.indicator, self.status, self.btn_expand, self.btn_settings, self.view,
+                                 self.progress, self.btn_prev, self.play, self.btn_next, self.btn_stop, self.btn_type,
                                  self.btn_clear, self.stepper, self.btn_volume]
 
         self.page = "reading"
         self.expanded = bool(self.settings.get("panel.expanded"))
         self.view.set_expanded(self.expanded)
         self._sync_expand_button()
-        self._divider_y = 0  # settings page: the rule above the "Reading aloud" group
         self.state = "ready"
         self.info_dict: dict = {}
         self.doc = None
@@ -212,7 +176,7 @@ class Panel(QWidget):
         self._wire()
         t.changed.connect(self._on_theme)
         self.settings.changed.connect(self._on_setting)
-        self._sync_settings_page()
+        self.tabs.sync()
         self._on_theme()
 
     # --- Wiring -------------------------------------------------------------------------------
@@ -235,11 +199,6 @@ class Panel(QWidget):
         self.btn_volume.clicked.connect(lambda: self.set_volume_open(not self.volume_open))
         self.slider.valueChanged.connect(e.set_volume)
         self.slider.interacted.connect(lambda: self._slider_timer.start(4000))
-        for key, _lbl, seg, opts in self.option_rows:
-            seg.selected.connect(lambda i, key=key, opts=opts: self.settings.set(key, opts[i][0]))
-        self.swatches.selected.connect(lambda key: self.settings.set("reading_tint", key))
-        self.row_citations.toggled.connect(lambda on: self.settings.set("skip_citations", on))
-        self.row_links.toggled.connect(lambda on: self.settings.set("skip_urls", on))
         self.view.sizeStepRequested.connect(self.step_text_size)
 
     def step_text_size(self, direction: int) -> None:
@@ -282,29 +241,15 @@ class Panel(QWidget):
             relayout = getattr(w, "relayout", None)
             if relayout:
                 relayout()
-        self._sync_settings_page()
+        self.tabs.sync()
         self.relayout()
         self.update()
 
     def _on_setting(self, key: str) -> None:
-        if key in ("text_size", "reading_font", "spacing", "highlight", "reading_tint", "skip_citations",
-                   "skip_urls"):
-            self._sync_settings_page()
         if key in ("text_size", "reading_font", "spacing", "panel.expanded"):
             self.relayout()
         if key == "volume":
             self.on_volume(int(self.settings.get("volume")))
-
-    def _sync_settings_page(self) -> None:
-        s = self.settings
-        for key, _lbl, seg, opts in self.option_rows:
-            keys = [o[0] for o in opts]
-            value = s.get(key)
-            seg.set_index(keys.index(value) if value in keys else 0)
-        self.swatches.set_items(self.ctl.tint_items(), s.get("reading_tint"))
-        self.lbl_bg_name.set_text(TINT_SHORT.get(s.get("reading_tint"), ""))
-        self.row_citations.set_checked(bool(s.get("skip_citations")))
-        self.row_links.set_checked(bool(s.get("skip_urls")))
 
     def reading_width(self, expanded: bool) -> int:
         """The reading page's width in the compact or the larger view, widened for larger text."""
@@ -324,6 +269,14 @@ class Panel(QWidget):
     def _fit_screen(self, w: int) -> int:
         screen = self.screen() or QGuiApplication.primaryScreen()
         return min(w, int(screen.availableGeometry().width() * 0.9))
+
+    def _max_height(self) -> int:
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        return screen.availableGeometry().height() - 2 * self.theme.px(EDGE)
+
+    def strip_shown(self) -> bool:
+        """The update line shows on the reading page while nothing is being read."""
+        return self.page == "reading" and self.update_bar.visible() and self.state not in ACTIVE
 
     def relayout(self) -> None:
         """Place every child on the grid (plate inset 12, optical inset 22) and resize the window."""
@@ -355,36 +308,21 @@ class Panel(QWidget):
         info_w = right_edge - info_x
         self.info.setGeometry(info_x, px(14), max(0, info_w), px(20))  # 20 tall: room for the 16 DIP keycaps
         self.info.setVisible(not settings_page and info_w >= px(48))
+        strip = self.strip_shown()
+        self.strip.setVisible(strip)
 
         if settings_page:
-            # Rows of 40 DIP: label at the optical inset, control right-aligned to the toggle switches.
-            # Every control shares one column (left edge at 132, right edge on the toggle switches).
-            y = px(46)
-            row_w = W - 2 * px(EDGE)
-            right = W - px(EDGE) - px(10)
-            col = px(132)
-            for _key, lbl, seg, _opts in self.option_rows:
-                lbl.setGeometry(px(22), y + px(10), col - px(22), px(20))
-                seg.setGeometry(col, y + px(3), right - col, px(34))
-                y += px(42)
-            self.lbl_bg.setGeometry(px(22), y + px(10), col - px(22), px(20))
-            sw_w = px(36) * max(1, len(self.swatches.items))
-            self.swatches.setGeometry(col - px(5), y, sw_w, px(40))  # circles' left edge on the column
-            name_x = self.swatches.x() + sw_w + px(8)
-            self.lbl_bg_name.setGeometry(name_x, y + px(12), right - name_x, px(16))
-            y += px(42)
-            self._divider_y = y + px(4)
-            y += px(9)
-            self.lbl_group.setGeometry(px(22), y, W - 2 * px(22), px(20))
-            y += px(22)
-            for row in (self.row_citations, self.row_links):
-                row.setGeometry(px(EDGE), y, row_w, px(40))
-                y += px(42)
-            H = y - px(2) + px(EDGE)
+            bar_x = px(EDGE) + px(32) + px(6)
+            self.tabs.bar.setGeometry(bar_x, px(8), self.btn_hide.x() - px(8) - bar_x, px(32))
+            H = self.tabs.arrange(W, px(44), self._max_height())
         else:
+            top = px(44)
+            if strip:
+                self.strip.setGeometry(px(EDGE), top, W - 2 * px(EDGE), px(STRIP_H))
+                top += px(STRIP_H) + px(8)
             card_h = self.view.preferred_height()
-            self.view.setGeometry(px(EDGE), px(44), W - 2 * px(EDGE), card_h)
-            y = px(44) + card_h + px(8)
+            self.view.setGeometry(px(EDGE), top, W - 2 * px(EDGE), card_h)
+            y = top + card_h + px(8)
             self.progress.setGeometry(px(22), y, W - 2 * px(22), px(16))
             yt = y + px(16) + px(4)
             self.btn_prev.move(px(EDGE), yt + px(2))
@@ -443,11 +381,10 @@ class Panel(QWidget):
         self.page = page
         self.set_volume_open(False, animate=False)
         self.ctl.tips.press(self)
-        if page == "settings":
-            self.status.set_text("Reading display", "TextPrimary")
-        else:
+        if page == "reading":
             self.present(self.state, self.info_dict)
         self.relayout()
+        self.tabs.set_active(page == "settings" and self.isVisible())
 
     # --- Volume slider swap -------------------------------------------------------------------
 
@@ -543,6 +480,7 @@ class Panel(QWidget):
     def present(self, state: str, info: dict) -> None:
         """Map an engine state onto every part of the panel."""
         self.state, self.info_dict = state, info
+        self.tabs.on_state(state, info)
         if self.page == "settings":
             return
         reduced = self.theme.reduced_motion
@@ -1029,15 +967,16 @@ class Panel(QWidget):
             self.ctl.schedule_theme_refresh()
         return super().nativeEvent(event_type, message)
 
+    def showEvent(self, event) -> None:
+        self.tabs.set_active(self.page == "settings")
+        super().showEvent(event)
+
     def hideEvent(self, event) -> None:
         self._slider_timer.stop()
+        self.tabs.set_active(False)
         super().hideEvent(event)
 
     def paintEvent(self, _event) -> None:
         t = self.theme
         p = QPainter(self)
         p.fillRect(self.rect(), t.color("Surface"))
-        if self.page == "settings":  # the rule between the display options and the "Reading aloud" group
-            y = self._divider_y + 0.5
-            p.setPen(QPen(t.color("ControlStroke"), 0))
-            p.drawLine(QPointF(t.px(22), y), QPointF(self.width() - t.px(22), y))

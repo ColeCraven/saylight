@@ -8,6 +8,9 @@ Press Ctrl+` with nothing highlighted to show or hide the panel (or to pause and
     python saylight_app.py --uninstall   stop starting at sign-in, and quit
     python saylight_app.py --start       start it now
     python saylight_app.py --quit        quit the running copy
+
+The installed Saylight.exe takes the same commands; its installer makes the Start menu entry. Settings and
+logs live in %LOCALAPPDATA%\\Saylight (see saylight/paths.py).
 """
 
 from __future__ import annotations
@@ -21,37 +24,35 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import winreg
 from ctypes import wintypes
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.abspath(__file__)
-PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+from saylight import __version__, paths
+
 APP_NAME = "Saylight"                       # the sign-in (Run) value
 QUIT_EVENT_NAME = "Local\\Saylight.Quit"    # keeps it to one copy, and is how --quit reaches the running one
 APP_USER_MODEL_ID = "Saylight.App"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SHORTCUT_NAME = "Saylight.lnk"
-SETTINGS_PATH = os.path.join(HERE, "saylight_settings.json")
-LOG_PATH = os.path.join(HERE, "saylight.log")
-CRASH_PATH = os.path.join(HERE, "saylight_crash.log")
-ICON_PATH = os.path.join(HERE, "saylight.ico")
+ICON_PATH = os.path.join(paths.install_dir(), "saylight.ico")  # a source install's Start menu icon
+NOTICES_NAME = "THIRD_PARTY_NOTICES.txt"   # written next to Saylight.exe by the build
 QUIT_WAIT_S = 1.5                           # time a copy asked to quit gets to save its settings and exit
 UNDO_MS = 10_000                            # how long Undo is offered after a Clear
 AWAY_SETTLE_MS = 50                         # how long light dismiss lets the foreground settle (as the box does)
 
 # The same app under its earlier name. --install replaces that install, --uninstall and --quit reach it too,
-# and its settings file is renamed on the first start (migrate_settings).
+# and paths.migrate_legacy_data() carries its settings file over.
 OLD_RUN_VALUE = "ReadAloudHotkey"
 OLD_QUIT_EVENT_NAME = "Local\\ReadAloudHotkey.Quit"
 OLD_SHORTCUT_NAME = "Read Aloud.lnk"
-OLD_SETTINGS_PATH = os.path.join(HERE, "read_aloud_settings.json")
-OLD_ICON_PATH = os.path.join(HERE, "read_aloud.ico")  # only its Start menu shortcut used it
+OLD_ICON_PATH = os.path.join(paths.install_dir(), "read_aloud.ico")  # only its Start menu shortcut used it
 
 EVENT_MODIFY_STATE = 0x0002
 ERROR_ALREADY_EXISTS = 183
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 SUPPRESS_STATES = {2, 3, 4}  # QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
+MB_OK, MB_YESNO, MB_ICONERROR, MB_SETFOREGROUND, IDYES = 0x0, 0x4, 0x10, 0x10000, 6
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.CreateEventW.restype = wintypes.HANDLE
@@ -91,6 +92,16 @@ def delete_run_value(name: str) -> bool:
     return True
 
 
+def read_run_value(name: str) -> str | None:
+    """The command of a sign-in entry, or None if there is none."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except FileNotFoundError:
+        return None
+    return str(value)
+
+
 def remove_file(path: str) -> bool:
     """Delete a file if it is there. True if it was deleted."""
     try:
@@ -107,6 +118,11 @@ def start_menu_path(name: str) -> str:
 
 # --- Commands ------------------------------------------------------------------------------------
 
+def run_command() -> str:
+    """The sign-in command for this copy, each part quoted, as the installer writes it."""
+    return " ".join(f'"{part}"' for part in paths.launch_command())
+
+
 def quit_running() -> bool:
     """Quit the running copy, including one still running under the earlier name. True if one was running."""
     signalled = [signal_quit(name) for name in (QUIT_EVENT_NAME, OLD_QUIT_EVENT_NAME)]
@@ -118,11 +134,12 @@ def quit_running() -> bool:
 
 
 def start() -> None:
+    command = paths.launch_command()
     flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        subprocess.Popen([PYTHONW, SCRIPT], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
+        subprocess.Popen(command, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
     except OSError:
-        subprocess.Popen([PYTHONW, SCRIPT], creationflags=flags, close_fds=True)
+        subprocess.Popen(command, creationflags=flags, close_fds=True)
     print("Saylight is running. Highlight text and press Ctrl+` to hear it.")
 
 
@@ -154,16 +171,17 @@ def make_icon(path: str) -> bool:
 
 
 def create_shortcut() -> None:
-    """A Start menu entry, so Saylight can be started again after quitting it."""
+    """A Start menu entry for a source install, so Saylight can be started again after quitting it."""
     if not os.path.exists(ICON_PATH):
         make_icon(ICON_PATH)
-    script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RA_LNK); $s.TargetPath = $env:RA_EXE; "
-              "$s.Arguments = '\"' + $env:RA_SCRIPT + '\"'; $s.WorkingDirectory = $env:RA_DIR; "
-              "if (Test-Path $env:RA_ICON) { $s.IconLocation = $env:RA_ICON }; "
-              "$s.Description = 'Read highlighted text aloud'; $s.Save()")
-    env = dict(os.environ, RA_LNK=start_menu_path(SHORTCUT_NAME), RA_EXE=PYTHONW, RA_SCRIPT=SCRIPT, RA_DIR=HERE,
-               RA_ICON=ICON_PATH)
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env=env,
+    pythonw, script = paths.launch_command()
+    script_ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RA_LNK); "
+                 "$s.TargetPath = $env:RA_EXE; $s.Arguments = '\"' + $env:RA_SCRIPT + '\"'; "
+                 "$s.WorkingDirectory = $env:RA_DIR; if (Test-Path $env:RA_ICON) { $s.IconLocation = $env:RA_ICON }; "
+                 "$s.Description = 'Read highlighted text aloud'; $s.Save()")
+    env = dict(os.environ, RA_LNK=start_menu_path(SHORTCUT_NAME), RA_EXE=pythonw, RA_SCRIPT=script,
+               RA_DIR=paths.install_dir(), RA_ICON=ICON_PATH)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script_ps], env=env,
                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
@@ -197,16 +215,21 @@ def install() -> None:
         print("Replaced the earlier version (Read Aloud).")
     if signal_quit(QUIT_EVENT_NAME):
         time.sleep(QUIT_WAIT_S)
-    set_run_value(APP_NAME, f'"{PYTHONW}" "{SCRIPT}"')
-    create_shortcut()
-    print("Saylight will start automatically when you sign in, and is in the Start menu.")
+    set_run_value(APP_NAME, run_command())
+    if paths.is_frozen():  # the installer made the Start menu entry, with the app's ID
+        print("Saylight will start automatically when you sign in.")
+    else:
+        create_shortcut()
+        print("Saylight will start automatically when you sign in, and is in the Start menu.")
     start()
 
 
 def uninstall() -> None:
     for name in (APP_NAME, OLD_RUN_VALUE):
         delete_run_value(name)
-    for name in (SHORTCUT_NAME, OLD_SHORTCUT_NAME):
+    # The installed app's Start menu entry belongs to its uninstaller (Settings > Apps).
+    shortcuts = (OLD_SHORTCUT_NAME,) if paths.is_frozen() else (SHORTCUT_NAME, OLD_SHORTCUT_NAME)
+    for name in shortcuts:
         remove_file(start_menu_path(name))
     print("Saylight will no longer start when you sign in.")
     quit_running()
@@ -214,13 +237,35 @@ def uninstall() -> None:
 
 # --- Bootstrap -----------------------------------------------------------------------------------
 
+CRASH_LOG_LIMIT = 256 * 1024  # bytes
+
+
+def trim_crash_log(path: str, limit: int = CRASH_LOG_LIMIT) -> None:
+    """Keep the crash log small: past `limit`, keep only its newest half, from a line start.
+
+    faulthandler also writes a thread dump for errors that Windows' COM code raises and then handles itself
+    (UI Automation does this while a screen reader is on), so the file can grow while Saylight runs fine."""
+    try:
+        if os.path.getsize(path) <= limit:
+            return
+        with open(path, "rb") as f:
+            f.seek(-(limit // 2), os.SEEK_END)
+            tail = f.read()
+        with open(path, "wb") as f:
+            f.write(tail[tail.find(b"\n") + 1:])
+    except OSError:
+        pass
+
+
 def setup_logging() -> None:
-    handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+    handler = logging.handlers.RotatingFileHandler(paths.log_path(), maxBytes=1_000_000, backupCount=2,
+                                                   encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
-    crash = open(CRASH_PATH, "a", encoding="utf-8")  # kept open for faulthandler; stderr is None under pythonw
+    trim_crash_log(paths.crash_path())
+    crash = open(paths.crash_path(), "a", encoding="utf-8")  # kept open for faulthandler; stderr is None under pythonw
     faulthandler.enable(crash)
     sys.excepthook = lambda t, v, tb: logging.getLogger("saylight").error("Unhandled exception",
                                                                           exc_info=(t, v, tb))
@@ -229,27 +274,17 @@ def setup_logging() -> None:
         exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
 
 
-def migrate_settings(new_path: str, old_path: str) -> str:
-    """Carry the settings over from the earlier name: if only the old settings file exists, rename it to the new
-    name. Returns the file to load: the new one, or the old one if the rename keeps failing, so nothing is lost
-    this session and the next start tries again."""
-    if os.path.exists(new_path) or not os.path.exists(old_path):
-        return new_path
-    for attempt in range(4):  # a sharing violation (antivirus, OneDrive) is usually gone within moments
-        try:
-            os.rename(old_path, new_path)  # unlike os.replace, never overwrites a file that appeared meanwhile
-        except (FileExistsError, FileNotFoundError):
-            return new_path
-        except OSError as e:
-            if attempt == 3:
-                log.error("Couldn't rename %s to %s (%s); using the old file this time",
-                          os.path.basename(old_path), os.path.basename(new_path), type(e).__name__)
-                return old_path
-            time.sleep(0.05)
-        else:
-            log.info("Renamed the settings file %s to %s", os.path.basename(old_path), os.path.basename(new_path))
-            return new_path
-    return new_path
+def settings_file() -> str:
+    """The settings file to load: the data folder's, or for this session an earlier one next to the program
+    that couldn't be moved there (the next start tries the move again)."""
+    path = paths.settings_path()
+    if not os.path.exists(path):
+        for name in (paths.SETTINGS_NAME, paths.OLD_SETTINGS_NAME):
+            earlier = os.path.join(paths.install_dir(), name)
+            if os.path.isfile(earlier):
+                log.info("Using the earlier settings file this session")
+                return earlier
+    return path
 
 
 def run() -> int:
@@ -259,7 +294,8 @@ def run() -> int:
     if not quit_event or ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         log.info("Already running; exiting")
         return 0
-    settings_path = migrate_settings(SETTINGS_PATH, OLD_SETTINGS_PATH)  # before Settings reads it
+    paths.migrate_legacy_data()  # before Settings reads the file
+    settings_path = settings_file()
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except OSError:
@@ -271,15 +307,65 @@ def run() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Saylight")
+    app.setApplicationVersion(__version__)
     qt_log = logging.getLogger("saylight.qt")
     qInstallMessageHandler(lambda mode, _ctx, msg: qt_log.warning(msg) if mode != QtMsgType.QtDebugMsg else None)
 
     ctl = App(app, int(quit_event), settings_path)
     ctl.start()
-    log.info("Saylight started")
+    log.info("Saylight %s started (%s)", __version__, "installed" if paths.is_frozen() else "from source")
     code = app.exec()
     kernel32.CloseHandle(quit_event)
     return code
+
+
+def run_safely() -> int:
+    """Build the app and run it. A start that fails ends in a plain message instead of a silent exit."""
+    global App
+    try:
+        App = _build_app_class()
+        return run()
+    except Exception:
+        show_start_failure(record_crash())
+        return 1
+
+
+def record_crash() -> str:
+    """Add the exception being handled to the crash log. Returns the log's path, or "" if it can't be written."""
+    logging.getLogger("saylight").error("Saylight couldn't start", exc_info=True)
+    try:
+        path = paths.crash_path()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} Saylight {__version__} couldn't start\n")
+            traceback.print_exc(file=f)
+    except OSError:
+        return ""
+    return path
+
+
+def show_start_failure(path: str) -> None:
+    """Say that Saylight couldn't start and where the details are, with a button that opens that folder."""
+    text = f"Saylight couldn't start. Details are in {path}" if path else "Saylight couldn't start."
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        _app = QApplication.instance() or QApplication([sys.argv[0]])
+        box = QMessageBox(QMessageBox.Icon.Critical, "Saylight", text)
+        folder = box.addButton("Open folder", QMessageBox.ButtonRole.ActionRole) if path else None
+        box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Close))
+        box.exec()
+        wanted = folder is not None and box.clickedButton() is folder
+    except Exception:  # Qt may be what failed: a plain Windows message instead
+        flags = MB_ICONERROR | MB_SETFOREGROUND | (MB_YESNO if path else MB_OK)
+        prompt = text + "\n\nOpen the folder now?" if path else text
+        answer = ctypes.windll.user32.MessageBoxW(None, prompt, "Saylight", flags)
+        wanted = bool(path) and answer == IDYES
+    if wanted:
+        try:
+            os.startfile(os.path.dirname(path))
+        except OSError:
+            pass
+
 
 
 # --- The app controller ----------------------------------------------------------------------------
@@ -289,12 +375,11 @@ def _build_app_class():
     from PySide6.QtGui import QColor, QGuiApplication
 
     from saylight import win32
-    from saylight.engine import COPYING, Engine
+    from saylight.engine import ACTIVE, COPYING, Engine
     from saylight.foreground import ForegroundTracker
     from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, InputThread
     from saylight.player import PlayerThread
     from saylight.settings import Settings
-    from saylight.synth import SynthWorker
     from saylight.theme import READING_PRESETS, TINT_NAMES, Theme
     from saylight.ui.compose import FOCUS_REASONS, ComposeWindow, should_resume
     from saylight.ui.controls import G_ERROR, G_NOTHING
@@ -303,23 +388,39 @@ def _build_app_class():
     from saylight.ui.panel import Panel
     from saylight.ui.tip import TipManager
     from saylight.ui.tray import Tray, speed_label
+    from saylight.update_service import UpdateService
+    from saylight.voices import make_backend, make_router
+    from saylight.voices.base import EDGE
+    from saylight.voices.catalog import VoiceCatalog
+    from saylight.voices.preview import VoicePreview
 
     class App(QObject):
-        """The controller every view talks to (`ctl`)."""
+        """The controller every view talks to (`ctl`).
+
+        For the settings pages: `version`, `router` (the engine's synth), `catalog` (the voice list), `preview`
+        (voice samples) and `updates` (the update check), plus set_voice(), notices_path(), open_notices(),
+        start_with_windows() and set_start_with_windows().
+        """
 
         def __init__(self, qapp, quit_event: int, settings_path: str | None = None):
             super().__init__()
             self.qapp = qapp
-            self.settings = Settings(settings_path or SETTINGS_PATH, self)
+            self.version = __version__
+            self.settings = Settings(settings_path or paths.settings_path(), self)
             self.theme = Theme(self.settings, self)
             self.clock = Clock(self)
             self.tips = TipManager(self.theme)
-            self.synth = SynthWorker(self)
+            self.router = make_router(settings=self.settings, parent=self)
+            self.catalog = VoiceCatalog(self, local=self._local_voices)
+            self.preview = VoicePreview(make_backend, lambda: int(self.settings.get("volume")), self)
             self.player = PlayerThread(self, volume=int(self.settings.get("volume")))
             self.input = InputThread(quit_event, self._hotkey_map(), self)
             self.foreground = ForegroundTracker(self)
-            self.engine = Engine(synth=self.synth, player=self.player, input_thread=self.input,
+            self.engine = Engine(synth=self.router, player=self.player, input_thread=self.input,
                                  settings=self.settings, parent=self, beep=win32.message_beep)
+            self._online = True  # until Windows says otherwise; an unknown network state counts as online
+            self.updates = UpdateService(self.settings, __version__, online=lambda: self._online,
+                                         busy=self._busy, parent=self)
             self.panel = Panel(self)
             self.compose = ComposeWindow(self)  # hidden until opened; unowned, and its flags never change
             self.tray = Tray(self, self.theme)
@@ -383,6 +484,7 @@ def _build_app_class():
             qapp.screenRemoved.connect(lambda *_: self._screen_timer.start(300))
             for screen in QGuiApplication.screens():
                 self._watch_screen(screen)
+            self.updates.quitRequested.connect(self.quit)  # Setup has started and will replace this copy
             qapp.aboutToQuit.connect(self._shutdown)
 
         # --- Lifecycle --------------------------------------------------------------------------
@@ -392,6 +494,7 @@ def _build_app_class():
             self.input.start()
             self.foreground.start()
             self._start_network_monitor()
+            self.updates.start()
             self.panel.relayout()
             self.tray.show()
             if self.settings.get("panel.visible"):
@@ -407,7 +510,9 @@ def _build_app_class():
 
                     def update(*_):
                         online = info.reachability() != QNetworkInformation.Reachability.Disconnected
+                        self._online = online
                         self.engine.set_online(online)
+                        self.router.set_reachable(online)
 
                     info.reachabilityChanged.connect(update)
                     update()
@@ -418,6 +523,7 @@ def _build_app_class():
             log.info("Shutting down")
             self.close_compose("quit")  # hides it at once; typed text and the undo stash go with the process
             self._fullscreen_timer.stop()
+            self.preview.shutdown()
             self.engine.shutdown()
             self.input.stop(3.0)
             self.foreground.stop()
@@ -746,9 +852,61 @@ def _build_app_class():
 
         def open_log(self) -> None:
             try:
-                os.startfile(LOG_PATH)
-            except OSError:
-                log.warning("Couldn't open the log", exc_info=True)
+                os.startfile(paths.log_path())
+            except OSError as e:
+                log.warning("Couldn't open the log (%s)", type(e).__name__)
+
+        # --- Voices, updates, sign-in and notices (the settings pages) ----------------------------
+
+        def set_voice(self, voice_id: str) -> None:
+            """Read with this voice (a VoiceInfo.id; a bare 1.0 name means an online voice). The engine uses it
+            from the next chunk it asks for. Raises ValueError for an ID that isn't a voice."""
+            self.settings.set("voice", voice_id)
+
+        def _local_voices(self) -> list:
+            """The voices that need no network to list, apart from the online ones the catalog has itself."""
+            return [voice for voice in self.router.voices() if voice.backend != EDGE]
+
+        def _busy(self) -> bool:
+            """A reading is running (paused included) or a selection is being copied: no update check now."""
+            return self.engine.state in ACTIVE
+
+        def notices_path(self) -> str:
+            """THIRD_PARTY_NOTICES.txt next to Saylight.exe (from source: the repository's notices)."""
+            path = os.path.join(paths.install_dir(), NOTICES_NAME)
+            if not paths.is_frozen() and not os.path.exists(path):
+                return os.path.splitext(path)[0] + ".md"
+            return path
+
+        def open_notices(self) -> bool:
+            """Open the licence notices in the person's viewer. False if that failed."""
+            try:
+                os.startfile(self.notices_path())
+            except OSError as e:
+                log.warning("Couldn't open the notices (%s)", type(e).__name__)
+                return False
+            return True
+
+        def start_with_windows(self) -> bool:
+            """Saylight starts when you sign in (its Run value exists)."""
+            try:
+                return read_run_value(APP_NAME) is not None
+            except OSError as e:
+                log.warning("Couldn't read the sign-in entry (%s)", type(e).__name__)
+                return False
+
+        def set_start_with_windows(self, on: bool) -> bool:
+            """Add or remove the sign-in entry for this copy. True if it now matches `on`."""
+            try:
+                if on:
+                    set_run_value(APP_NAME, run_command())
+                else:
+                    delete_run_value(APP_NAME)
+            except OSError as e:
+                log.warning("Couldn't change the sign-in entry (%s)", type(e).__name__)
+                return False
+            log.info("Start with Windows %s", "on" if on else "off")
+            return True
 
         def schedule_theme_refresh(self) -> None:
             self._theme_timer.start(250)
@@ -764,17 +922,13 @@ def _build_app_class():
     return App
 
 
-App = None  # built by main(); Qt is imported only when actually running, so the CLI stays fast
+App = None  # built by run_safely(); Qt is imported only when actually running, so the CLI stays fast
 
 
 def main() -> None:
-    global App
     commands = {"--install": install, "--uninstall": uninstall, "--start": start, "--quit": quit_running}
     if len(sys.argv) == 1:
-        if HERE not in sys.path:
-            sys.path.insert(0, HERE)
-        App = _build_app_class()
-        sys.exit(run())
+        sys.exit(run_safely())
     elif sys.argv[1] in commands:
         commands[sys.argv[1]]()
     else:

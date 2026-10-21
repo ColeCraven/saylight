@@ -1,5 +1,6 @@
-"""Tests for the focusable controls in ui/controls.py (the Read aloud pill and the Clear / Undo / Paste buttons of
-the Type or paste box): keyboard activation, the keyboard-only focus ring, sizes and the room kept for the ring.
+"""Tests for controls in ui/controls.py: the focusable Read aloud pill and Clear / Undo / Paste buttons of the Type
+or paste box (keyboard activation, the keyboard-only focus ring, sizes and the room kept for the ring), and the
+settings page's link line and navigation row.
 
 Widgets are rendered into a QImage and never shown.
 """
@@ -7,13 +8,13 @@ Widgets are rendered into a QImage and never shown.
 import sys
 import unittest
 
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QFocusEvent, QFontMetricsF, QImage, QKeyEvent
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal
+from PySide6.QtGui import QFocusEvent, QFontMetricsF, QImage, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QWidget
 
 from saylight.theme import Theme
-from saylight.ui.controls import (G_CLEAR, G_PLAY, G_UNDO, FOCUS_PAD, IconButton, PillButton, TextButton,
-                                  text_button_size)
+from saylight.ui.controls import (G_CLEAR, G_OPEN, G_PLAY, G_UNDO, FOCUS_PAD, IconButton, LinkText, NavRow,
+                                  PillButton, TextButton, text_button_size)
 
 _app = None
 
@@ -199,6 +200,77 @@ class TextButtonTests(unittest.TestCase):
         chip.place(QRect(0, 0, 83, 32))
         spot = QPoint(FOCUS_PAD + 80, FOCUS_PAD + 16)  # the right padding: fill only
         self.assertEqual(render(chip).pixel(spot), t.reading_colors()["keycap_fill"].rgb())
+
+
+
+def mouse(widget: QWidget, kind: QEvent.Type, pos: QPointF) -> bool:
+    buttons = Qt.MouseButton.LeftButton if kind == QEvent.Type.MouseButtonPress else Qt.MouseButton.NoButton
+    event = QMouseEvent(kind, pos, pos, pos, Qt.MouseButton.LeftButton, buttons, Qt.KeyboardModifier.NoModifier)
+    QCoreApplication.sendEvent(widget, event)
+    return event.isAccepted()
+
+
+class LinkTextTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.t = theme()
+        self.line = LinkText(self.t, FakeTips())
+        self.line.resize(400, 20)
+        self.line.set_parts([("text", "Saylight 1.3 is ready"), ("sep", " · "), ("install", "Install")])
+        self.clicks: list[str] = []
+        self.line.linkClicked.connect(self.clicks.append)
+
+    def test_links_are_laid_out_after_the_text(self) -> None:
+        fm = QFontMetricsF(self.t.font("body"))
+        r = self.line.link_rect("install")
+        self.assertAlmostEqual(r.left(), fm.horizontalAdvance("Saylight 1.3 is ready · "), places=3)
+        self.assertEqual(self.line.link_keys(), ["install"])
+        self.assertEqual(self.line.accessibleName(), "Saylight 1.3 is ready · Install")
+
+    def test_a_click_on_a_link_emits_its_key(self) -> None:
+        centre = self.line.link_rect("install").center()
+        self.assertTrue(mouse(self.line, QEvent.Type.MouseButtonPress, centre))
+        mouse(self.line, QEvent.Type.MouseButtonRelease, centre)
+        self.assertEqual(self.clicks, ["install"])
+
+    def test_presses_on_the_text_pass_through(self) -> None:
+        self.assertFalse(mouse(self.line, QEvent.Type.MouseButtonPress, QPointF(5, 10)))
+        self.assertEqual(self.clicks, [])
+
+    def test_a_release_off_the_link_does_nothing(self) -> None:
+        mouse(self.line, QEvent.Type.MouseButtonPress, self.line.link_rect("install").center())
+        mouse(self.line, QEvent.Type.MouseButtonRelease, QPointF(5, 10))
+        self.assertEqual(self.clicks, [])
+
+    def test_disabled_links_take_no_clicks(self) -> None:
+        self.line.setEnabled(False)
+        centre = self.line.link_rect("install").center()
+        mouse(self.line, QEvent.Type.MouseButtonPress, centre)
+        mouse(self.line, QEvent.Type.MouseButtonRelease, centre)
+        self.assertEqual(self.clicks, [])
+        self.assertIsNone(self.line._key_at(centre))
+
+    def test_the_tooltip_follows_the_pointer(self) -> None:
+        self.line.link_tips = {"install": "Install it"}
+        self.line.text_tip = "About the update"
+        self.assertEqual(self.line.tooltip_text(), "About the update")
+        self.line._set_hover_key("install")
+        self.assertEqual(self.line.tooltip_text(), "Install it")
+
+
+class NavRowTests(unittest.TestCase):
+    def test_click_name_and_detail(self) -> None:
+        row = NavRow(theme(), FakeTips(), "Privacy and licences", glyph=G_OPEN)
+        row.resize(416, 40)
+        clicks: list[int] = []
+        row.clicked.connect(lambda: clicks.append(1))
+        mouse(row, QEvent.Type.MouseButtonPress, QPointF(200, 20))
+        mouse(row, QEvent.Type.MouseButtonRelease, QPointF(200, 20))
+        self.assertEqual(clicks, [1])
+        self.assertEqual(row.accessibleName(), "Privacy and licences")
+        self.assertEqual(row.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        row.set_detail("12 words")
+        self.assertEqual(row.detail, "12 words")
+        render(row)  # paints with a detail and a glyph
 
 
 if __name__ == "__main__":
