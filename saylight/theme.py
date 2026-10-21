@@ -158,25 +158,29 @@ def _app_tokens(dark: bool, accent: QColor) -> dict[str, QColor]:
 # A missing key falls back to the theme: background Surface, text TextPrimary, secondary TextSecondary,
 # highlight Accent blended over the background, highlight_paused text blended over the background,
 # highlight_text the text colour, edge (the card hairline) text blended over the background, keycap_fill and
-# keycap_stroke the KeycapFill and KeycapStroke tokens, keycap_text the text colour.
+# keycap_stroke the KeycapFill and KeycapStroke tokens, keycap_text the text colour, skipped (text shown but not
+# read aloud) the secondary colour.
 # Keep the tint names in step with settings.READING_TINTS.
 # High contrast ignores the tint. tests/test_theme.py checks every preset for WCAG contrast.
 #
 # The tints follow dyslexia readability research. Body text sits at 11-15:1 (never black on white),
 # earlier sentences at ~5:1, and the word pill takes the hue opposite the background (blue on warm, amber on
-# blue) because blue/yellow differences survive the common colour-vision deficiencies.
+# blue) because blue/yellow differences survive the common colour-vision deficiencies. Skipped text (citations,
+# notes and references that are shown but not read aloud) sits at the lightness of the earlier sentences with
+# the opposite cast, cool slate on the warm tints and warm taupe on soft blue, so it never looks already read;
+# it stays above 4.5:1 on the band too, since a skipped citation can sit inside the current sentence.
 _CREAM = {"background": "#FAF5E9", "text": "#24211C", "secondary": "#6B655B", "band": "#F2E7CC",
           "highlight": "#A9C8F2", "highlight_text": "#24211C", "highlight_paused": "#C3D3E5",
-          "keycap_fill": "#FFFFFF", "keycap_stroke": "#D3CFC4"}
+          "keycap_fill": "#FFFFFF", "keycap_stroke": "#D3CFC4", "skipped": "#56637A"}
 _PEACH = {"background": "#EDD1B0", "text": "#24211C", "secondary": "#5E554A", "band": "#E6C7A2",
           "highlight": "#98BBE8", "highlight_text": "#24211C", "highlight_paused": "#B3BFD0",
-          "keycap_fill": "#FFFFFF", "keycap_stroke": "#C9B195"}
+          "keycap_fill": "#FFFFFF", "keycap_stroke": "#C9B195", "skipped": "#455366"}
 _SOFT_BLUE = {"background": "#E3ECF6", "text": "#1C2430", "secondary": "#556070", "band": "#D4E1F0",
               "highlight": "#E9B949", "highlight_text": "#1C2430", "highlight_paused": "#E2C783",
-              "keycap_fill": "#FFFFFF", "keycap_stroke": "#BFC8D2"}
+              "keycap_fill": "#FFFFFF", "keycap_stroke": "#BFC8D2", "skipped": "#6E5A44"}
 _SOFT_DARK = {"background": "#1F2023", "text": "#E6E1D6", "secondary": "#9C978D", "band": "#2A2C31",
               "highlight": "#36527F", "highlight_text": "#FFFFFF", "highlight_paused": "#324564",
-              "keycap_fill": "#2F2F31", "keycap_stroke": "#474747"}
+              "keycap_fill": "#2F2F31", "keycap_stroke": "#474747", "skipped": "#8C9AAE"}
 READING_PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "auto": {"light": _CREAM, "dark": _SOFT_DARK},
     "cream": {"light": _CREAM, "dark": _CREAM},
@@ -189,7 +193,8 @@ TINT_NAMES = {"auto": "Automatic: cream in light mode, soft dark in dark mode", 
 _HC_READING = {"background": "Surface", "text": "TextPrimary", "secondary": "TextSecondary",
                "band": "Surface", "highlight": "WordHighlight", "highlight_paused": "WordHighlightPaused",
                "highlight_text": "WordHighlightText", "edge": "ControlStroke",
-               "keycap_fill": "KeycapFill", "keycap_stroke": "KeycapStroke", "keycap_text": "TextPrimary"}
+               "keycap_fill": "KeycapFill", "keycap_stroke": "KeycapStroke", "keycap_text": "TextPrimary",
+               "skipped": "TextDisabled"}
 READING_ROLES = tuple(_HC_READING)
 
 # --- Fonts ---------------------------------------------------------------------
@@ -438,7 +443,8 @@ class Theme(QObject):
                 "edge": given("edge") or composite(text, 0.10 if background.lightness() > 128 else 0.06, background),
                 "keycap_fill": given("keycap_fill") or self.color("KeycapFill"),
                 "keycap_stroke": given("keycap_stroke") or self.color("KeycapStroke"),
-                "keycap_text": given("keycap_text") or QColor(text)}
+                "keycap_text": given("keycap_text") or QColor(text),
+                "skipped": given("skipped") or given("secondary") or self.color("TextSecondary")}
 
     # --- Fonts and metrics
 

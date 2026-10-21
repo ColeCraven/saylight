@@ -7,11 +7,14 @@ make symbols speakable, and never silently drop real prose.
 
 Public API
     normalize(text, *, skip_citations=True, skip_urls=True) -> str
+    normalize_pair(text, *, skip_citations=True, skip_urls=True) -> [(shown, spoken)]
     split_sentences(text, *, max_len=1500) -> list[str]
     chunk_sentences(sentences, first_limit=250, limit=1500) -> list[list[int]]
 
 Convenience helpers
     chunk_text(sentences, chunk) -> str     the string to synthesise for a chunk
+    references_start(text), references_end(text, start)   a file's reference list
+    spoken_forms(text) -> [(start, end, said)]            "e.g." said as "for example"
     prepare(text, ...) -> Prepared          normalize + split + chunk in one call
 
 Design summary (details next to each section below)
@@ -42,8 +45,8 @@ import unicodedata
 from typing import NamedTuple
 
 __all__ = [
-    "normalize", "split_sentences", "chunk_sentences", "chunk_text",
-    "prepare", "Prepared",
+    "normalize", "normalize_pair", "split_sentences", "chunk_sentences", "chunk_text",
+    "prepare", "Prepared", "references_start", "references_end", "spoken_forms",
 ]
 
 _OPEN_QUOTES = "\"'\u201c\u2018\u00ab\u201e\u201a"
@@ -1049,6 +1052,9 @@ def _tidy(t):
 # normalize
 # ---------------------------------------------------------------------------
 
+_HAS_WORD_RE = re.compile(r"[^\W_]")
+
+
 def normalize(text: str, *, skip_citations: bool = True, skip_urls: bool = True) -> str:
     """Clean copied text for speech.  Paragraphs are separated by "\\n\\n".
 
@@ -1061,32 +1067,161 @@ def normalize(text: str, *, skip_citations: bool = True, skip_urls: bool = True)
         raise TypeError("normalize() expects a str")
     text = _clean_chars(text)
     out = _normalize_clean(text, skip_citations, skip_urls)
-    if not out and (skip_citations or skip_urls) and re.search(r"[^\W_]", text):
+    if not out and (skip_citations or skip_urls) and _HAS_WORD_RE.search(text):
         out = _normalize_clean(text, False, False)
     return out
 
 
 def _normalize_clean(text, skip_citations, skip_urls):
+    out = []
+    for para in _paragraphs(text):
+        t = _inline(para.text, skip_citations, skip_urls)
+        if _HAS_WORD_RE.search(t):
+            out.append(t)
+    return "\n\n".join(out)
+
+
+def _paragraphs(text):
+    """The line layer: furniture, hyphenation and broken URLs out, then paragraphs (headings and items apart)."""
     lines = [line.strip() for line in text.split("\n")]
     lines = _strip_page_furniture(_strip_line_numbers(lines))
     text = _dehyphenate("\n".join(lines))
     lines = _join_broken_urls([line.strip() for line in text.split("\n")])
-    out = []
-    for para in _build_paragraphs(lines):
-        t = para.text
-        saved = []
-        if skip_urls:
-            t = _remove_urls(t)
-        else:
-            t, saved = _protect_urls(t)
-        if skip_citations:
-            t = _remove_citations(t)
-        t = _tidy(_replace_symbols(t))
-        if saved:
-            t = _restore_urls(t, saved)
-        if re.search(r"[^\W_]", t):
-            out.append(t)
-    return "\n\n".join(out)
+    return _build_paragraphs(lines)
+
+
+def _inline(t, skip_citations, skip_urls):
+    """The inline layer for one paragraph: URLs, citations, symbols and tidy-up."""
+    saved = []
+    if skip_urls:
+        t = _remove_urls(t)
+    else:
+        t, saved = _protect_urls(t)
+    if skip_citations:
+        t = _remove_citations(t)
+    t = _tidy(_replace_symbols(t))
+    if saved:
+        t = _restore_urls(t, saved)
+    return t
+
+
+def normalize_pair(text: str, *, skip_citations: bool = True, skip_urls: bool = True) -> list[tuple[str, str]]:
+    """normalize() twice over one line pass: (shown, spoken) for each paragraph.
+
+    The shown paragraph keeps citations and URLs; the spoken one is exactly what normalize() reads. A paragraph
+    that is only a citation has spoken "" (shown, never read). Joining the non-empty spoken paragraphs with
+    "\\n\\n" gives normalize(text, ...), and joining the shown ones gives normalize(text, skip_citations=False,
+    skip_urls=False). As in normalize(), a selection that would be read as silence is read with its citations.
+    """
+    if not isinstance(text, str):
+        raise TypeError("normalize_pair() expects a str")
+    pairs = []
+    for para in _paragraphs(_clean_chars(text)):
+        shown = _inline(para.text, False, False)
+        if not _HAS_WORD_RE.search(shown):
+            continue
+        spoken = _inline(para.text, skip_citations, skip_urls) if (skip_citations or skip_urls) else shown
+        pairs.append((shown, spoken if _HAS_WORD_RE.search(spoken) else ""))
+    if pairs and not any(spoken for _, spoken in pairs):
+        pairs = [(shown, shown) for shown, _ in pairs]
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# The reference list
+# ---------------------------------------------------------------------------
+# A paper's reference list is often more than half its text (about 30
+# minutes of listening), so a file reading stops before it unless the
+# person asks for it.  It starts at the last References-type heading line
+# in the last 60% of the text (a two-column paper's list can begin at 42%).
+# An appendix after it ends it, because that is prose again: "Appendix A",
+# "Supplementary Material", or a lettered heading ("A Additional Details")
+# with an "A.1 ..." heading somewhere after it.
+
+_REFS_HEADING_RE = re.compile(
+    r"(?:\d{1,2}\.?\s+|[IVX]{1,4}\.\s+)?(?:references?(?:\s+cited)?|bibliography|works\s+cited"
+    r"|literature\s+cited|reference\s+list)\s*:?", re.I)
+_APPENDIX_HEADING_RE = re.compile(
+    r"(?:appendix|appendices|supplementary\s+(?:materials?|information|data|methods))\b.{0,80}", re.I)
+_LETTER_HEADING_RE = re.compile(r"(?P<l>[A-H])\.?\s+[A-Z][\w\-]*(?:\s+[\w\-]+){0,10}")
+REFS_MIN_SHARE = 0.4
+
+
+def _lines_with_offsets(text, start=0):
+    pos = start
+    for line in text[start:].split("\n"):
+        yield pos, line.strip()
+        pos += len(line) + 1
+
+
+def references_start(text: str) -> int | None:
+    """Offset of the line holding the last References-type heading, if it lies in the last 60% of `text`."""
+    best = None
+    for pos, line in _lines_with_offsets(text):
+        if line and len(line) <= 40 and _REFS_HEADING_RE.fullmatch(line):
+            best = pos
+    if best is not None and best >= len(text) * REFS_MIN_SHARE:
+        return best
+    return None
+
+
+def references_end(text: str, start: int) -> int:
+    """Where the reference list that starts at `start` ends: at an appendix heading after it, or at the end."""
+    lines = list(_lines_with_offsets(text, start))
+    for k in range(1, len(lines)):
+        pos, line = lines[k]
+        if not line or len(line) > 90 or _ENDS_STOP_RE.search(line):
+            continue
+        if _APPENDIX_HEADING_RE.fullmatch(line):
+            return pos
+        m = _LETTER_HEADING_RE.fullmatch(line)
+        if m:
+            sub = m.group("l") + ".1 "
+            if any(later.startswith(sub) for _, later in lines[k + 1:k + 400]):
+                return pos
+    return len(text)
+
+
+# ---------------------------------------------------------------------------
+# Spoken forms
+# ---------------------------------------------------------------------------
+# Abbreviations a voice may stumble over or pause after are said in full:
+# "Fig. 2" -> "figure 2", "e.g." -> "for example".  They are found in the
+# spoken text after sentence splitting, so they never move a sentence
+# boundary, and the screen keeps the original.  (Number ranges and "~"
+# are already said as words by normalize().)
+
+_SPOKEN_FORMS = [(re.compile(p), said) for p, said in [
+    (r"(?<![\w.])Figs\.(?=\s*\d)", "Figures"),
+    (r"(?<![\w.])figs\.(?=\s*\d)", "figures"),
+    (r"(?<![\w.])Fig\.(?=\s*\d)", "Figure"),
+    (r"(?<![\w.])fig\.(?=\s*\d)", "figure"),
+    (r"(?<![\w.])Eqs\.(?=\s*\(?\d)", "Equations"),
+    (r"(?<![\w.])eqs\.(?=\s*\(?\d)", "equations"),
+    (r"(?<![\w.])Eq\.(?=\s*\(?\d)", "Equation"),
+    (r"(?<![\w.])eq\.(?=\s*\(?\d)", "equation"),
+    (r"(?<![\w.])pp\.(?=\s*\d)", "pages"),
+    (r"(?<![\w.])Approx\.(?=\s)", "Approximately"),
+    (r"(?<![\w.])approx\.(?=\s)", "approximately"),
+    (r"(?<![\w.])E\.\s?g\.(?=[\s,;:)]|$)", "For example"),
+    (r"(?<![\w.])e\.\s?g\.(?=[\s,;:)]|$)", "for example"),
+    (r"(?<![\w.])I\.\s?e\.(?=[\s,;:)]|$)", "That is"),
+    (r"(?<![\w.])i\.\s?e\.(?=[\s,;:)]|$)", "that is"),
+]]
+_SPOKEN_TRIGGER_RE = re.compile(r"[FfEeIiAp][a-z]*\.")
+
+
+def spoken_forms(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, said) for each abbreviation in `text` that is said in full, in order and never overlapping."""
+    if not _SPOKEN_TRIGGER_RE.search(text):
+        return []
+    found = sorted((m.start(), m.end(), said) for rx, said in _SPOKEN_FORMS for m in rx.finditer(text))
+    out, end = [], -1
+    for a, b, said in found:
+        if a >= end:
+            out.append((a, b, said))
+            end = b
+    return out
 
 
 # ---------------------------------------------------------------------------

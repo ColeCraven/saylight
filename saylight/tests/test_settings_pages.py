@@ -153,7 +153,7 @@ class TabTests(ServicesCase):
         self.assertEqual(bar.accessibleName(), "Settings, Reading display tab")
         self.tabs.set_index(1)
         self.assertEqual(bar.accessibleName(), "Settings, Voice tab")
-        self.assertEqual(self.panel.btn_settings.accessibleName(), "Settings")
+        self.assertEqual(self.panel.btn_more.accessibleName(), "More")
 
     def test_every_tab_has_the_same_height_and_the_bar_stays_put(self) -> None:
         self.panel.set_page("settings")
@@ -170,8 +170,8 @@ class TabTests(ServicesCase):
         tabs_top = self.tabs.y()
         ys = [tabs_top + seg.y() - 3 for _key, _lbl, seg, _opts in page.option_rows]
         self.assertEqual(ys, [46, 88, 130, 172])
-        self.assertEqual(tabs_top + page.row_links.geometry().bottom() + 1 + 12, 381)
-        self.assertEqual(self.panel.height(), 381)  # the same height as 1.1's page
+        self.assertEqual(tabs_top + page.swatches.geometry().bottom() + 1, 254)
+        self.assertFalse(hasattr(page, "row_links"))  # what's read aloud moved to Voice
 
     def test_only_the_current_tab_shows(self) -> None:
         self.panel.set_page("settings")
@@ -184,22 +184,20 @@ class TabTests(ServicesCase):
     def test_display_rows_change_settings(self) -> None:
         page = self.open_tab(0)
         page.option_rows[0][2].selected.emit(2)
-        page.row_links.toggled.emit(False)
         self.assertEqual(self.settings.get("text_size"), "large")
-        self.assertFalse(self.settings.get("skip_urls"))
         self.settings.set("spacing", "extra")
         self.assertEqual(page.option_rows[2][2].index, 2)
 
     def test_a_tab_taller_than_the_room_scrolls(self) -> None:
         self.panel._max_height = lambda: 300
-        page = self.open_tab(0)
+        page = self.open_tab(1)
         self.panel.relayout()
         self.assertEqual(self.panel.height(), 300)
         self.assertGreater(self.tabs.max_scroll(), 0)
-        top = page.option_rows[0][2].y()
+        top = page.caption.y()
         self.assertTrue(self.wheel(self.tabs, 1))
         self.assertEqual(self.tabs.scroll.value, 42)
-        self.assertEqual(page.option_rows[0][2].y(), top - 42)
+        self.assertEqual(page.caption.y(), top - 42)
         self.wheel(self.tabs, 10)
         self.assertEqual(self.tabs.scroll.value, self.tabs.max_scroll())
         self.assertFalse(self.wheel(self.tabs, 1))  # at the end: nothing left to scroll
@@ -304,6 +302,34 @@ class GeneralPageTests(ServicesCase):
     def test_privacy_and_licences_opens_the_notices(self) -> None:
         self.page.row_notices.clicked.emit()
         self.assertEqual(self.ctl.calls[-1], ("open_notices",))
+
+    def test_pick_up_where_you_left_off(self) -> None:
+        from saylight.ui import general_page as G
+        p = self.page
+        self.assertEqual(p.lbl_files.parts, [("text", G.FILES_CAPTION)])
+        self.assertFalse(p.row_resume.checked)  # off by default
+        self.assertEqual(p.row_resume.detail, G.RESUME_DETAIL)
+        self.assertEqual(p.row_resume.row_height(), 52)
+        forgot = []
+        self.ctl.set_resume = lambda on: (self.settings.set("resume.enabled", on), forgot.append(on), 0 if on else 7)[2]
+        p.row_resume.clicked.emit()
+        self.assertTrue(self.settings.get("resume.enabled"))
+        p.row_resume.clicked.emit()
+        self.assertEqual(forgot, [True, False])
+        self.assertEqual(p.row_resume.detail, "Saylight forgot your place in 7 files.")
+        p._forgot_timer.timeout.emit()
+        self.assertEqual(p.row_resume.detail, G.RESUME_DETAIL)
+        self.assertEqual(G.forgot_detail(1), "Saylight forgot your place in 1 file.")
+        self.assertEqual(G.forgot_detail(0), "Saylight forgot every place it remembered.")
+        self.settings.set("resume.enabled", True)  # turned on elsewhere (the nudge)
+        self.assertTrue(p.row_resume.checked)
+
+    def test_the_files_group_sits_between_two_rules(self) -> None:
+        p = self.page
+        y = p.lbl_files.geometry().y()
+        self.assertEqual(p.rules[0] + 5, y)
+        self.assertEqual(p.row_resume.geometry().y(), y + 22)
+        self.assertEqual(p.rules[1], p.row_resume.geometry().bottom() + 1 + 2 + 4)
 
 
 class MissingServicesTests(unittest.TestCase):

@@ -1,0 +1,3 @@
+# Byte-exact test files: never convert their line endings.
+*.pdf binary
+*.docx binary

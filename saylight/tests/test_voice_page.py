@@ -88,9 +88,42 @@ class BuiltInListTests(VoiceCase):
         self.assertEqual(self.headers()[0], "Your voice")
         self.assertEqual(self.list.rows[1][1].id, "edge:fr-FR-HenriNeural")
 
-    def test_the_list_fills_the_tab(self) -> None:
-        self.assertEqual(self.list.height(), 381 - 68 - 8 - 40 - 12)
-        self.assertEqual(self.page.row_all.geometry().bottom() + 1 + self.tabs.y() + 12, self.panel.height())
+    def test_the_list_keeps_its_minimum_with_whats_read_aloud_below(self) -> None:
+        self.assertEqual(self.list.height(), 156)
+        p = self.page
+        y = lambda w: w.geometry().y() + self.tabs.y()  # noqa: E731
+        self.assertEqual(y(p.row_all), y(self.list) + 156 + 8)
+        self.assertEqual(p.rules, [p.row_all.geometry().y() + 42 + 4])
+        self.assertEqual(y(p.lbl_read), y(p.row_all) + 42 + 9)
+        rows = [row for _key, row, _inv in p.read_rows] + [p.row_pron]
+        self.assertEqual([y(r) for r in rows], [y(p.lbl_read) + 22 + 42 * i for i in range(5)])
+        self.assertEqual(rows[-1].geometry().bottom() + 1 + self.tabs.y() + 12, self.panel.height())
+        self.assertEqual(rows[-1].geometry().bottom() + 1 - (p.row_all.geometry().bottom() + 1), 241)
+
+
+class ReadAloudTests(VoiceCase):
+    def test_the_skip_switches_and_their_settings(self) -> None:
+        p, s = self.page, self.settings
+        rows = {key: row for key, row, _inv in p.read_rows}
+        self.assertEqual([row.label for _key, row, _inv in p.read_rows],
+                         ["Skip citations", "Skip links and DOIs", "Skip notes, captions and tables",
+                          "Skip the reference list"])
+        self.assertTrue(all(row.checked for row in rows.values()))  # the defaults skip all four
+        rows["skip_urls"].toggled.emit(False)
+        self.assertFalse(s.get("skip_urls"))
+        rows["read_asides"].toggled.emit(False)   # "Skip notes" off reads them
+        self.assertTrue(s.get("read_asides"))
+        s.set("read_references", True)
+        self.assertFalse(rows["read_references"].checked)
+        self.assertIn("Changes apply at once.", rows["skip_citations"].tooltip_text())
+
+    def test_pronunciations_row(self) -> None:
+        from saylight.ui.voice_page import pronunciations_detail
+        self.assertEqual(pronunciations_detail(0, True), "None yet")
+        self.assertEqual(pronunciations_detail(1, True), "1 word")
+        self.assertEqual(pronunciations_detail(12, False), "12 words · off")
+        self.assertEqual(self.page.row_pron.detail, "None yet")
+        self.assertEqual(self.page.row_pron.tooltip_text(), "Change how words are said")
 
     def test_the_wheel_scrolls_the_list_then_passes_through(self) -> None:
         self.assertTrue(self.wheel(self.list, 1))

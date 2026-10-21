@@ -8,33 +8,42 @@ clipboard by Saylight.
 
 The window's geometry is final from its first frame: the window fades in while the box grows inside it
 (GrowOverlay), so the document is never laid out again during the motion.
+
+What won't be read aloud (citations, links) is dimmed in the reading card's skipped colour (SkipHighlighter),
+the box never fills itself from an opened file, and its context menu can change how a word is said.
 """
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import logging
 import math
 import os
 import re
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QRegularExpression, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QFontMetricsF, QGuiApplication, QKeyEvent, QKeySequence, QLinearGradient, QPainter,
-                           QPainterPath, QPalette, QPen, QTextBlockFormat, QTextCursor, QTextDocument,
-                           QTextDocumentFragment, QTextOption)
+from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QRect, QRectF, QRegularExpression, QSize, Qt, QTimer,
+                            Signal)
+from PySide6.QtGui import (QAction, QContextMenuEvent, QFontMetricsF, QGuiApplication, QKeyEvent, QKeySequence,
+                           QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QSyntaxHighlighter,
+                           QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextDocumentFragment,
+                           QTextOption)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect, QScrollBar, QStyle, QStyleOptionSlider,
                                QTextEdit, QWidget)
 
-from .. import win32
+from .. import academic_text, win32
+from ..alignment import Aligned, diff_edits
 from ..engine import MAX_TEXT_CHARS, PAUSED
 from .controls import (G_CLEAR, G_COLLAPSE, G_PASTE, G_TYPE, G_UNDO, FadeLabel, IconButton, Part, PillButton,
                        TextButton, draw_glyph, paint_parts, text_button_size)
 from .motion import FAST, MEDIUM, SLOW, Tween, decelerate, exit_curve, with_alpha
 from .panel import EXPANDED_W, MA_NOACTIVATE, WM_MOUSEACTIVATE, WPM_AT_1X
+from .sentence_view import word_bounds
 
 log = logging.getLogger("saylight.compose")
 
@@ -54,6 +63,10 @@ COUNT_DELAY_MS = 150
 AWAY_SETTLE_MS = 50  # light dismiss judges the foreground once it settles (Win+. passes it through the shell)
 LIMIT_BEEP_S = 2.0
 INK_SAMPLE = "Hdlbgjpqy"  # the reading card centres this ink in each row
+SKIP_DELAY_MS = 400          # what won't be read aloud is dimmed this long after the last edit
+SKIP_WORKER_CHARS = 20_000   # longer text is checked on a worker thread
+PRONOUNCE_MAX = 100          # a selection up to this long can have its pronunciation changed
+PRONOUNCE_LABEL = "Change how “{word}” is said…"
 
 HINT: list[Part] = [("key", "Ctrl"), ("key", "Enter"), ("text", " reads it aloud  ·  "), ("key", "Esc"),
                     ("text", " goes back")]
@@ -236,18 +249,73 @@ def read_scope(selected: str, full: str) -> tuple[str, str]:
     return full, "all"
 
 
-def prefill_plan(user_text: bool, current: str, box: tuple[str, int] | None) -> tuple[str, str, int]:
+def prefill_plan(user_text: bool, current: str, box: tuple[str, int] | None, *,
+                 source_kind: str = "") -> tuple[str, str, int]:
     """What the box shows as it opens.
 
     ("keep", "", 0) keeps the text you typed as you left it; ("load", text, pos) loads the reading's text with
     `pos` its current sentence's start in UTF-16 units; ("empty", "", 0) starts empty. `box` is the reading's
-    text and the offset of its current sentence, or None."""
+    text and the offset of its current sentence, or None. A file's text never fills the box (it can run to
+    hundreds of pages, and would become a draft): with `source_kind` "file" it keeps your text or starts empty."""
     if user_text and current.strip():
         return "keep", "", 0
-    if box is not None and box[0]:
+    if box is not None and box[0] and source_kind != "file":
         text, start = box
         return "load", text, utf16_len(text[:max(0, min(start, len(text)))])
     return "empty", "", 0
+
+
+def reading_prefill(doc, sentence: int) -> tuple[str, int] | None:
+    """The `prefill` for open_at(): the reading's text and its current sentence's start, or None with no reading
+    and for a document opened from a file (the box is never filled from a file)."""
+    if doc is None or not doc.sentences or getattr(getattr(doc, "source", None), "kind", "") == "file":
+        return None
+    return doc.text, doc.sentences[max(0, min(sentence, len(doc.sentences) - 1))].start
+
+
+def skipped_spans(text: str, *, skip_citations: bool = True,
+                  skip_urls: bool = True) -> list[tuple[int, int]] | None:
+    """The parts of `text` that won't be read aloud (citations, links), as (start, end) offsets into it, or None
+    when that can't be told for sure, so nothing is dimmed.
+
+    The spoken text is academic_text.normalize()'s, the one a reading gets; diff_edits() compares it with `text`
+    word by word, and its result is used only when it rebuilds the spoken text exactly."""
+    spoken = academic_text.normalize(text, skip_citations=skip_citations, skip_urls=skip_urls)
+    try:
+        edits = diff_edits(text, spoken)
+        if Aligned(text, edits).spoken != spoken:
+            return None
+    except ValueError:
+        return None
+    spans = []
+    for e in edits:
+        a, b = e.start, e.end
+        if e.kind != "skip":
+            continue
+        while a < b and text[a].isspace():
+            a += 1
+        while b > a and text[b - 1].isspace():
+            b -= 1
+        if a < b:
+            spans.append((a, b))
+    return spans
+
+
+def to_utf16(text: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Spans in code points as UTF-16 units (QTextDocument positions): they differ after an emoji or the like."""
+    if not text or max(text) < "\U00010000":
+        return list(spans)
+    units = [0]
+    for c in text:
+        units.append(units[-1] + (2 if ord(c) > 0xFFFF else 1))
+    return [(units[a], units[b]) for a, b in spans]
+
+
+def pronounce_label(word: str) -> str:
+    """The context-menu item for `word`, a long selection shortened in the middle."""
+    if len(word) > 40:
+        word = word[:19] + "…" + word[-19:]
+    return PRONOUNCE_LABEL.format(word=word)
 
 
 def should_resume(paused_doc, document, state: str, reason: str) -> bool:
@@ -369,6 +437,7 @@ class ComposeEdit(QTextEdit):
     sizeStep = Signal(int)
     limitHit = Signal()
     edited = Signal()
+    pronunciationRequested = Signal(str)  # a word or a short selection, from the context menu
 
     _NON_SPACE = QRegularExpression(r"\S", QRegularExpression.PatternOption.UseUnicodePropertiesOption)
 
@@ -633,6 +702,41 @@ class ComposeEdit(QTextEdit):
             return
         event.accept()
 
+    # --- Context menu: change how a word is said
+
+    def pronounce_target(self) -> str:
+        """The word at the caret, or the selection when it is 1 to PRONOUNCE_MAX characters ("" for none)."""
+        c = self.textCursor()
+        if c.hasSelection():
+            words = c.selectedText().replace("\u2029", " ").split()
+            text = " ".join(words)
+            return text if 1 <= len(text) <= PRONOUNCE_MAX else ""
+        line = c.block().text()
+        i = len(line.encode("utf-16-le")[:2 * c.positionInBlock()].decode("utf-16-le", "ignore"))
+        span = word_bounds(line, i) or word_bounds(line, i - 1)  # in the word, or just after it
+        return line[span[0]:span[1]] if span else ""
+
+    def context_menu(self, pos: QPoint):
+        """Qt's own menu for the text, starting with "Change how “word” is said…" when there is a word."""
+        menu = self.createStandardContextMenu(pos)
+        word = self.pronounce_target()
+        if word:
+            first = menu.actions()[0] if menu.actions() else None
+            action = QAction(pronounce_label(word), menu)
+            action.triggered.connect(lambda: self.pronunciationRequested.emit(word))
+            menu.insertAction(first, action)
+            menu.insertSeparator(first)
+        return menu
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        if event.reason() == QContextMenuEvent.Reason.Mouse:  # a right-click outside the selection moves the caret
+            hit, c = self.cursorForPosition(event.pos()), self.textCursor()
+            if not (c.hasSelection() and c.selectionStart() <= hit.position() <= c.selectionEnd()):
+                self.setTextCursor(hit)
+        menu = self.context_menu(event.pos())
+        menu.exec(event.globalPos())
+        menu.deleteLater()
+
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:  # text size, never QTextEdit's own zoom
             steps = event.angleDelta().y()
@@ -641,6 +745,146 @@ class ComposeEdit(QTextEdit):
             event.accept()
             return
         super().wheelEvent(event)
+
+
+class _Relay(QObject):
+    """Carries a worker thread's result to the GUI thread (a queued signal)."""
+    done = Signal(int, object)
+
+
+class SkipHighlighter(QSyntaxHighlighter):
+    """Dims what won't be read aloud in the box, in the reading card's skipped colour, so typed or pasted text looks
+    the way the card will show it.
+
+    The text is checked SKIP_DELAY_MS after the last edit, on a worker thread when it is longer than
+    SKIP_WORKER_CHARS; until then the dimmed spans move with the edits, and one that is edited into is dropped. A
+    check that can't be trusted (skipped_spans() gives None) dims nothing. The formats live in the layout only:
+    they never reach the text, the undo history or `edited`."""
+
+    checked = Signal()  # a check's result is showing
+
+    def __init__(self, edit: "ComposeEdit", theme, settings, *,
+                 analyse: Callable[..., list[tuple[int, int]] | None] | None = None):
+        super().__init__(None)  # attached to the document last, so a span moves before its block is redrawn
+        self.setParent(edit)
+        self._theme, self._settings = theme, settings
+        self._analyse = analyse or skipped_spans
+        self._spans: list[tuple[int, int]] = []  # in UTF-16 units, sorted
+        self._starts: list[int] = []
+        self._text = ""                          # the text the spans belong to
+        self._rev = 0
+        self._busy = False
+        self._fmt = QTextCharFormat()
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(SKIP_DELAY_MS)
+        self._timer.timeout.connect(self.check_now)
+        self._relay = _Relay(self)
+        self._relay.done.connect(self._on_result)
+        doc = edit.document()
+        doc.contentsChange.connect(self._on_change)
+        theme.changed.connect(self._on_theme)
+        settings.changed.connect(self._on_setting)
+        self._on_theme()
+        self.setDocument(doc)
+        self._text = doc.toPlainText()
+
+    @property
+    def spans(self) -> list[tuple[int, int]]:
+        """The dimmed spans, as document positions."""
+        return list(self._spans)
+
+    def _set_spans(self, spans: list[tuple[int, int]]) -> None:
+        self._spans = sorted(spans)
+        self._starts = [a for a, _ in self._spans]
+
+    def _on_change(self, pos: int, removed: int, added: int) -> None:
+        text = self.document().toPlainText()
+        if text == self._text:  # a format change (the line pitch), not an edit
+            return
+        self._text = text
+        self._rev += 1
+        moved = added - removed
+        self._set_spans([(a, b) if b <= pos else (a + moved, b + moved) for a, b in self._spans
+                         if b <= pos or a >= pos + removed])
+        self._timer.start()
+
+    def check_now(self) -> None:
+        """Check the text now (the delay after an edit ends here)."""
+        self._timer.stop()
+        if self._busy:  # the running check's answer is stale already: check again when it comes
+            return
+        text, rev = self._text, self._rev
+        if not text.strip():
+            self._show(rev, text, [])
+            return
+        options = {"skip_citations": self._setting("skip_citations"), "skip_urls": self._setting("skip_urls")}
+        if len(text) <= SKIP_WORKER_CHARS:
+            self._show(rev, text, self._run(text, options))
+            return
+        self._busy = True
+        threading.Thread(target=lambda: self._relay.done.emit(rev, (text, self._run(text, options))),
+                         name="saylight-compose-check", daemon=True).start()
+
+    def _setting(self, key: str) -> bool:
+        value = self._settings.get(key)
+        return True if value is None else bool(value)
+
+    def _run(self, text: str, options: dict) -> list[tuple[int, int]] | None:
+        try:
+            return self._analyse(text, **options)
+        except Exception as e:  # never break typing over a check
+            log.warning("Compose: skip check failed (%s)", type(e).__name__)
+            return None
+
+    def _on_result(self, rev: int, result) -> None:
+        self._busy = False
+        text, spans = result
+        if rev == self._rev:
+            self._show(rev, text, spans)
+        elif not self._timer.isActive():
+            self.check_now()
+
+    def _show(self, rev: int, text: str, spans: list[tuple[int, int]] | None) -> None:
+        if rev != self._rev:
+            return
+        old = set(self._spans)
+        self._set_spans(to_utf16(text, spans or []))
+        doc = self.document()
+        for a, b in old ^ set(self._spans):  # redraw only the paragraphs whose dimming changed
+            block, last = doc.findBlock(a), doc.findBlock(max(a, b - 1))
+            while block.isValid():
+                self.rehighlightBlock(block)
+                if block == last:
+                    break
+                block = block.next()
+        self.checked.emit()
+
+    def _on_theme(self) -> None:
+        self._fmt = QTextCharFormat()
+        self._fmt.setForeground(self._theme.reading_colors()["skipped"])
+        if self._spans and self.document() is not None:
+            self.rehighlight()
+
+    def _on_setting(self, key: str) -> None:
+        if key == "reading_tint":
+            self._on_theme()
+        elif key in ("skip_citations", "skip_urls"):
+            self._rev += 1
+            self.check_now()
+
+    def highlightBlock(self, text: str) -> None:
+        if not self._spans:
+            return
+        block = self.currentBlock()
+        start, end = block.position(), block.position() + block.length() - 1
+        i = max(0, bisect.bisect_right(self._starts, start) - 1)
+        while i < len(self._spans) and self._spans[i][0] < end:
+            a, b = self._spans[i]
+            a, b = max(a, start), min(b, end)
+            if b > a:
+                self.setFormat(a - start, b - a, self._fmt)
+            i += 1
 
 
 class WellFades(QWidget):
@@ -803,6 +1047,7 @@ class ComposeWindow(QWidget):
     readRequested = Signal(str, str)   # text, "selection" or "all"
     clearRequested = Signal()
     undoRequested = Signal()
+    pronunciationRequested = Signal(str)  # context menu: the App closes the box ("switch") and opens Pronunciations
     closeRequested = Signal(str)       # esc | back | away | screen
     sizeStepRequested = Signal(int)
     textEdited = Signal()
@@ -832,6 +1077,7 @@ class ComposeWindow(QWidget):
 
         # Stacking, bottom to top: the text, its fades, the grow overlay, then everything else.
         self.edit = ComposeEdit(t, self)
+        self.highlighter = SkipHighlighter(self.edit, t, ctl.settings)
         self.fades = WellFades(t, self.edit, self)
         self.overlay = GrowOverlay(t, self)
         self.overlay.hide()
@@ -879,6 +1125,7 @@ class ComposeWindow(QWidget):
         e.readKey.connect(self.read_from_shortcut)
         e.escapeKey.connect(lambda: self.closeRequested.emit("esc"))
         e.undoKey.connect(self.undoRequested.emit)
+        e.pronunciationRequested.connect(self.pronunciationRequested.emit)
         e.sizeStep.connect(self.sizeStepRequested.emit)
         e.limitHit.connect(lambda: self.show_note("limit"))
         e.edited.connect(self._on_edited)

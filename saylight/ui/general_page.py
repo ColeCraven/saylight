@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QWidget
 
 from .controls import G_OPEN, FadeLabel, LinkText, NavRow, Part, ToggleRow, measure_parts, spoken_parts
@@ -9,6 +10,17 @@ from .settings_pages import COLUMN, EDGE, OPTICAL, PITCH, SettingsPage
 from .update_bar import short_version
 
 CHECK_RESULTS = {"current": "You have the latest version", "error": "Couldn't check. Try again later."}
+FILES_CAPTION = "Files · you can drop a PDF, Word or text file on the panel"
+RESUME_DETAIL = "Remembers your place in up to 20 files, never their text."
+RESUME_TIP = ("When you open a file again, Saylight continues where you stopped. It keeps each file's location "
+              "and your place in it, never its text. Turning this off forgets them all at once.")
+FORGOT_MS = 6000  # how long "Saylight forgot your place in 7 files." stays before the usual detail comes back
+
+
+def forgot_detail(n: int) -> str:
+    if n <= 0:
+        return "Saylight forgot every place it remembered."
+    return f"Saylight forgot your place in {n} file{'s' if n != 1 else ''}."
 # What follows the keycaps, longest first: a long shortcut keeps the shorter wording, or the keycaps alone.
 SHORTCUT_NOTES = {True: (" reads the highlighted text", " reads highlighted text", ""),
                   False: (" · another app is using it", " · in use", "")}
@@ -31,6 +43,13 @@ class GeneralPage(SettingsPage):
                                    tooltip="Start Saylight when you sign in to Windows")
         self.lbl_shortcut = self.label("Shortcut")
         self.val_shortcut = FadeLabel(t, "body", "TextPrimary", host)
+        self.lbl_files = FadeLabel(t, "small", "TextSecondary", host)
+        self.lbl_files.set_text(FILES_CAPTION, animate=False)
+        self.row_resume = ToggleRow(t, tips, "Pick up where you left off", host, tooltip=RESUME_TIP,
+                                    detail=RESUME_DETAIL)
+        self._forgot_timer = QTimer(host)
+        self._forgot_timer.setSingleShot(True)
+        self._forgot_timer.timeout.connect(lambda: self.row_resume.set_detail(RESUME_DETAIL))
         self.updates_line = LinkText(t, tips, host, role="body", color_token="TextSecondary")
         self.row_notices = NavRow(t, tips, "Privacy and licences", host, glyph=G_OPEN,
                                   tooltip="Saylight doesn't keep your text or audio. This opens the licences of "
@@ -42,17 +61,19 @@ class GeneralPage(SettingsPage):
         self.row_start.setEnabled(hasattr(ctl, "set_start_with_windows"))
         self.row_notices.setEnabled(hasattr(ctl, "open_notices"))
         self.row_start.toggled.connect(self._set_start)
+        self.row_resume.toggled.connect(self._set_resume)
         self.row_notices.clicked.connect(lambda: ctl.open_notices())
         self.updates_line.linkClicked.connect(self._toggle_checks)
         self.version_line.linkClicked.connect(self._check_now)
         if self.updates is not None and hasattr(self.updates, "checked"):
             self.updates.checked.connect(self._on_checked)
         self.settings.changed.connect(
-            lambda key: self.sync() if key == "updates.check" or key.startswith("hotkeys") else None)
+            lambda key: self.sync() if key in ("updates.check", "resume.enabled") or key.startswith("hotkeys")
+            else None)
 
     def widgets(self) -> list[QWidget]:
-        return [self.row_start, self.lbl_shortcut, self.val_shortcut, self.updates_line, self.row_notices,
-                self.version_line]
+        return [self.row_start, self.lbl_shortcut, self.val_shortcut, self.lbl_files, self.row_resume,
+                self.updates_line, self.row_notices, self.version_line]
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
         px = self.theme.px
@@ -68,6 +89,12 @@ class GeneralPage(SettingsPage):
         y += px(PITCH)
         self.rules = [y + px(4)]
         y += px(9)
+        self.lbl_files.setGeometry(x + px(OPTICAL), y, text_w, px(20))
+        y += px(22)
+        self.row_resume.setGeometry(x + px(EDGE), y, row_w, self.row_resume.row_height())
+        y += self.row_resume.row_height() + px(2)
+        self.rules.append(y + px(4))
+        y += px(9)
         self.updates_line.setGeometry(x + px(OPTICAL), y + px(10), text_w, px(20))
         y += px(PITCH)
         self.row_notices.setGeometry(x + px(EDGE), y, row_w, px(40))
@@ -79,6 +106,7 @@ class GeneralPage(SettingsPage):
     def sync(self) -> None:
         start = getattr(self.ctl, "start_with_windows", None)
         self.row_start.set_checked(bool(start()) if callable(start) else False)
+        self.row_resume.set_checked(bool(self.settings.get("resume.enabled")))
         self._fit_shortcut()
         if self.settings.get("updates.check"):
             line = [("text", "Saylight checks GitHub for updates once a day"), ("sep", " · "), ("toggle", "Turn off")]
@@ -140,6 +168,17 @@ class GeneralPage(SettingsPage):
     def _set_start(self, on: bool) -> None:
         self.ctl.set_start_with_windows(on)
         self.row_start.set_checked(bool(self.ctl.start_with_windows()))
+
+    def _set_resume(self, on: bool) -> None:
+        """On: Saylight starts remembering places. Off: it forgets them all at once (there is no Undo)."""
+        set_resume = getattr(self.ctl, "set_resume", None)
+        forgot = set_resume(on) if set_resume is not None else self.settings.set("resume.enabled", on)
+        if on:
+            self._forgot_timer.stop()
+            self.row_resume.set_detail(RESUME_DETAIL)
+        else:
+            self.row_resume.set_detail(forgot_detail(int(forgot or 0)))
+            self._forgot_timer.start(FORGOT_MS)
 
     def _toggle_checks(self, _key: str) -> None:
         self.settings.set("updates.check", not self.settings.get("updates.check"))

@@ -30,6 +30,7 @@ from saylight.engine import ClearedReading
 from saylight.input_thread import HK_COMPOSE, HK_PANEL
 from saylight.settings import Settings
 from saylight.ui.compose import ComposeSession, ComposeSnapshot
+from saylight.ui.sheet import SheetSession
 from saylight.voices.base import VoiceInfo
 from saylight.voices.catalog import VoiceCatalog
 
@@ -397,11 +398,46 @@ class FakeEngine(QObject):
     notice = Signal(str)
     panelToggleRequested = Signal()
     mediaKeysWanted = Signal(bool)
+    openingCancelled = Signal(int)
+    resumeApplied = Signal(int)
 
-    def __init__(self, *, parent=None, **_parts) -> None:
+    def __init__(self, *, parent=None, builder=None, resume=None, pronunciations=None, **_parts) -> None:
         super().__init__(parent)
         self.state, self.document, self.cur, self.speed = "ready", None, 0, 1.0
         self.speakable = True
+        self.builder, self.store, self.plist = builder, resume, pronunciations
+        self.raw, self.resumed, self.token = None, None, 0
+
+    # --- Files, as the App drives them
+
+    def begin_opening(self, title: str, kind: str = "file") -> int:
+        self.token += 1
+        world.log("begin_opening", title, kind)
+        self.state = "opening"
+        return self.token
+
+    def opening_progress(self, token: int, done: int, total: int) -> None:
+        world.log("opening_progress", token, done, total)
+
+    def opening_failed(self, token: int, kind: str) -> None:
+        world.log("opening_failed", token, kind)
+        self.state = "open_failed"
+
+    def open_notice(self, kind: str, title: str = "") -> None:
+        world.log("open_notice", kind, title)
+        self.state = "open_failed"
+
+    def read_document(self, doc, raw=None, *, token=None) -> bool:
+        world.log("read_document", token)
+        self.document, self.raw, self.state = doc, raw, "preparing"
+        self.sessionChanged.emit(doc)
+        return True
+
+    def rebuild(self, read_section=None) -> None:
+        world.log("rebuild", read_section)
+
+    def start_over(self) -> None:
+        world.log("start_over")
 
     @property
     def current_sentence(self) -> int:
@@ -518,6 +554,26 @@ class FakePanel:
         self.page, self.expanded, self.visible, self._hiding, self.cleared = "reading", False, True, False, False
         self.view = FakeView()
         self.rest = QRect(740, 768, 440, 252)
+        self.notice_ext, self.cleared_title, self.notes, self.progress = "", "", [], []
+        self.failed_badge = False
+
+    def set_cleared(self, on: bool, title: str = "") -> None:
+        self.cleared, self.cleared_title = on, title
+
+    def show_note(self, text: str, color: str = "TextSecondary") -> None:
+        self.notes.append((text, color))
+
+    def set_save_progress(self, fraction, eta: str = "", *, done: bool = False) -> None:
+        self.progress.append((fraction, done))
+
+    def set_save_failed(self, on: bool) -> None:
+        self.failed_badge = on
+
+    def on_resumed(self, sentence: int, exact: bool, page: int) -> None:
+        world.log("on_resumed", sentence, exact, page)
+
+    def close_flyout(self, now: bool = False) -> None:
+        world.log("close_flyout")
 
     def isVisible(self) -> bool:
         return self.visible
@@ -534,9 +590,6 @@ class FakePanel:
 
     def set_covered(self, on: bool) -> None:
         world.log("covered", on)
-
-    def set_cleared(self, on: bool) -> None:
-        self.cleared = on
 
     def refresh_box_actions(self) -> None:
         world.log("refresh_box_actions")
@@ -559,6 +612,7 @@ class FakePanel:
         pass
 
     present = on_session = on_position = on_time_left = on_speed = on_volume = reclamp = relayout = _ignore
+    refresh_flyout = _ignore
 
 
 class FakeCompose(QObject):
@@ -572,6 +626,7 @@ class FakeCompose(QObject):
     sizeStepRequested = Signal(int)
     textEdited = Signal()
     closed = Signal(str)
+    pronunciationRequested = Signal(str)
 
     hwnd = BOX
 
@@ -737,12 +792,84 @@ class FakeNetwork(QObject):
         return cls.current
 
 
+class FakeServer(QObject):
+    """The Open with server: never listens on a real pipe name."""
+
+    openRequested = Signal(str)
+    openRejected = Signal(str, str)
+
+    def __init__(self, name=None, parent=None) -> None:
+        super().__init__(parent)
+
+    def listen(self) -> bool:
+        world.log("listen")
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+class FakeLoader(QObject):
+    progress = Signal(int, int, int)
+    built = Signal(int, object, object)
+    failed = Signal(int, str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.jobs: list[tuple] = []
+
+    def open(self, token: int, path: str, options, *, password=None) -> None:
+        self.jobs.append(("open", token, path, options, password))
+
+    def build(self, token: int, raw, options) -> None:
+        self.jobs.append(("build", token, raw, options, None))
+
+    def cancel(self, token: int) -> None:
+        self.jobs.append(("cancel", token))
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        pass
+
+
+class FakeExporter(QObject):
+    progress = Signal(int, int)
+    finished = Signal(str)
+    failed = Signal(str, str)
+
+    def __init__(self, factory, parent=None, **_kw) -> None:
+        super().__init__(parent)
+        self.busy, self.started, self.cancelled, self.retried, self.shut = False, [], 0, 0, False
+
+    def start(self, doc, target: str, *, voice: str, speed: float, first: int = 0, last=None) -> None:
+        self.busy = True
+        self.started.append((doc, target, voice, speed, first))
+
+    def fraction(self) -> float:
+        return 0.42 if self.busy else 0.0
+
+    def remaining_s(self):
+        return None
+
+    def cancel(self) -> None:
+        self.cancelled += 1
+        self.busy = False
+
+    def retry(self) -> bool:
+        self.retried += 1
+        self.busy = True
+        return True
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        self.shut = True
+
+
 FAKES = {"saylight.engine.Engine": FakeEngine, "saylight.input_thread.InputThread": FakeInput,
          "saylight.foreground.ForegroundTracker": FakeForeground, "saylight.ui.panel.Panel": FakePanel,
          "saylight.ui.compose.ComposeWindow": FakeCompose, "saylight.ui.hud.Hud": FakeHud,
          "saylight.ui.tray.Tray": Quiet, "saylight.ui.tip.TipManager": Quiet, "saylight.voices.make_router": FakeRouter,
          "saylight.voices.preview.VoicePreview": FakePreview, "saylight.update_service.UpdateService": FakeUpdates,
-         "saylight.player.PlayerThread": Quiet}
+         "saylight.player.PlayerThread": Quiet, "saylight.single_instance.OpenServer": FakeServer,
+         "saylight.documents.loader.DocumentLoader": FakeLoader, "saylight.export.AudioExporter": FakeExporter}
 
 
 class AppTest(unittest.TestCase):
@@ -792,7 +919,7 @@ class SettingsPagesTests(AppTest):
     def test_the_pages_get_the_voices_updates_and_version(self) -> None:
         app = self.app
         self.assertEqual(app.version, saylight.__version__)
-        self.assertEqual(saylight.__version__, "1.2.0")
+        self.assertEqual(saylight.__version__, "1.3.0")
         self.assertIsInstance(app.router, FakeRouter)
         self.assertIs(app.router.settings, app.settings)
         self.assertIs(app.router.parent, app)
@@ -1341,6 +1468,307 @@ class ComposeFlowTests(AppTest):
         self.assertEqual(self.c.text, "")
         self.app.undo_clear()
         self.assertIs(self.e.document, doc)  # the next open loads the reading into the box again
+
+
+
+# --- The App: files, Open with, passwords, section chips, resume and Save as audio ------------------
+
+class FakeSheet(QObject):
+    """A sheet (Pronunciations, Save as audio, the PDF password): opens and closes at once."""
+
+    closeRequested = Signal(str)
+    closed = Signal(str)
+    submitted = Signal(str)
+    saved = Signal(str)
+    saveChosen = Signal(str, int)
+
+    def __init__(self, *_args, **_kw) -> None:
+        super().__init__()
+        self.session = SheetSession()
+        self.setup = None
+        self.prepared: list = []
+
+    @property
+    def is_open(self) -> bool:
+        return self.session.phase in ("opening", "open")
+
+    def open_at(self, rest, *, return_to: int, panel_visible: bool = True, source: str = "") -> bool:
+        world.log("sheet_open", type(self).__name__, source, return_to)
+        self.session.phase, self.session.return_to = "open", return_to
+        world.foreground = SHEET
+        return True
+
+    def close_animated(self, reason: str) -> None:
+        world.log("sheet_close", reason)
+        self.session = SheetSession()
+        self.closed.emit(reason)
+
+    def is_foreground(self) -> bool:
+        return world.foreground == SHEET
+
+    def is_dismissed_by(self, hwnd: int) -> bool:
+        return self.is_open and hwnd == OTHER_APP
+
+    def reanchor(self, _rest) -> None:
+        pass
+
+    def prepare(self, what) -> None:
+        self.setup = what
+        self.prepared.append(what)
+
+    def wrong_password(self) -> None:
+        world.log("wrong_password")
+
+    def show_list(self) -> None:
+        world.log("show_list")
+
+    def show_word(self, word: str, context=None) -> None:
+        world.log("show_word", word, context)
+
+
+class PasswordSheetFake(FakeSheet):
+    pass
+
+
+class SaveSheetFake(FakeSheet):
+    pass
+
+
+class PronSheetFake(FakeSheet):
+    pass
+
+
+SHEET = 9191
+
+
+def loaded(text: str = "x" * 10, pages: int = 0, scanned: tuple = ()):
+    from saylight.documents.model import LoadedDocument
+    return LoadedDocument("pdf", "Secret Title", text, pages=pages, scanned_pages=list(scanned))
+
+
+class FileFlowTests(AppTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.files = tempfile.mkdtemp(prefix="saylight_app_files_")
+        self.addCleanup(shutil.rmtree, self.files, True)
+        for target, fake in (("saylight.ui.password_sheet.PasswordSheet", PasswordSheetFake),
+                             ("saylight.ui.export_dialog.ExportDialog", SaveSheetFake),
+                             ("saylight.ui.pronunciation_dialog.PronunciationDialog", PronSheetFake)):
+            patcher = mock.patch(target, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.loader = self.app.loader
+
+    def make(self, name: str) -> str:
+        path = os.path.join(self.files, name)
+        with open(path, "wb") as f:
+            f.write(b"%PDF-1.4")
+        return path
+
+    def test_opening_a_file(self) -> None:
+        path = self.make("Secret Title.pdf")
+        with self.assertLogs("saylight.app", "INFO") as logs:
+            self.app.open_path(path, "drop")
+        self.assertIn(("begin_opening", "Secret Title", "file"), world.events)
+        kind, token, opened, options, password = self.loader.jobs[0]
+        self.assertEqual((kind, token, opened, password), ("open", 1, path, None))
+        self.assertTrue(options.skip_citations)
+        self.assertEqual(self.p.notice_ext, ".pdf")
+        self.assertNotIn("Secret", " ".join(logs.output))
+        self.assertNotIn(self.files, " ".join(logs.output))
+        self.assertNotIn("panel_show", world.kinds())  # never shows the panel
+        self.assertNotIn("set_foreground", world.kinds())
+
+    def test_what_cannot_be_opened_is_a_notice(self) -> None:
+        self.app.open_path(os.path.join(self.files, "old.doc"), "open with")
+        self.app.open_path(os.path.join(self.files, "gone.pdf"), "continue")
+        self.assertEqual([e for e in world.events if e[0] == "open_notice"],
+                         [("open_notice", "unsupported", "old"), ("open_notice", "missing", "gone")])
+        self.assertEqual(self.loader.jobs, [])
+
+    def test_the_loaders_answers_reach_the_engine(self) -> None:
+        self.app.open_path(self.make("Secret Title.pdf"))
+        raw = loaded("Some text. More text.", pages=18, scanned=(3, 4))
+        doc = self.app.build_document(raw)
+        self.loader.progress.emit(1, 4, 18)
+        with self.assertLogs("saylight.app", "INFO") as logs:
+            self.loader.built.emit(1, doc, raw)
+        self.assertIn(("opening_progress", 1, 4, 18), world.events)
+        self.assertIn(("read_document", 1), world.events)
+        line = next(m for m in logs.output if "Open: pdf" in m)
+        self.assertIn("18 pages", line)
+        self.assertNotIn("Secret", line)
+        self.assertEqual(self.p.notes, [("2 scanned pages skipped", "TextSecondary")])
+
+    def test_a_failure_becomes_the_engines_notice(self) -> None:
+        self.app.open_path(self.make("a.pdf"))
+        self.loader.failed.emit(1, "corrupt")
+        self.assertIn(("opening_failed", 1, "corrupt"), world.events)
+
+    def test_a_password_pdf(self) -> None:
+        path = self.make("Locked.pdf")
+        self.app.open_path(path)
+        self.loader.failed.emit(1, "password")
+        self.assertIn(("opening_failed", 1, "password"), world.events)
+        world.foreground = OTHER_APP
+        self.app.open_password("card")
+        sheet = self.app._password_sheet
+        self.assertEqual(sheet.prepared, ["Locked"])
+        self.assertIn(("sheet_open", "PasswordSheetFake", "card", OTHER_APP), world.events)
+        sheet.submitted.emit("wrong")
+        job = self.loader.jobs[-1]
+        self.assertEqual((job[0], job[1], job[2], job[4]), ("open", 2, path, "wrong"))
+        self.loader.failed.emit(2, "password")
+        self.assertIn(("wrong_password",), world.events)
+        self.assertTrue(sheet.is_open)  # the sheet stays for another try
+        sheet.submitted.emit("right")
+        self.loader.progress.emit(3, 1, 9)
+        self.assertFalse(sheet.is_open)  # it worked: the sheet goes and the foreground goes back
+        self.assertIn(("sheet_close", "read"), world.events)
+        self.assertEqual(world.foreground, OTHER_APP)
+
+    def test_the_password_sheet_needs_a_password_notice(self) -> None:
+        self.app.open_password("tray")
+        self.assertIsNone(self.app._password_sheet)
+
+    def test_section_chips_are_for_this_file_only(self) -> None:
+        raw = loaded("Body text here. And more.")
+        self.e.raw, self.e.document = raw, self.app.build_document(raw)
+        self.assertFalse(self.app.build_options(raw).read_asides)
+        self.app.toggle_section("notes")
+        self.assertIn(("rebuild", "notes"), world.events)
+        self.assertTrue(self.app.build_options(raw).read_asides)
+        self.assertFalse(self.app.build_options(loaded()).read_asides)  # another file
+        self.assertFalse(self.app.build_options("typed text").read_asides)
+        self.app.toggle_section("notes")
+        self.assertIn(("rebuild", None), world.events)
+        self.assertFalse(self.app.build_options(raw).read_asides)
+        self.app.toggle_section("refs")
+        self.e.raw = loaded()  # a new file
+        self.e.sessionChanged.emit(None)
+        self.assertEqual(self.app._overrides, {})
+
+    def test_the_builder_builds_with_the_options_and_long_text_on_the_worker(self) -> None:
+        builder = self.e.builder
+        self.assertEqual(len(builder("Hello there. Bye now.").sentences), 2)
+        builder.start(7, "long text")
+        self.assertEqual(self.loader.jobs[-1][:3], ("build", 7, "long text"))
+        self.e.openingCancelled.emit(7)
+        self.assertEqual(self.loader.jobs[-1], ("cancel", 7))
+
+    def test_open_with_reaches_open_path(self) -> None:
+        path = self.make("b.pdf")
+        self.app.server.openRequested.emit(path)
+        self.assertEqual(self.loader.jobs[0][2], path)
+        self.app.server.openRejected.emit("unsupported", os.path.join(self.files, "x.doc"))
+        self.assertIn(("open_notice", "unsupported", "x"), world.events)
+        self.assertEqual(self.p.notice_ext, ".doc")
+
+    def test_turning_resume_off_forgets_every_place_at_once(self) -> None:
+        from saylight.resume import ResumePoint
+        path = self.make("Smith 2024.pdf")
+        self.app.set_resume(True)
+        self.app.resume.remember(ResumePoint(path, 1, 1, "f" * 64, 0, 5, 1.0, 14))
+        self.app._refresh_continue()
+        for _ in range(200):
+            QCoreApplication.processEvents()
+            if self.app.continue_point():
+                break
+        self.assertEqual(self.app.continue_point(), ("Smith 2024", 14))
+        with self.assertLogs("saylight.app", "INFO") as logs:
+            self.assertEqual(self.app.set_resume(False), 1)
+        self.assertIn("Resume: off, forgot 1", " ".join(logs.output))
+        self.assertFalse(os.path.exists(self.app.resume.path))
+        self.assertIsNone(self.app.continue_point())
+        self.assertFalse(self.app.settings.get("resume.enabled"))
+
+    def test_continue_opens_the_file(self) -> None:
+        from saylight.resume import ResumePoint
+        path = self.make("c.pdf")
+        self.app.settings.set("resume.enabled", True)
+        self.app._continue = ResumePoint(path, 1, 1, "f" * 64, 0, 5, 1.0, 0)
+        self.app.continue_reading("card")
+        self.assertEqual(self.loader.jobs[0][2], path)
+
+    def test_save_as_audio(self) -> None:
+        from saylight.text_model import Document
+        doc = Document.from_raw("One sentence here. Two sentences there.")
+        self.e.document, self.e.state = doc, "stopped"
+        self.app.open_save("flyout")
+        sheet = self.app._save_sheet
+        setup = sheet.prepared[0]
+        self.assertFalse(setup.from_file)
+        self.assertIn(("sheet_open", "SaveSheetFake", "flyout", APP_WINDOW), world.events)
+        target = os.path.join(self.files, "out.mp3")
+        sheet.saveChosen.emit(target, 0)
+        self.assertFalse(sheet.is_open)
+        ex = self.app.exporter
+        self.assertEqual(ex.started[0][1], target)
+        self.assertTrue(self.app._busy())  # no update check while saving
+        self.assertEqual(self.app.flyout_state()["saving"], 0.42)
+        self.assertEqual(self.p.notes[-1], ("Saving audio", "TextSecondary"))
+        ex.busy = False
+        ex.failed.emit("offline", "OSError")
+        self.assertTrue(self.p.failed_badge)
+        self.assertEqual(self.app.flyout_state()["failed"], "No internet connection")
+        self.assertEqual(self.p.notes[-1], ("Couldn't save the audio", "Critical"))
+        self.app.retry_save()
+        self.assertEqual((ex.retried, self.app.flyout_state()["failed"]), (1, ""))
+        self.app.cancel_save()
+        self.assertEqual(ex.cancelled, 1)
+        self.assertEqual(self.p.notes[-1], ("Saving cancelled · no file kept", "TextSecondary"))
+        ex.finished.emit(target)
+        self.assertEqual(self.app.saved_audio(), target)
+        self.app._forget_save()
+        self.assertEqual(self.app.saved_audio(), "")
+
+    def test_quitting_cancels_a_save(self) -> None:
+        self.app._shutdown()
+        self.assertTrue(self.app.exporter.shut)
+
+    def test_pronunciations_pause_and_saving_resumes(self) -> None:
+        self.load("reading")
+        self.app.open_pronunciations("flyout")
+        self.assertEqual(self.e.state, "paused")
+        sheet = self.app._pron_sheet
+        self.assertIn(("show_list",), world.events)
+        sheet.closeRequested.emit("saved")
+        self.assertEqual(self.e.state, "reading")
+        self.assertEqual(world.foreground, APP_WINDOW)
+
+    def test_one_focusable_window_at_a_time(self) -> None:
+        self.load("stopped")
+        self.app.open_compose("button")
+        self.app.open_pronunciations("tray")
+        self.assertFalse(self.app.composing())
+        self.assertIn(("close_animated", "switch"), world.events)
+        self.app.open_compose("button")
+        self.assertFalse(self.app._pron_sheet.is_open)
+
+    def test_hud_for_an_open_notice_while_hidden(self) -> None:
+        self.p.visible = False
+        self.app.settings.set("hud_when_hidden", True)
+        self.app._on_state("open_failed", {"label": "Password needed", "kind": "password"})
+        self.e.notice.emit("open_failed")
+        self.assertIn(("hud", "Password needed"), world.events)
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_a_path_opens_in_the_running_copy_or_a_new_one(self) -> None:
+        got = []
+        with mock.patch.object(A, "run_safely", lambda path="": got.append(path) or 0), \
+                mock.patch.object(sys, "argv", ["Saylight.exe", "paper.pdf"]), self.assertRaises(SystemExit):
+            A.main()
+        self.assertEqual(got, [os.path.abspath("paper.pdf")])
+
+    def test_the_running_copy_gets_the_path(self) -> None:
+        sent = []
+        with mock.patch.object(A, "setup_logging", lambda: None), \
+                mock.patch.object(A.kernel32, "CreateEventW", lambda *a: 1), \
+                mock.patch.object(A.ctypes, "get_last_error", lambda: A.ERROR_ALREADY_EXISTS), \
+                mock.patch("saylight.single_instance.send_open", lambda p: sent.append(p) or True):
+            self.assertEqual(A.run("C:/docs/paper.pdf"), 0)
+        self.assertEqual(sent, ["C:/docs/paper.pdf"])
 
 
 if __name__ == "__main__":

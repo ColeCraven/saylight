@@ -136,6 +136,7 @@ _sig(user32.MessageBeep, wintypes.BOOL, wintypes.UINT)
 _sig(user32.VkKeyScanW, ctypes.c_short, wintypes.WCHAR)
 _sig(user32.MapVirtualKeyW, wintypes.UINT, wintypes.UINT, wintypes.UINT)
 _sig(user32.GetAsyncKeyState, ctypes.c_short, ctypes.c_int)
+_sig(user32.GetKeyState, ctypes.c_short, ctypes.c_int)
 _sig(user32.SendInput, wintypes.UINT, wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 _sig(user32.RegisterHotKey, wintypes.BOOL, wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT)
 _sig(user32.UnregisterHotKey, wintypes.BOOL, wintypes.HWND, ctypes.c_int)
@@ -481,6 +482,17 @@ def unregister_hotkey(hk_id: int) -> bool:
 
 def key_down(vk: int) -> bool:
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def key_state(vk: int) -> tuple[bool, bool]:
+    """(down now, pressed since the last look). The second is best effort: Windows keeps one such bit per key,
+    and another app's look can take it first."""
+    state = user32.GetAsyncKeyState(vk)
+    return bool(state & 0x8000), bool(state & 1)
+
+
+def caps_lock_on() -> bool:
+    return bool(user32.GetKeyState(0x14) & 1)  # VK_CAPITAL toggled
 
 
 def _send_batch(events: Sequence[tuple[int, bool]]) -> int:

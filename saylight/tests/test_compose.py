@@ -1,6 +1,6 @@
 """Tests for the Type or paste box (ui/compose.py): its geometry and layout, paste clean-up and the length limit,
-the count, what a read gesture reads, the prefill, the resume and light-dismiss rules, and the text field and
-window themselves.
+the count, what a read gesture reads, the prefill (never from a file), the resume and light-dismiss rules, the text
+field and window themselves, the dimming of what won't be read aloud, and the context menu's pronunciation item.
 
 No window is ever shown or activated and no sound plays: show and activation, the Win32 calls, the screens and
 the clipboard are all replaced, and pastes go through QMimeData objects.
@@ -8,9 +8,14 @@ the clipboard are all replaced, and pastes go through QMimeData objects.
 
 import ctypes
 import random
+import re
 import sys
+import threading
+import time
 import unittest
+from collections import namedtuple
 from ctypes import wintypes
+from types import SimpleNamespace
 from unittest import mock
 
 import shiboken6
@@ -20,6 +25,7 @@ from PySide6.QtGui import (QFont, QFontDatabase, QFontMetricsF, QImage, QKeyEven
 from PySide6.QtWidgets import QApplication, QWidget
 
 from saylight.engine import MAX_TEXT_CHARS
+from saylight.text_model import Document
 from saylight.theme import Theme
 from saylight.ui import compose as C
 
@@ -1354,6 +1360,229 @@ class HighContrastTests(unittest.TestCase):
         self.assertEqual(pal.color(pal.ColorGroup.Inactive, pal.ColorRole.Highlight).getRgb()[:3], (26, 235, 255))
         self.assertEqual(pal.color(pal.ColorRole.PlaceholderText).getRgb()[:3], (63, 242, 63))
         self.assertEqual(pal.color(pal.ColorRole.Base).getRgb()[:3], (0, 0, 0))
+
+
+# --- What won't be read aloud, the prefill from files, and the context menu ------------------------
+
+CITED = "Reading improved (Smith et al., 2020). It lasted."
+
+
+def fake_analyse(text: str, **_options) -> list[tuple[int, int]]:
+    """Dims every bracketed part, the way citations are: a stand-in for skipped_spans()."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\([^)]*\)", text)]
+
+
+def dimmed(edit: "C.ComposeEdit") -> list[str]:
+    """The text the highlighter has dimmed, block by block, with the colour of each run."""
+    out = []
+    block = edit.document().begin()
+    while block.isValid():
+        for r in block.layout().formats():
+            out.append((block.text()[r.start:r.start + r.length], r.format.foreground().color().name()))
+        block = block.next()
+    return out
+
+
+class FilePrefillTests(unittest.TestCase):
+    def test_a_file_never_fills_the_box(self) -> None:
+        self.assertEqual(C.prefill_plan(False, "", ("Body text.", 0), source_kind="file"), ("empty", "", 0))
+        self.assertEqual(C.prefill_plan(True, "Mine", ("Body text.", 0), source_kind="file"), ("keep", "", 0))
+        self.assertEqual(C.prefill_plan(False, "", ("Body text.", 0), source_kind="selection")[0], "load")
+
+    def test_reading_prefill(self) -> None:
+        doc = Document.from_raw("One sentence. Two sentences.")
+        self.assertEqual(C.reading_prefill(doc, 1), (doc.text, doc.sentences[1].start))
+        self.assertEqual(C.reading_prefill(doc, 99), (doc.text, doc.sentences[1].start))
+        doc.source = SimpleNamespace(kind="file", path="C:/x.pdf", title="x")
+        self.assertIsNone(C.reading_prefill(doc, 0))
+        self.assertIsNone(C.reading_prefill(None, 0))
+
+
+class SkippedSpansTests(unittest.TestCase):
+    def fake_alignment(self, edits, spoken_ok=True):
+        """diff_edits() giving `edits`, and an Aligned whose spoken text matches normalize's only if `spoken_ok`."""
+        Edit = namedtuple("Edit", "start end spoken kind")
+        made = [Edit(*e) for e in edits]
+
+        class Aligned:
+            def __init__(self, display, given):
+                self.spoken = "SPOKEN" if spoken_ok else "something else"
+
+        return (mock.patch.object(C, "Aligned", Aligned), mock.patch.object(C, "diff_edits", lambda d, s: made),
+                mock.patch.object(C.academic_text, "normalize", return_value="SPOKEN"))
+
+    def test_skip_edits_become_trimmed_spans(self) -> None:
+        text = "Reading improved (Smith, 2020) here."
+        a = text.index(" (")
+        patches = self.fake_alignment([(a, text.index(")") + 1, "", "skip"), (0, 7, "reading", "say"),
+                                       (text.index(" here"), text.index(" here") + 1, "", "skip")])
+        with patches[0], patches[1], patches[2]:
+            self.assertEqual(C.skipped_spans(text), [(a + 1, text.index(")") + 1)])  # spaces trimmed, "say" kept
+
+    def test_a_failed_check_dims_nothing(self) -> None:
+        patches = self.fake_alignment([(0, 4, "", "skip")], spoken_ok=False)
+        with patches[0], patches[1], patches[2]:
+            self.assertIsNone(C.skipped_spans("Text (x)."))
+
+    def test_real_citations(self) -> None:
+        spans = C.skipped_spans(CITED)
+        self.assertEqual([CITED[a:b] for a, b in spans], ["(Smith et al., 2020)"])
+        self.assertEqual(C.skipped_spans(CITED, skip_citations=False), [])
+
+    def test_utf16_offsets(self) -> None:
+        text = "😀 (Smith) x"
+        self.assertEqual(C.to_utf16(text, [(2, 9)]), [(3, 10)])
+        self.assertEqual(C.to_utf16("plain (x)", [(6, 9)]), [(6, 9)])
+
+
+class SkipHighlighterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = FakeSettings()
+        self.theme = make_theme(self.settings)
+        self.edit = C.ComposeEdit(self.theme)
+        self.calls: list[tuple[str, str]] = []
+
+        def analyse(text, **options):
+            self.calls.append((text, threading.current_thread().name))
+            return self.result(text, **options)
+
+        self.result = fake_analyse
+        self.hl = C.SkipHighlighter(self.edit, self.theme, self.settings, analyse=analyse)
+        self.skipped = self.theme.reading_colors()["skipped"].name()
+
+    def type_at(self, pos: int, text: str) -> None:
+        c = QTextCursor(self.edit.document())
+        c.setPosition(pos)
+        c.insertText(text)
+
+    def test_dims_400_ms_after_the_last_edit(self) -> None:
+        self.edit.setPlainText(CITED)
+        self.assertEqual(self.hl._timer.interval(), 400)
+        self.assertTrue(self.hl._timer.isActive())
+        self.assertEqual(self.calls, [])
+        self.hl.check_now()
+        self.assertEqual(dimmed(self.edit), [("(Smith et al., 2020)", self.skipped)])
+        self.assertEqual(self.calls[0][1], threading.current_thread().name)  # short text: checked right here
+
+    def test_spans_move_with_edits_until_the_next_check(self) -> None:
+        self.edit.setPlainText(CITED)
+        self.hl.check_now()
+        self.type_at(0, "Yes. ")
+        a = CITED.index("(") + 5
+        self.assertEqual(self.hl.spans, [(a, a + len("(Smith et al., 2020)"))])
+        self.assertEqual(dimmed(self.edit), [("(Smith et al., 2020)", self.skipped)])
+        self.type_at(a + 3, "x")  # typing into the citation drops it until the check
+        self.assertEqual(self.hl.spans, [])
+        self.hl.check_now()
+        self.assertEqual(dimmed(self.edit), [("(Smxith et al., 2020)", self.skipped)])
+
+    def test_never_an_edit_or_an_undo_step(self) -> None:
+        edited = []
+        self.edit.edited.connect(lambda: edited.append(1))
+        self.edit.load(CITED)
+        self.assertFalse(self.edit.document().isUndoAvailable())
+        self.hl.check_now()
+        self.edit._merge_all()  # a format-only change is not an edit either
+        self.assertEqual((edited, self.edit.document().isUndoAvailable()), ([], False))
+        self.assertEqual(len(self.hl.spans), 1)
+        self.assertFalse(self.hl._timer.isActive())
+
+    def test_a_failed_check_dims_nothing(self) -> None:
+        self.edit.setPlainText(CITED)
+        self.hl.check_now()
+        self.result = lambda text, **o: None
+        self.type_at(len(CITED), " More.")
+        self.hl.check_now()
+        self.assertEqual((self.hl.spans, dimmed(self.edit)), ([], []))
+
+    def test_long_text_is_checked_on_a_worker(self) -> None:
+        text = (CITED + " ") * 401
+        self.assertGreater(len(text), C.SKIP_WORKER_CHARS)
+        self.edit.setPlainText(text)
+        self.hl.check_now()
+        self.assertEqual(self.hl.spans, [])  # not yet: the worker is still on it
+        self.type_at(0, "New. ")              # and its answer is stale before it arrives
+        deadline = time.monotonic() + 5
+        while self.hl._busy and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.005)
+        self.assertEqual(self.hl.spans, [])
+        self.hl.check_now()
+        deadline = time.monotonic() + 5
+        while not self.hl.spans and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.005)
+        self.assertEqual(len(self.hl.spans), 401)
+        self.assertNotEqual(self.calls[-1][1], threading.current_thread().name)
+
+    def test_settings_and_tint_changes(self) -> None:
+        options = []
+        self.result = lambda text, **o: options.append(o) or fake_analyse(text)
+        self.edit.setPlainText(CITED)
+        self.hl.check_now()
+        self.settings.set("skip_citations", False)
+        self.assertEqual(options[-1], {"skip_citations": False, "skip_urls": True})
+        self.settings.set("reading_tint", "blue")
+        self.theme.refresh()
+        self.assertEqual(dimmed(self.edit)[0][1], self.theme.reading_colors()["skipped"].name())
+
+
+class PronounceMenuTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.edit = C.ComposeEdit(make_theme())
+        self.edit.setPlainText("They measured fMRI responses, e.g. in V1.")
+
+    def caret(self, pos: int, anchor: int | None = None) -> str:
+        c = QTextCursor(self.edit.document())
+        c.setPosition(pos if anchor is None else anchor)
+        if anchor is not None:
+            c.setPosition(pos, QTextCursor.MoveMode.KeepAnchor)
+        self.edit.setTextCursor(c)
+        return self.edit.pronounce_target()
+
+    def test_word_at_the_caret_or_a_short_selection(self) -> None:
+        text = self.edit.toPlainText()
+        self.assertEqual(self.caret(text.index("fMRI") + 2), "fMRI")
+        self.assertEqual(self.caret(text.index("fMRI") + 4), "fMRI")  # just after it
+        self.assertEqual(self.caret(text.index("e.g") + 1), "e.g")
+        self.assertEqual(self.caret(text.index("V1") + 2), "V1")
+        self.assertEqual(self.caret(text.index("fMRI"), text.index("responses") + 9), "fMRI responses")
+        self.edit.setPlainText("word " * 30)
+        self.assertEqual(self.caret(0, 150), "")  # longer than 100 characters
+        self.edit.setPlainText("a  b")
+        self.assertEqual(self.caret(2), "")
+
+    def test_the_menu_starts_with_the_item(self) -> None:
+        asked = []
+        self.edit.pronunciationRequested.connect(asked.append)
+        text = self.edit.toPlainText()
+        self.caret(text.index("fMRI") + 1)
+        menu = self.edit.context_menu(QPoint(5, 5))
+        actions = menu.actions()
+        self.assertEqual(actions[0].text(), "Change how “fMRI” is said…")
+        self.assertTrue(actions[1].isSeparator())  # then Qt's own items
+        self.assertGreater(len(actions), 3)
+        actions[0].trigger()
+        self.assertEqual(asked, ["fMRI"])
+        self.edit.setPlainText("   ")
+        self.assertFalse(any("is said" in a.text() for a in self.edit.context_menu(QPoint(1, 1)).actions()))
+        self.assertEqual(C.pronounce_label("x" * 60), "Change how “" + "x" * 19 + "…" + "x" * 19 + "” is said…")
+
+
+
+class PronounceWindowTests(WindowCase):
+    def test_the_window_passes_it_on(self) -> None:
+        asked = []
+        self.win.pronunciationRequested.connect(asked.append)
+        self.win.edit.pronunciationRequested.emit("ibid.")
+        self.assertEqual(asked, ["ibid."])
+        self.assertIsInstance(self.win.highlighter, C.SkipHighlighter)
+
+    def test_a_file_reading_opens_the_box_empty(self) -> None:
+        doc = Document.from_raw("Body of the file. It is long.")
+        doc.source = SimpleNamespace(kind="file", path="C:/x.pdf", title="x")
+        self.open(C.reading_prefill(doc, 1))
+        self.assertEqual(self.win.edit.toPlainText(), "")
 
 
 if __name__ == "__main__":

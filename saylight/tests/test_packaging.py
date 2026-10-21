@@ -457,3 +457,43 @@ class SignInEntryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentsPackagingTests(unittest.TestCase):
+    """1.3: pypdf ships (and only pypdf), and Saylight is listed under Open with without becoming a default app."""
+
+    def test_pypdf_is_pinned_everywhere_it_is_installed(self):
+        self.assertIn("pypdf==6.14.2", _read(os.path.join(REPO, "requirements.txt")).splitlines())
+        zip_script = _read(os.path.join(REPO, "scripts", "build_python_zip.py"))
+        self.assertRegex(zip_script, r"\npypdf>=6\.14\.2,<7\n")
+
+    def test_the_spec_bundles_pypdf_and_leaves_out_pillow_and_cryptography(self):
+        spec = _read(os.path.join(PACKAGING, "saylight.spec"))
+        self.assertIn('collect_submodules("pypdf")', spec)
+        excludes = spec[spec.index("EXCLUDES = ["):spec.index("]", spec.index("EXCLUDES = ["))]
+        for name in ('"PIL"', '"cryptography"'):
+            self.assertIn(name, excludes)
+
+    def test_open_with_only_lists_saylight(self):
+        iss = _read(os.path.join(PACKAGING, "saylight.iss"))
+        from saylight.documents.loader import SUPPORTED
+        for ext in SUPPORTED:
+            if ext == ".markdown":  # opens from Saylight, but isn't listed: Windows would ask "Pick an app" for it
+                self.assertNotIn(rf'Subkey: "Software\Classes\{ext}\OpenWithProgids"', iss)
+            else:
+                self.assertIn(rf'Subkey: "Software\Classes\{ext}\OpenWithProgids"', iss)
+        # A default app would set an extension's own default value or its UserChoice; neither is ever written.
+        self.assertNotRegex(iss, r'Software\\Classes\\\.\w+"; ValueType: string; ValueName: ""')
+        self.assertNotIn("UserChoice", "\n".join(ln for ln in iss.splitlines() if not ln.lstrip().startswith(";")))
+        self.assertIn(r'Software\Classes\{#ProgId}\shell\open\command', iss)
+        self.assertIn(r'"""{app}\{#AppExe}"" ""%1"""', iss)
+        self.assertIn("uninsdeletekey", iss)
+
+    def test_the_test_install_has_its_own_progid(self):
+        ident = mtc.read_identity()
+        self.assertNotEqual(ident["test"]["ProgId"], ident["real"]["ProgId"])
+        self.assertEqual(ident["real"]["ProgId"], "Saylight.Document")
+
+    def test_the_test_copy_gets_its_own_open_with_pipe(self):
+        from saylight import single_instance
+        self.assertEqual(single_instance.SERVER_BASE, mtc.read_identity()["real"]["OpenPipe"])

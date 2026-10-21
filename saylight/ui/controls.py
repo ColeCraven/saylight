@@ -39,6 +39,24 @@ G_PASTE = ""
 G_DOWNLOAD = ""
 G_OPEN = ""      # OpenInNewWindow
 G_CHEVRON = ""   # ChevronRight
+G_MORE = ""
+G_OPEN_FILE = ""   # FolderOpen (G_OPEN is OpenInNewWindow, for links)
+G_DOCUMENT = ""
+G_SAVE = ""
+G_DONE = ""
+G_FOLDER = ""
+G_SPEECH = ""
+G_HISTORY = ""
+G_LOCK = ""
+G_EYE = ""         # show password
+G_EYE_OFF = ""     # hide password
+G_TEST = ""        # a speaker, not Play
+G_DELETE = ""
+G_FIND = ""
+G_IMPORT = ""
+G_EXPORT = ""
+G_CANCEL = ""
+G_ARROW = ""       # word -> said as
 
 TRANSPARENT = QColor(0, 0, 0, 0)
 
@@ -60,7 +78,10 @@ def draw_glyph(p: QPainter, rect: QRectF, glyph: str, font, color: QColor, dx: f
 Part = tuple[str, str]  # ("text", "..."), ("key", "Ctrl"), ("glyph", G_PLAY): a round chip with an icon,
 #                         or ("action", "type"): a clickable chip from ACTION_PARTS
 CAP_H = {"small": 16, "body": 18, "message": 20}  # keycap and glyph-chip height in DIP for each text role
-ACTION_PARTS = {"type": (G_TYPE, "Type or paste text"), "undo": (G_UNDO, "Undo")}  # key: (glyph, label)
+# key: (glyph, label). "continue" is always given its label when painted ("Continue Smith 2024 from page 14").
+ACTION_PARTS = {"type": (G_TYPE, "Type or paste text"), "undo": (G_UNDO, "Undo"),
+                "open": (G_OPEN_FILE, "Open a file"), "continue": (G_HISTORY, "Continue"),
+                "password": (G_LOCK, "Enter password"), "retry": (G_RETRY, "Try again")}
 
 
 class ActionState(NamedTuple):
@@ -85,20 +106,26 @@ def _keycap_width(theme, label: str) -> float:
     return max(float(theme.px(20)), w)
 
 
-def _part_width(theme, kind: str, s: str, role: str) -> float:
+def action_label(key: str, labels: dict[str, str] | None = None) -> str:
+    """An action chip's label: the override in `labels`, else its ACTION_PARTS label."""
+    return (labels or {}).get(key) or ACTION_PARTS[key][1]
+
+
+def _part_width(theme, kind: str, s: str, role: str, labels: dict[str, str] | None = None) -> float:
     if kind == "key":
         return _keycap_width(theme, s)
     if kind == "glyph":
         return float(theme.px(CAP_H.get(role, 18)))
     if kind == "action":  # glyph at +10, label at +32, 10 of right padding
-        return theme.px(32) + QFontMetricsF(theme.font(role)).horizontalAdvance(ACTION_PARTS[s][1]) + theme.px(10)
+        return theme.px(32) + QFontMetricsF(theme.font(role)).horizontalAdvance(action_label(s, labels)) + theme.px(10)
     return QFontMetricsF(theme.font(role)).horizontalAdvance(s)
 
 
-def measure_parts(theme, parts: list[Part], *, role: str = "body") -> float:
+def measure_parts(theme, parts: list[Part], *, role: str = "body", labels: dict[str, str] | None = None) -> float:
+    """The parts' width on one line; `labels` overrides action chip labels by key, as in paint_parts."""
     w = 0.0
     for i, (kind, s) in enumerate(parts):
-        w += _part_width(theme, kind, s, role)
+        w += _part_width(theme, kind, s, role, labels)
         if kind != "text" and i + 1 < len(parts) and parts[i + 1][0] != "text":
             w += theme.px(4)
     return w
@@ -107,12 +134,13 @@ def measure_parts(theme, parts: list[Part], *, role: str = "body") -> float:
 def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, parts: list[Part],
                 color: QColor, *, role: str = "body", caps: tuple[QColor, QColor, QColor] | None = None,
                 actions: dict[str, ActionState] | None = None, disabled: QColor | None = None,
-                hits: dict[str, QRectF] | None = None) -> float:
+                hits: dict[str, QRectF] | None = None, labels: dict[str, str] | None = None) -> float:
     """Paint text with inline keycaps and chips on one line; returns the x after the last part.
 
     `caps` is (fill, stroke, ink) for the keycaps and chips; the app-theme keycap tokens by default.
     `actions` gives each action chip's state, `disabled` the ink of a disabled one (TextDisabled by default),
-    and `hits`, when given, receives each action chip's rect by key."""
+    `hits`, when given, receives each action chip's rect by key, and `labels` overrides action chip labels by key
+    (the Continue chip names its file)."""
     font = theme.font(role)
     fm = QFontMetricsF(font)
     baseline = line_top + (line_h - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
@@ -120,7 +148,7 @@ def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, pa
     cap_h = theme.px(CAP_H.get(role, 18))
     fill, stroke, ink = caps or (theme.color("KeycapFill"), theme.color("KeycapStroke"), theme.color("TextPrimary"))
     for i, (kind, s) in enumerate(parts):
-        w = _part_width(theme, kind, s, role)
+        w = _part_width(theme, kind, s, role, labels)
         if kind == "text":
             p.setFont(font)
             p.setPen(color)
@@ -129,7 +157,7 @@ def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, pa
             state = (actions or {}).get(s, ActionState())
             r = QRectF(x, mid - (cap_h + theme.px(4)) / 2, w, cap_h + theme.px(4))
             _paint_action(p, theme, r, baseline, s, state, (fill, stroke, ink), font,
-                          disabled or theme.color("TextDisabled"))
+                          disabled or theme.color("TextDisabled"), action_label(s, labels))
             if hits is not None:
                 hits[s] = r
         else:
@@ -158,10 +186,10 @@ def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, pa
 
 
 def _paint_action(p: QPainter, t, r: QRectF, baseline: float, key: str, state: ActionState,
-                  caps: tuple[QColor, QColor, QColor], font, disabled_ink: QColor) -> None:
+                  caps: tuple[QColor, QColor, QColor], font, disabled_ink: QColor, label: str) -> None:
     """An action chip: keycap colours, a 16 DIP glyph and the label on the line's baseline."""
     fill, stroke, ink = caps
-    glyph, label = ACTION_PARTS[key]
+    glyph = ACTION_PARTS[key][0]
     hover, pressed = (state.hover, state.pressed) if state.enabled else (0.0, 0.0)
     face = fill
     if not t.high_contrast:
@@ -934,6 +962,7 @@ class ProgressBar(Control):
         self.thickness = Tween(self, theme, 0.0, FAST)
         self.dim = Tween(self, theme, 0.0, MEDIUM)  # 1 → played drawn in ProgressInactive, no buffer (stopped)
         self.starts: list[float] = []     # sentence start fractions
+        self.marks: list[float] | None = None  # the ticks to draw instead of the sentence starts (page starts)
         self.label_fn: Callable[[int], str] | None = None
         self.interactive = False
         self._hover_x: float | None = None
@@ -1037,8 +1066,10 @@ class ProgressBar(Control):
             gap = t.k * 2
             surface = with_alpha(t.color("Surface"), hv)
             last_x = -1e9
-            for s in self.starts[1:]:
+            for s in (self.marks if self.marks is not None else self.starts[1:]):
                 x = s * w
+                if x <= 0 or x >= w:
+                    continue
                 if x - last_x < t.k * 4:
                     continue
                 last_x = x
@@ -1272,18 +1303,50 @@ class FadeLabel(QWidget):
 
 # --- Settings page controls --------------------------------------------------------------------
 
+TOGGLE_H = 40     # DIP: a settings row
+DESCRIBED_H = 52  # DIP: a row with a detail line under its label
+
+
+def _baseline(fm: QFontMetricsF, top: float, height: float) -> float:
+    """The baseline that centres one line of `fm` text in the band from `top`, `height` tall."""
+    return top + (height - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
+
+
 class ToggleRow(Control):
-    """A full-width settings row: label on the left, Fluent toggle switch on the right."""
+    """A full-width settings row: label on the left, Fluent toggle switch on the right.
+
+    A described row (made with a `detail`) has a line in the small role under the label and is DESCRIBED_H tall;
+    a new detail crossfades in 120 ms. The detail is also the row's accessible description."""
 
     toggled = Signal(bool)
 
-    def __init__(self, theme, tips, label: str, parent: QWidget | None = None, tooltip: str = ""):
-        super().__init__(theme, tips, parent, tooltip)
+    def __init__(self, theme, tips, label: str, parent: QWidget | None = None, tooltip: str = "", *,
+                 detail: str = "", focusable: bool = False):
+        super().__init__(theme, tips, parent, tooltip, focusable=focusable)
         self.label = label
+        self.described = bool(detail)  # fixed when made, so the row's height never changes with its detail
+        self.detail = detail
+        self._prev_detail = ""
         self.checked = False
         self.knob = Tween(self, theme, 0.0, MEDIUM, decelerate())
+        self.detail_fade = Tween(self, theme, 1.0, 120)
         self.clicked.connect(lambda: self.set_checked(not self.checked, emit=True))
         self.setAccessibleName(f"{label}: off")
+        if detail:
+            self.setAccessibleDescription(detail)
+
+    def row_height(self) -> int:
+        """The face's height: DESCRIBED_H with a detail line, TOGGLE_H without (place() adds the ring's room)."""
+        return self.theme.px(DESCRIBED_H if self.described else TOGGLE_H)
+
+    def set_detail(self, text: str) -> None:
+        if text == self.detail:
+            return
+        self._prev_detail, self.detail = self.detail, text
+        self.detail_fade.snap(0.0)
+        self.detail_fade.to(1.0)
+        self.setAccessibleDescription(text)
+        self.update()
 
     def set_checked(self, on: bool, *, emit: bool = False) -> None:
         if on != self.checked:
@@ -1295,11 +1358,25 @@ class ToggleRow(Control):
         elif self.knob.target != (1.0 if on else 0.0):
             self.knob.snap(1.0 if on else 0.0)
 
+    def _paint_detail(self, p: QPainter, text: str, top: float, right: float, opacity: float) -> None:
+        if not text or opacity <= 0:
+            return
+        t = self.theme
+        font = t.font("small")
+        fm = QFontMetricsF(font)
+        x = self.face().left() + t.px(10)
+        p.setOpacity(opacity)
+        p.setFont(font)
+        p.setPen(t.color("TextSecondary"))
+        p.drawText(QPointF(x, _baseline(fm, top, t.px(16))),
+                   fm.elidedText(text, Qt.TextElideMode.ElideRight, max(0.0, right - x)))
+        p.setOpacity(1.0)
+
     def paintEvent(self, _event) -> None:
         t = self.theme
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect())
+        r = self.face()
         fill = mix(mix(TRANSPARENT, t.color("SubtleHover"), self.hover.value), t.color("SubtlePressed"),
                    self.press.value)
         if fill.alpha():
@@ -1307,16 +1384,26 @@ class ToggleRow(Control):
             p.setBrush(fill)
             p.drawRoundedRect(r, t.px(4), t.px(4))
         hc_outline(p, t, r, t.px(4), self.hover.value)
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, r, t.px(4))
+        # Switch: 40 x 20 track, 12 DIP knob (14 on hover), slides 167 ms; centred on the whole row.
+        k = self.knob.value
+        tw, th = t.k * 40, t.k * 20
+        track = QRectF(r.right() - t.px(10) - tw, r.top() + (r.height() - th) / 2, tw, th)
         font = t.font("body")
         fm = QFontMetricsF(font)
         p.setFont(font)
         p.setPen(t.color("TextPrimary"))
-        baseline = (self.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
-        p.drawText(QPointF(t.px(10), baseline), self.label)
-        # Switch: 40 x 20 track, 12 DIP knob (14 on hover), slides 167 ms.
-        k = self.knob.value
-        tw, th = t.k * 40, t.k * 20
-        track = QRectF(self.width() - t.px(10) - tw, (self.height() - th) / 2, tw, th)
+        if self.described:  # label 20 + 2 + detail 16, centred as one block
+            top = r.top() + (r.height() - t.px(38)) / 2
+            p.drawText(QPointF(r.left() + t.px(10), _baseline(fm, top, t.px(20))), self.label)
+            f = self.detail_fade.value
+            right = track.left() - t.px(12)
+            if f < 1.0:
+                self._paint_detail(p, self._prev_detail, top + t.px(22), right, 1.0 - f)
+            self._paint_detail(p, self.detail, top + t.px(22), right, f)
+        else:
+            p.drawText(QPointF(r.left() + t.px(10), _baseline(fm, r.top(), r.height())), self.label)
         on_fill = mix(t.color("Accent"), t.color("AccentHover"), self.hover.value)
         if k < 1.0:
             p.setOpacity(1.0 - k)
@@ -1344,9 +1431,11 @@ class Segmented(Control):
 
     selected = Signal(int)
 
-    def __init__(self, theme, tips, items: list[tuple], parent: QWidget | None = None, name: str = ""):
-        """`items`: (label, font px at k=1, tooltip[, font family]) per segment."""
-        super().__init__(theme, tips, parent, tooltip=self._tip)
+    def __init__(self, theme, tips, items: list[tuple], parent: QWidget | None = None, name: str = "", *,
+                 focusable: bool = False):
+        """`items`: (label, font px at k=1, tooltip[, font family]) per segment. A focusable one moves its
+        selection with the arrow keys, Home and End, like a radio group."""
+        super().__init__(theme, tips, parent, tooltip=self._tip, focusable=focusable)
         self.items = items
         self.index = 0
         self._hover_i: int | None = None
@@ -1360,11 +1449,26 @@ class Segmented(Control):
             self.setAccessibleName(f"{self.accessibleName().split(':')[0]}: {self.items[i][2]}")
             self.update()
 
+    def keyPressEvent(self, event) -> None:
+        steps = {Qt.Key.Key_Left: -1, Qt.Key.Key_Up: -1, Qt.Key.Key_Right: 1, Qt.Key.Key_Down: 1}
+        last = len(self.items) - 1
+        if self.focusable and event.key() in steps:
+            i = max(0, min(last, self.index + steps[event.key()]))
+        elif self.focusable and event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End):
+            i = 0 if event.key() == Qt.Key.Key_Home else last
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+        if i != self.index and self.isEnabled():
+            self.set_index(i)
+            self.selected.emit(i)
+
     def _seg_w(self) -> float:
-        return self.width() / max(1, len(self.items))
+        return self.face().width() / max(1, len(self.items))
 
     def _index_at(self, x: float) -> int:
-        return max(0, min(len(self.items) - 1, int(x / self._seg_w())))
+        return max(0, min(len(self.items) - 1, int((x - self.face().left()) / self._seg_w())))
 
     def _tip(self) -> str:
         return self.items[self._hover_i][2] if self._hover_i is not None else ""
@@ -1393,13 +1497,17 @@ class Segmented(Control):
         t = self.theme
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        face = self.face()
+        r = face.adjusted(0.5, 0.5, -0.5, -0.5)
         p.setPen(QPen(t.color("ControlStroke"), 0))
         p.setBrush(t.color("SegmentTrack"))
         p.drawRoundedRect(r, t.px(4), t.px(4))
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, face, t.px(4))
         sw = self._seg_w()
+        x0, top, h = face.left(), face.top(), face.height()
         inset = t.px(2)
-        sel = QRectF(self.bar.value * sw, 0, sw, self.height()).adjusted(inset, inset, -inset, -inset)
+        sel = QRectF(x0 + self.bar.value * sw, top, sw, h).adjusted(inset, inset, -inset, -inset)
         p.setPen(QPen(t.color("ControlStroke"), 0))
         p.setBrush(t.color("SegmentSelected"))
         p.drawRoundedRect(sel, t.px(3), t.px(3))
@@ -1414,11 +1522,11 @@ class Segmented(Control):
                           bar_h / 2, bar_h / 2)
         # Every label sits on the body font's baseline, so mixed faces and sizes line up.
         fmb = QFontMetricsF(t.font("body"))
-        baseline = (self.height() - 3 * t.k - (fmb.ascent() + fmb.descent())) / 2 + fmb.ascent()
+        baseline = top + (h - 3 * t.k - (fmb.ascent() + fmb.descent())) / 2 + fmb.ascent()
         for i, item in enumerate(self.items):
             label, size = item[0], item[1]
             if self._hover_i == i and i != self.index and self.hover.value > 0:
-                plate = QRectF(i * sw, 0, sw, self.height()).adjusted(inset, inset, -inset, -inset)
+                plate = QRectF(x0 + i * sw, top, sw, h).adjusted(inset, inset, -inset, -inset)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(with_alpha(t.color("SegmentSelected"), 0.6 * self.hover.value))
                 p.drawRoundedRect(plate, t.px(3), t.px(3))
@@ -1430,7 +1538,7 @@ class Segmented(Control):
             fm = QFontMetricsF(font)
             p.setFont(font)
             p.setPen(t.color("TextPrimary") if i == self.index else t.color("TextSecondary"))
-            p.drawText(QPointF(i * sw + (sw - fm.horizontalAdvance(label)) / 2, baseline), label)
+            p.drawText(QPointF(x0 + i * sw + (sw - fm.horizontalAdvance(label)) / 2, baseline), label)
 
 
 class SwatchRow(Control):
@@ -1528,26 +1636,30 @@ class SwatchRow(Control):
 
 class NavRow(Control):
     """A full-width settings row that opens something: label at the optical inset, an optional detail
-    right-aligned before the glyph (a chevron by default), whose right edge lines up with the toggle switches."""
+    right-aligned before the glyph (a chevron by default), whose right edge lines up with the toggle switches.
+    The whole row is the target; the detail is also its accessible description."""
 
     def __init__(self, theme, tips, label: str, parent: QWidget | None = None, tooltip: str = "", *,
-                 glyph: str = G_CHEVRON, detail: str = ""):
-        super().__init__(theme, tips, parent, tooltip)
+                 glyph: str = G_CHEVRON, detail: str = "", focusable: bool = False):
+        super().__init__(theme, tips, parent, tooltip, focusable=focusable)
         self.label = label
         self.glyph = glyph
         self.detail = detail
         self.setAccessibleName(label)
+        if detail:
+            self.setAccessibleDescription(detail)
 
     def set_detail(self, text: str) -> None:
         if text != self.detail:
             self.detail = text
+            self.setAccessibleDescription(text)
             self.update()
 
     def paintEvent(self, _event) -> None:
         t = self.theme
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect())
+        r = self.face()
         fill = mix(mix(TRANSPARENT, t.color("SubtleHover"), self.hover.value), t.color("SubtlePressed"),
                    self.press.value)
         if fill.alpha():
@@ -1555,15 +1667,16 @@ class NavRow(Control):
             p.setBrush(fill)
             p.drawRoundedRect(r, t.px(4), t.px(4))
         hc_outline(p, t, r, t.px(4), self.hover.value)
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, r, t.px(4))
         enabled = self.isEnabled()
         font = t.font("body")
         fm = QFontMetricsF(font)
         p.setFont(font)
         p.setPen(t.color("TextPrimary" if enabled else "TextDisabled"))
-        baseline = (self.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
-        p.drawText(QPointF(t.px(10), baseline), self.label)
+        p.drawText(QPointF(r.left() + t.px(10), _baseline(fm, r.top(), r.height())), self.label)
         g = t.px(12)
-        glyph_rect = QRectF(self.width() - t.px(10) - g, (self.height() - g) / 2, g, g)
+        glyph_rect = QRectF(r.right() - t.px(10) - g, r.top() + (r.height() - g) / 2, g, g)
         ink = t.color("TextSecondary" if enabled else "TextDisabled")
         draw_glyph(p, glyph_rect, self.glyph, t.font("icon12"), ink)
         if self.detail:
@@ -1571,8 +1684,8 @@ class NavRow(Control):
             sfm = QFontMetricsF(small)
             p.setFont(small)
             p.setPen(ink)
-            sb = (self.height() - (sfm.ascent() + sfm.descent())) / 2 + sfm.ascent()
-            p.drawText(QPointF(glyph_rect.left() - t.px(8) - sfm.horizontalAdvance(self.detail), sb), self.detail)
+            x = glyph_rect.left() - t.px(8) - sfm.horizontalAdvance(self.detail)
+            p.drawText(QPointF(x, _baseline(sfm, r.top(), r.height())), self.detail)
 
 
 class LinkText(Control):

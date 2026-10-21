@@ -20,6 +20,7 @@ REQUIREMENTS = """\
 # What Saylight needs from PyPI (Install Saylight.cmd installs these for you).
 edge-tts>=7.3.1,<8
 PySide6-Essentials>=6.12,<7
+pypdf>=6.14.2,<7
 """
 
 INSTALL_CMD = r"""@echo off

@@ -11,7 +11,7 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
-from .controls import FadeLabel, Segmented, SwatchRow, ToggleRow
+from .controls import FadeLabel, Segmented, SwatchRow
 from .motion import MEDIUM, Tween, decelerate, with_alpha
 
 EDGE = 12        # the plate inset
@@ -74,11 +74,11 @@ class SettingsPage:
 
 
 class DisplayPage(SettingsPage):
-    """Reading display: text size, font, spacing, highlight and background, and the Reading aloud toggles."""
+    """Reading display: text size, font, spacing, highlight and background. (What's read aloud is on Voice.)"""
 
     title = "Reading display"
     tooltip = "Text size, font, spacing, highlight and background"
-    KEYS = ("text_size", "reading_font", "spacing", "highlight", "reading_tint", "skip_citations", "skip_urls")
+    KEYS = ("text_size", "reading_font", "spacing", "highlight", "reading_tint")
 
     def __init__(self, host: QWidget, ctl) -> None:
         super().__init__(host, ctl)
@@ -96,33 +96,21 @@ class DisplayPage(SettingsPage):
         self.lbl_bg = self.label("Background")
         self.swatches = SwatchRow(t, tips, host)
         self.lbl_bg_name = FadeLabel(t, "small", "TextSecondary", host)  # names the chosen background
-        self.lbl_group = FadeLabel(t, "small", "TextSecondary", host)
-        self.lbl_group.set_text("Reading aloud · applies from the next reading", animate=False)
-        self.row_citations = ToggleRow(t, tips, "Skip citations", host,
-                                       tooltip="Leave out references such as (Smith et al., 2019) and [12]. "
-                                               "Applies from the next reading.")
-        self.row_links = ToggleRow(t, tips, "Skip links and DOIs", host,
-                                   tooltip="Say “link” instead of reading web addresses and DOIs. "
-                                           "Applies from the next reading.")
         s = self.settings
         for key, _lbl, seg, opts in self.option_rows:
             seg.selected.connect(lambda i, key=key, opts=opts: s.set(key, opts[i][0]))
         self.swatches.selected.connect(lambda key: s.set("reading_tint", key))
-        self.row_citations.toggled.connect(lambda on: s.set("skip_citations", on))
-        self.row_links.toggled.connect(lambda on: s.set("skip_urls", on))
         s.changed.connect(lambda key: self.sync() if key in self.KEYS else None)
 
     def widgets(self) -> list[QWidget]:
         out: list[QWidget] = []
         for _key, lbl, seg, _opts in self.option_rows:
             out += [lbl, seg]
-        return out + [self.lbl_bg, self.swatches, self.lbl_bg_name, self.lbl_group, self.row_citations,
-                      self.row_links]
+        return out + [self.lbl_bg, self.swatches, self.lbl_bg_name]
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
         px = self.theme.px
         top = y
-        row_w = w - 2 * px(EDGE)
         right = w - px(EDGE) - px(10)  # the toggle switches' right edge
         col = px(COLUMN)
         for _key, lbl, seg, _opts in self.option_rows:
@@ -135,13 +123,6 @@ class DisplayPage(SettingsPage):
         name_x = self.swatches.x() + sw_w + px(8)
         self.lbl_bg_name.setGeometry(name_x, y + px(12), x + right - name_x, px(16))
         y += px(PITCH)
-        self.rules = [y + px(4)]
-        y += px(9)
-        self.lbl_group.setGeometry(x + px(OPTICAL), y, w - 2 * px(OPTICAL), px(20))
-        y += px(22)
-        for row in (self.row_citations, self.row_links):
-            row.setGeometry(x + px(EDGE), y, row_w, px(40))
-            y += px(PITCH)
         return y - px(2) + px(EDGE) - top
 
     def sync(self) -> None:
@@ -152,8 +133,6 @@ class DisplayPage(SettingsPage):
             seg.set_index(keys.index(value) if value in keys else 0)
         self.swatches.set_items(self.ctl.tint_items(), s.get("reading_tint"))
         self.lbl_bg_name.set_text(TINT_SHORT.get(s.get("reading_tint"), ""))
-        self.row_citations.set_checked(bool(s.get("skip_citations")))
-        self.row_links.set_checked(bool(s.get("skip_urls")))
 
 
 class TabBar(Segmented):

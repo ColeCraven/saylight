@@ -13,7 +13,8 @@ Two ways in:
 
 The checks: every saylight module imports; Qt finds its windows platform, ico and network-information plugins;
 the fonts and the tray are there; certifi and Windows' certificate store load; edge-tts ships as plain .py
-files; no Python or Qt DLL is loaded from outside the build. With network: edge-tts lists voices and
+files; a small PDF made by the test opens through the build's own pypdf; no Python or Qt DLL is loaded from
+outside the build. With network: edge-tts lists voices and
 synthesises one fixed word into memory, and Windows' MCI opens and measures that audio with the volume at 0
 without playing it. The report holds counts, versions and file names from the build, never user text.
 """
@@ -76,6 +77,26 @@ def _loaded_modules() -> list[str]:
     return paths
 
 
+def _tiny_pdf() -> bytes:
+    """A one-page PDF with one sentence in Helvetica, built byte by byte (no tools needed)."""
+    stream = b"BT /F1 12 Tf 72 720 Td (Saylight reads this sentence.) Tj ET"
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % off for off in offsets)
+    return out + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+
+
 def _mci(command: str, buf=None) -> int:
     winmm = ctypes.WinDLL("winmm")
     winmm.mciSendStringW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.UINT, wintypes.HANDLE)
@@ -127,7 +148,7 @@ def main(argv: list[str]) -> int:
                 importlib.import_module(name)
             except Exception as e:
                 failed[name] = type(e).__name__
-        for name in ("edge_tts", "aiohttp", "certifi"):
+        for name in ("edge_tts", "aiohttp", "certifi", "pypdf"):
             importlib.import_module(name)
         if failed:
             raise ImportError(f"{len(failed)} modules failed: {failed}")
@@ -216,6 +237,29 @@ def main(argv: list[str]) -> int:
             raise RuntimeError(f"unexpected {present}; separate Qt DLLs {qt}")
         return {"qt_dlls_separate": qt}
     check("contents", contents)
+
+    def documents():
+        """A PDF made here (one fixed sentence, never the user's) read by Saylight's reader, pypdf from the build."""
+        import importlib.util
+
+        import pypdf
+        from saylight.documents.loader import read_file
+        folder = os.environ.get("TEMP") or _dist_dir()
+        path = os.path.join(folder, f"selftest_{os.getpid()}.pdf")
+        with open(path, "wb") as f:
+            f.write(_tiny_pdf())
+        try:
+            raw = read_file(path)
+        finally:
+            os.remove(path)
+        if "Saylight reads this sentence." not in raw.text or raw.pages != 1:
+            raise RuntimeError(f"read {len(raw.text)} characters from {raw.pages} pages")
+        where = os.path.abspath(pypdf.__file__)
+        if not where.startswith(_internal_dir()):
+            raise RuntimeError("pypdf was loaded from outside the build")
+        return {"pypdf": pypdf.__version__, "characters": len(raw.text),
+                "cryptography": importlib.util.find_spec("cryptography") is not None}
+    check("documents", documents)
 
     mp3: list[bytes] = []
     if offline:

@@ -12,9 +12,22 @@ start(), or on the first event-loop pass if the app never calls it. The synth ge
 multiplier (0.95); a synth with limits_for(voice) sets the chunk sizes, and one with new_reading() hears
 when each reading starts. Timers come from an injectable factory so tests can drive them with a fake
 clock. Never logs text, only counts and ids.
+
+Files come in through begin_opening() (the Opening state, which keeps the current document until the new
+one is built), then read_document() or opening_failed() (an open notice that stays until the next action).
+The optional builder, resume store and pronunciation list are duck-typed too:
+* builder(raw) builds a Document with this reading's options; if it also has start(token, raw), text over
+  BUILD_ASYNC_CHARS is built on its worker instead and comes back through read_document(..., token=token);
+* resume has lookup(), remember() and forget() (resume.ResumeStore); it is used only while the
+  resume.enabled setting is on, and only for files;
+* pronunciations has current() (or is the list itself) and is used by the default builder.
 """
 
+import bisect
+import hashlib
 import logging
+import os
+import re
 import time
 from collections import Counter, deque
 from collections.abc import Callable
@@ -22,6 +35,7 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
+from .resume import ResumePoint
 from .text_model import ChunkPlan, ChunkTiming, Document, map_words, plan_chunks
 from .voices.base import DEFAULT_VOICE_ID
 
@@ -36,12 +50,15 @@ READY, READY_OFFLINE, SHORTCUT_UNAVAILABLE = "ready", "ready_offline", "shortcut
 COPYING, PREPARING, READING, WAITING, PAUSED = "copying", "preparing", "reading", "waiting", "paused"
 FINISHED, STOPPED, NOTHING_SELECTED = "finished", "stopped", "nothing_selected"
 ERROR_OFFLINE, ERROR_SERVICE, ERROR_PLAYBACK = "error_offline", "error_service", "error_playback"
+OPENING, OPEN_FAILED = "opening", "open_failed"
 
 IDLE = frozenset({READY, READY_OFFLINE, SHORTCUT_UNAVAILABLE})
 ERRORS = frozenset({ERROR_OFFLINE, ERROR_SERVICE, ERROR_PLAYBACK})
 RESTING = IDLE | ERRORS | {FINISHED, STOPPED}          # Nothing selected is an overlay on one of these
 SESSION = frozenset({PREPARING, READING, WAITING, PAUSED})  # a reading is running
-ACTIVE = SESSION | {COPYING}
+ACTIVE = SESSION | {COPYING, OPENING}
+_PLAYING = frozenset({PREPARING, READING, WAITING})
+OVERLAYS = frozenset({NOTHING_SELECTED, OPEN_FAILED})  # shown over the state underneath (see _underlying)
 
 LABELS = {
     READY: "Ready", READY_OFFLINE: "Offline", SHORTCUT_UNAVAILABLE: "Shortcut unavailable",
@@ -49,10 +66,16 @@ LABELS = {
     WAITING: "Preparing audio…", PAUSED: "Paused", FINISHED: "Finished", STOPPED: "Stopped",
     NOTHING_SELECTED: "Nothing selected", ERROR_OFFLINE: "Can't reach the voice service",
     ERROR_SERVICE: "Voice service error", ERROR_PLAYBACK: "Couldn't play audio",
+    OPENING: "Opening…", OPEN_FAILED: "Can't open this file",
 }
+# The open notice's label for each kind (LoadError kinds, plus "missing" for a file that has gone).
+OPEN_LABELS = {"password": "Password needed", "protected": "Can't open this PDF", "scanned": "No text to read",
+               "empty": "No text to read", "unsupported": "Can't read this file", "too_large": "File too large",
+               "corrupt": "Can't open this file", "io": "Can't open this file", "missing": "File not found"}
+OPEN_CRITICAL = frozenset({"corrupt", "io", "missing"})  # these beep as errors; the rest as cautions
 _PLAY_ACTIONS = {READY: "read", READY_OFFLINE: "read", SHORTCUT_UNAVAILABLE: "read", FINISHED: "read",
-                 STOPPED: "read", COPYING: "none", PREPARING: "pause", READING: "pause", WAITING: "pause",
-                 PAUSED: "resume"}  # errors: "retry"
+                 STOPPED: "read", COPYING: "none", OPENING: "none", PREPARING: "pause", READING: "pause",
+                 WAITING: "pause", PAUSED: "resume"}  # errors: "retry"
 _PREV_ACTIONS = {READING: "prev", WAITING: "prev", PAUSED: "prev", FINISHED: "read_last_again",
                  STOPPED: "read_from"}
 
@@ -80,6 +103,11 @@ MAX_CACHED_CHUNKS = 24        # ready chunks kept for Previous / jumps (bounded 
 DEFAULT_MS_PER_CHAR = 65.0    # length estimate at 1.0x before anything has been measured
 MPC_ALPHA = 0.3               # EMA weight of a new ms-per-character measurement
 MAX_TEXT_CHARS = 100_000      # typed or pasted text beyond this is not read
+OPEN_SHOW_MS = 150            # Opening is shown only after this long, so quick opens don't flicker
+BUILD_ASYNC_CHARS = 20_000    # text longer than this is built on the builder's worker, when it has one
+RESUME_SAVE_MS = 30_000       # a file's place is saved this often while reading (resume.enabled only)
+# Settings that change what is read aloud: the engine rebuilds the document when one changes.
+REBUILD_KEYS = frozenset({"skip_citations", "skip_urls", "read_references", "read_asides", "pronunciations.enabled"})
 
 
 def snap_speed(v: float) -> float:
@@ -100,6 +128,58 @@ def rate_string(v: float) -> str:
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def spoken_span(doc) -> tuple[int, int]:
+    """The stretch of the shown text that progress measures: the first sentence's start to the last's end.
+
+    Notes or a reference list that are shown but not read aloud follow the last sentence, so they never count
+    towards progress; citations skipped inside the span still do (they are short)."""
+    if doc is None or not doc.sentences:
+        return 0, 0
+    return doc.sentences[0].start, doc.sentences[-1].end
+
+
+def span_fraction(doc, offset: float) -> float:
+    """A shown offset as a fraction of the spoken span (0 to 1), for the progress bar and its marks."""
+    lo, hi = spoken_span(doc)
+    return _clamp((offset - lo) / (hi - lo), 0.0, 1.0) if hi > lo else 0.0
+
+
+def sentence_at_offset(doc, offset: int) -> int:
+    """The sentence at (or last before) a shown offset; the document's own method when it has one."""
+    find = getattr(doc, "sentence_at_offset", None)
+    if find is not None:
+        return _clamp(int(find(offset)), 0, len(doc.sentences) - 1)
+    starts = [s.start for s in doc.sentences]
+    return _clamp(bisect.bisect_right(starts, offset) - 1, 0, len(doc.sentences) - 1)
+
+
+def _say(sentence) -> str:
+    """What the voice gets for a sentence (its shown text unless the text model says otherwise)."""
+    return getattr(sentence, "say", None) or sentence.text
+
+
+def _page_of(doc, sentence: int) -> int:
+    """The page a sentence is on, or 0 when the document has no pages."""
+    page_of = getattr(doc, "page_of", None)
+    try:
+        page = page_of(sentence) if page_of is not None else None
+    except (IndexError, ValueError):
+        page = None
+    return int(page or 0)
+
+
+def _fingerprint(doc) -> str:
+    fingerprint = getattr(doc, "fingerprint", None)
+    return fingerprint() if fingerprint is not None else hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
+
+
+def _raw_len(raw) -> int:
+    return len(raw) if isinstance(raw, str) else len(getattr(raw, "text", "") or "")
+
+
+_NON_SPACE = re.compile(r"\S")
 
 
 class _QtTimer:
@@ -149,6 +229,8 @@ class ClearedReading:
     doc: Document
     sentence: int
     finished: bool
+    raw: object = None          # the input the document was built from (for rebuilds)
+    file: tuple | None = None   # (path, size, mtime_ns, fingerprint) of a file, for resume
 
 
 @dataclass
@@ -171,14 +253,17 @@ class Engine(QObject):
     notice = Signal(str)
     panelToggleRequested = Signal()
     mediaKeysWanted = Signal(bool)
+    openingCancelled = Signal(int)   # an opening (or a worker build) that will not be used: cancel its job
+    resumeApplied = Signal(int)      # a file continued from its saved place, at this sentence
 
     def __init__(self, *, synth, player, input_thread, settings, clock=time.monotonic, parent=None,
                  timer_factory: Callable[[Callable[[], None]], object] | None = None,
-                 beep: Callable[[str], None] | None = None):
+                 beep: Callable[[str], None] | None = None, builder=None, resume=None, pronunciations=None):
         super().__init__(parent)
         self._synth, self._player, self._input, self._settings = synth, player, input_thread, settings
         self._clock = clock
         self._beep = beep
+        self._builder, self._store, self._pronunciations = builder, resume, pronunciations
         make = timer_factory or (lambda callback: _QtTimer(self, callback))
         self._copy_show_timer = make(self._on_copy_show)
         self._copy_watchdog = make(self._on_copy_timeout)
@@ -192,9 +277,13 @@ class Engine(QObject):
         self._volume_timer = make(self._send_volume)
         self._retry_timer = make(self._on_retry_due)
         self._start_timer = make(self._auto_start)
+        self._open_show_timer = make(self._on_open_show)
+        self._resume_timer = make(self._on_resume_due)
+        self._rebuild_timer = make(self.rebuild)
         self._timers = (self._copy_show_timer, self._copy_watchdog, self._waiting_timer, self._seek_timer,
                         self._commit_timer, self._note_timer, self._overlay_timer, self._purge_timer,
-                        self._media_timer, self._volume_timer, self._retry_timer, self._start_timer)
+                        self._media_timer, self._volume_timer, self._retry_timer, self._start_timer,
+                        self._open_show_timer, self._resume_timer, self._rebuild_timer)
 
         # session
         self._doc: Document | None = None
@@ -213,6 +302,23 @@ class Engine(QObject):
         self._seek_target: int | None = None
         self._seek_ack: tuple[int, float] | None = None  # (ms, sent at): a seek of the loaded chunk no tick showed yet
         self._retry_due: dict[int, float] = {}
+        self._raw = None                       # what the document was built from (kept for rebuilds)
+        self._file: tuple | None = None        # (path, size, mtime_ns, fingerprint) when reading a file
+        self._resumed: tuple[int, bool] | None = None  # (sentence, exact) when this file continued
+        self._suffix: tuple[object, list[int]] | None = None  # (doc, spoken characters from each sentence)
+
+        # opening files, worker builds and open notices
+        self._open_token = 0                   # the last token handed out (tokens only grow)
+        self._open_live: int | None = None     # the token the Opening state waits for
+        self._open_kind = ""                   # "file", or "text" for a long selection built on the worker
+        self._open_title = ""                  # UI only, never logged
+        self._open_prev = READY                # the state under Opening
+        self._open_shown = False
+        self._open_progress = (0, 0)
+        self._rebuild_live: int | None = None  # the token of a rebuild running on the worker
+        self._read_section: str | None = None  # a section to read once the rebuild is in (from Finished)
+        self._fail_kind = ""
+        self._fail_title = ""
 
         # state
         self._state = READY
@@ -293,6 +399,17 @@ class Engine(QObject):
     @property
     def volume(self) -> int:
         return self._volume
+
+    @property
+    def raw(self):
+        """What the current document was built from: the text, or the LoadedDocument of a file."""
+        return self._raw
+
+    @property
+    def resumed(self) -> tuple[int, bool] | None:
+        """(sentence, exact) when the current file continued from its saved place, else None. Not exact means
+        the file changed since, so the place was found by its offset ("Continuing near page 14")."""
+        return self._resumed
 
     # --- Lifecycle -----------------------------------------------------------------------------
 
@@ -375,6 +492,9 @@ class Engine(QObject):
             self.prev()
 
     def _on_read_hotkey(self) -> None:
+        if self._state == OPENING:  # a new read replaces the file being opened
+            self._cancel_opening()
+        self._end_notice()
         state = self._state
         if state == COPYING:
             self._presses.append(_Press(ignored=True))
@@ -476,7 +596,8 @@ class Engine(QObject):
             self._cancel_copy()
 
     def _show_nothing_selected(self, reason: str) -> None:
-        self._rest = self._underlying()
+        self._clear_overlay()
+        self._rest = self._state
         self._reason = reason
         self._overlay_timer.start(NOTHING_SELECTED_MS)
         self._set_state(NOTHING_SELECTED)
@@ -484,16 +605,32 @@ class Engine(QObject):
         self.notice.emit("nothing_selected")
 
     def _clear_overlay(self) -> None:
+        """Drop Nothing selected or an open notice, without publishing (the caller does)."""
         if self._state == NOTHING_SELECTED:
             self._overlay_timer.stop()
             self._state = self._rest
+        elif self._state == OPEN_FAILED:
+            self._state = self._rest
+            self._fail_kind = self._fail_title = ""
 
     def _on_overlay_expired(self) -> None:
         if self._state == NOTHING_SELECTED:
             self._set_state(self._rest)
 
     def _underlying(self) -> str:
-        return self._rest if self._state == NOTHING_SELECTED else self._state
+        return self._rest if self._state in OVERLAYS else self._state
+
+    def _end_notice(self) -> None:
+        """Any action ends an open notice; the state underneath it carries on."""
+        if self._state == OPEN_FAILED:
+            self._clear_overlay()
+            self._publish()
+
+    @Slot()
+    def dismiss_notice(self) -> None:
+        """End an open notice (the panel calls this for its controls that don't reach the engine)."""
+        if not self._shut:
+            self._end_notice()
 
     # --- Input: typed text, Clear and Undo -----------------------------------------------------
 
@@ -506,14 +643,18 @@ class Engine(QObject):
         if self._shut or not text or not text.strip():
             return False
         text = text[:MAX_TEXT_CHARS]
-        doc = self._make_doc(text)
-        if not doc.sentences:
-            log.info("Nothing to read in %d typed characters", len(text))
-            return False
+        doc = None
+        if not self._builds_async(text):
+            doc = self._make_doc(text)
+            if not doc.sentences:
+                log.info("Nothing to read in %d typed characters", len(text))
+                return False
         for press in self._presses:  # a Ctrl+` copy still running must not replace this reading
             press.ignored = True
         if self._state == COPYING:
             self._cancel_copy(publish=False)
+        if self._state == OPENING:
+            self._cancel_opening(publish=False)
         self._clear_overlay()
         log.info("Reading typed text: %d characters", len(text))
         return self._new_session(text, doc)
@@ -533,12 +674,20 @@ class Engine(QObject):
             self._cancel_copy(publish=False)
         self._clear_overlay()
         doc = self._doc
-        token = ClearedReading(doc, self._cur, self._state == FINISHED) if doc is not None else None
+        token = None
+        if doc is not None:
+            under = self._open_prev if self._state == OPENING else self._state
+            token = ClearedReading(doc, self._cur, under == FINISHED, self._raw, self._file)
+            self._remember()  # with resume on, Clear saves the place first
         self._settle_speed()  # commit a waiting change now; its note no longer applies
         self._purge()
         self._mid_session = self._back_online = False
         self._reason = ""
-        self._set_state(self._base_idle())
+        if self._state == OPENING:  # the file being opened carries on; it now opens over Ready
+            self._open_prev = self._base_idle()
+            self._publish()
+        else:
+            self._set_state(self._base_idle())
         if token is not None:
             log.info("Cleared (%d sentences)", len(token.doc.sentences))
         return token
@@ -552,6 +701,7 @@ class Engine(QObject):
             return False
         self._clear_overlay()
         self._doc, self._time_left_value = token.doc, None
+        self._raw, self._file = token.raw, token.file
         self.sessionChanged.emit(self._doc)
         self._cur = self._floor = _clamp(token.sentence, 0, len(self._doc.sentences) - 1)
         self._played_any = False
@@ -568,6 +718,7 @@ class Engine(QObject):
         """Play/Pause: pause or resume a reading; Try again in an error; else nothing."""
         if self._shut:
             return
+        self._end_notice()
         state = self._underlying()
         if state in (PREPARING, READING, WAITING):
             self._pause()
@@ -581,6 +732,7 @@ class Engine(QObject):
         """Pause a reading that is preparing, playing or waiting; never resumes. True if it paused."""
         if self._shut or self._underlying() not in (PREPARING, READING, WAITING):
             return False
+        self._end_notice()
         self._pause()
         return True
 
@@ -589,6 +741,7 @@ class Engine(QObject):
         """Resume a paused reading; never pauses. True if it resumed."""
         if self._shut or self._underlying() != PAUSED:
             return False
+        self._end_notice()
         self._resume()
         return True
 
@@ -597,6 +750,7 @@ class Engine(QObject):
             self._player.pause()
         self._set_state(PAUSED)
         self.notice.emit("paused")
+        self._remember()
 
     def _resume(self) -> None:
         self._flush_seek()
@@ -610,12 +764,15 @@ class Engine(QObject):
 
     @Slot()
     def stop(self) -> None:
-        """Stop: Copying returns to the previous resting state; a reading goes to Stopped."""
+        """Stop: Copying and Opening return to the previous state; a reading goes to Stopped."""
         if self._shut:
             return
+        self._end_notice()
         state = self._underlying()
         if state == COPYING:
             self._cancel_copy()
+        elif state == OPENING:
+            self._cancel_opening()
         elif state in SESSION:
             for press in self._presses:  # a Ctrl+` copy still running must not start a reading after Stop
                 press.ignored = True
@@ -627,6 +784,7 @@ class Engine(QObject):
             self._after_cut = None
             self._set_state(STOPPED)
             self.notice.emit("stopped")
+            self._remember()
         elif state in ERRORS:
             self._clear_overlay()
             self._set_state(STOPPED)
@@ -635,6 +793,7 @@ class Engine(QObject):
     def prev(self) -> None:
         if self._shut or self._doc is None:
             return
+        self._end_notice()
         state = self._underlying()
         if state in (READING, WAITING, PAUSED):
             if self._seek_target is not None:
@@ -653,7 +812,10 @@ class Engine(QObject):
 
     @Slot()
     def next(self) -> None:
-        if self._shut or self._doc is None or self._state not in (READING, WAITING, PAUSED):
+        if self._shut or self._doc is None:
+            return
+        self._end_notice()
+        if self._state not in (READING, WAITING, PAUSED):
             return
         base = self._seek_target if self._seek_target is not None else self._cur
         if base < len(self._doc.sentences) - 1:
@@ -664,6 +826,7 @@ class Engine(QObject):
         """Progress-bar click: seek while reading; read from there when Finished or Stopped."""
         if self._shut or self._doc is None:
             return
+        self._end_notice()
         state = self._underlying()
         if state in (READING, WAITING, PAUSED):
             self._seek_to(sentence)
@@ -680,6 +843,20 @@ class Engine(QObject):
         self._restart(self._cur)
 
     @Slot()
+    def start_over(self) -> None:
+        """Start from the beginning (the chip on a file that continued from its saved place)."""
+        if self._shut or self._doc is None:
+            return
+        self._end_notice()
+        self._resumed = None
+        state = self._underlying()
+        if state in (READING, WAITING, PAUSED):
+            self._seek_to(0)
+        elif state == PREPARING or state in ERRORS or state in (FINISHED, STOPPED):
+            self._clear_overlay()
+            self._restart(0)
+
+    @Slot()
     def replay_from_start(self) -> None:
         if self._shut or self._doc is None or self._underlying() not in (ERRORS | {FINISHED, STOPPED}):
             return
@@ -694,6 +871,319 @@ class Engine(QObject):
         self._cur = target
         self._set_state(WAITING if self._played_any else PREPARING)
         self._start_at(target, play=True)
+
+    # --- Files: opening, open notices, rebuilds ------------------------------------------------
+
+    def begin_opening(self, title: str, kind: str = "file") -> int:
+        """Start Opening (shown after OPEN_SHOW_MS) and return its token for the loader's answers.
+
+        The current document stays until read_document() brings the new one; a reading in progress pauses, as
+        it does for Ctrl+`. Opening again replaces the open in progress (openingCancelled has its token). `title`
+        is UI only and never logged."""
+        if self._shut:
+            return 0
+        for press in self._presses:  # a Ctrl+` copy still running must not replace this
+            press.ignored = True
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        if self._state in (PREPARING, READING, WAITING):
+            self._pause()
+        if self._state == OPENING:
+            replaced = self._open_live
+            if replaced is not None:
+                self.openingCancelled.emit(replaced)
+        else:
+            self._open_prev = self._state
+            self._open_shown = False
+            self._open_show_timer.start(OPEN_SHOW_MS)
+        self._open_token += 1
+        self._open_live = self._open_token
+        self._open_kind, self._open_title = kind, title
+        self._open_progress = (0, 0)
+        log.info("Opening a %s", "file" if kind == "file" else "long text")
+        self._set_state(OPENING)
+        self._emit_position()
+        return self._open_token
+
+    def opening_progress(self, token: int, done: int, total: int) -> None:
+        """The loader's progress (pages done of total; total 0 when unknown)."""
+        if self._shut or token != self._open_live or self._state != OPENING:
+            return
+        progress = (max(0, int(done)), max(0, int(total)))
+        if progress != self._open_progress:
+            self._open_progress = progress
+            self._publish()
+            self._emit_position()
+
+    def opening_failed(self, token: int, kind: str) -> None:
+        """The file couldn't be read: back to the state under Opening, with the open notice over it."""
+        if self._shut or token is None:
+            return
+        if token == self._rebuild_live:  # a rebuild that failed keeps the document as it was
+            self._rebuild_live = None
+            log.info("Rebuild failed: %s", kind)
+            return
+        if token != self._open_live:
+            return
+        title = self._open_title
+        self._leave_opening()
+        self.open_notice(kind, title)
+
+    def open_notice(self, kind: str, title: str = "") -> None:
+        """Show the open notice for `kind` (OPEN_LABELS) over the current state, until the next action.
+
+        For files that never reached the loader too: Open with on an unsupported or missing file."""
+        if self._shut:
+            return
+        kind = kind if kind in OPEN_LABELS else "corrupt"
+        if self._state == OPENING:
+            self._cancel_opening(publish=False)
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        if self._state in _PLAYING:  # a reading under the notice waits, paused (as it does while opening)
+            self._pause()
+        self._rest = self._state
+        self._fail_kind, self._fail_title = kind, title
+        log.info("Open failed: %s", kind)
+        self._set_state(OPEN_FAILED)
+        self._emit_position()
+        self._do_beep("error" if kind in OPEN_CRITICAL else "ok")
+        self.notice.emit("open_failed")
+
+    def _cancel_opening(self, *, publish: bool = True) -> None:
+        """Stop, or a new read, while opening: the loader's job is dropped and nothing changes."""
+        token = self._open_live
+        self._leave_opening()
+        if publish:
+            self._set_state(self._state)
+            self._emit_position()
+        log.info("Opening cancelled")
+        if token is not None:
+            self.openingCancelled.emit(token)
+
+    def _leave_opening(self) -> None:
+        """Back to the state under Opening, without publishing (the caller does)."""
+        self._open_show_timer.stop()
+        self._open_shown = False
+        self._open_live = None
+        self._open_progress = (0, 0)
+        self._open_kind = self._open_title = ""
+        if self._state == OPENING:
+            self._state = self._open_prev
+
+    def _on_open_show(self) -> None:
+        if self._state == OPENING:
+            self._open_shown = True
+            self._publish()
+            self._emit_position()
+            if self._open_kind == "file":
+                self.notice.emit("opening")
+
+    def read_document(self, doc: Document, raw=None, *, token: int | None = None) -> bool:
+        """Read a document built elsewhere (an opened file, or text built on the worker) from its start, or from
+        its saved place. With the token of an earlier begin_opening() or rebuild, a stale answer is dropped.
+
+        False when it was dropped, or when there is nothing to read (the "empty" notice then shows)."""
+        if self._shut:
+            return False
+        if token is not None and token == self._rebuild_live:
+            self._rebuild_live = None
+            return self._apply_rebuild(doc, raw)
+        if token is not None and token != self._open_live:
+            log.info("Dropped a document that is no longer wanted")
+            return False
+        if not doc.sentences:
+            if self._state == OPENING:
+                self.opening_failed(self._open_live, "empty")
+            else:
+                self.open_notice("empty")
+            return False
+        if self._state == OPENING:
+            self._leave_opening()
+        for press in self._presses:  # a Ctrl+` copy still running must not replace this reading
+            press.ignored = True
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        return self._new_session(doc.text, doc, raw=raw if raw is not None else doc.text)
+
+    @Slot()
+    def rebuild(self, read_section: str | None = None) -> None:
+        """Build the document again from the same input, keeping the place on screen: after a change to what is
+        read aloud (the engine does this itself for the settings), a section chip or a pronunciation change.
+
+        With `read_section` ("notes" or "refs", from Document.sections), a reading that has finished goes on to
+        read that section once the new document is ready; one still going reaches it by itself."""
+        self._rebuild_timer.stop()
+        if self._shut or self._doc is None or self._raw is None:
+            return
+        self._read_section = read_section
+        raw = self._raw
+        if self._builds_async(raw):
+            self._open_token += 1
+            if self._rebuild_live is not None:
+                self.openingCancelled.emit(self._rebuild_live)
+            self._rebuild_live = self._open_token
+            self._builder.start(self._rebuild_live, raw)
+            return
+        try:
+            doc = self._build(raw)
+        except Exception as e:  # keep reading the document as it was
+            log.warning("Rebuild failed (%s)", type(e).__name__)
+            return
+        self._apply_rebuild(doc, raw)
+
+    def _apply_rebuild(self, doc: Document, raw) -> bool:
+        old = self._doc
+        if old is None or raw is not self._raw or not doc.sentences:
+            return False
+        if getattr(doc, "source", None) is None and getattr(old, "source", None) is not None:
+            doc.source = old.source
+        state = self._underlying()
+        place = self._seek_target if self._seek_target is not None else self._cur
+        target = sentence_at_offset(doc, old.sentences[_clamp(place, 0, len(old.sentences) - 1)].start)
+        same = 0  # leading sentences that are unchanged: their audio stays valid
+        for a, b in zip(old.sentences, doc.sentences):
+            if (a.start, a.end, _say(a)) != (b.start, b.end, _say(b)):
+                break
+            same += 1
+        loaded = self._chunks.get(self._loaded)
+        keep_playing = (state in (READING, WAITING, PAUSED) and loaded is not None and loaded.plan.last < same
+                        and self._seek_target is None)
+        self._bump_gen()  # chunks still being made were planned on the old document
+        if not keep_playing:
+            self._seek_timer.stop()
+            self._seek_target = None
+            self._close_player()
+            self._after_cut = None
+        for chunk in [c for c in self._chunks.values() if c.plan.last >= same and c.id != self._loaded]:
+            self._delete_chunk(chunk)
+        self._doc, self._suffix, self._time_left_value = doc, None, None
+        log.info("Rebuilt: %d sentences, %d unchanged", len(doc.sentences), same)
+        self.sessionChanged.emit(doc)
+        if keep_playing:
+            self._prefetch()
+            self._publish()
+            self._emit_position()
+        elif state in SESSION:
+            if state != PAUSED:
+                self._set_state(WAITING if self._played_any else PREPARING)
+            self._start_at(target, play=state != PAUSED)
+        else:
+            self._cur = self._floor = target
+            self._publish()
+            self._emit_position()
+        self._emit_time_left(force=True)
+        section, self._read_section = self._read_section, None
+        offset = (getattr(doc, "sections", None) or {}).get(section) if section else None
+        if offset is not None and state == FINISHED:
+            first = next((s.index for s in doc.sentences if s.start >= offset), None)
+            if first is not None:
+                self._clear_overlay()
+                self._restart(first)
+        return True
+
+    def _builds_async(self, raw) -> bool:
+        return getattr(self._builder, "start", None) is not None and _raw_len(raw) > BUILD_ASYNC_CHARS
+
+    def _build(self, raw) -> Document:
+        """A Document for `raw` with this reading's options (the builder's when there is one)."""
+        if self._builder is not None:
+            return self._builder(raw)
+        skip_citations, skip_urls = bool(self._get("skip_citations", True)), bool(self._get("skip_urls", True))
+        extra = {}
+        pronunciations = self._pronunciation_list()
+        if pronunciations is not None:
+            extra["pronunciations"] = pronunciations
+        if isinstance(raw, str):
+            return Document.from_raw(raw, skip_citations=skip_citations, skip_urls=skip_urls, **extra)
+        from . import text_model
+        options = text_model.BuildOptions(skip_citations=skip_citations, skip_urls=skip_urls,
+                                          read_references=bool(self._get("read_references", False)),
+                                          read_asides=bool(self._get("read_asides", False)), **extra)
+        return Document.build(raw, options)
+
+    def _pronunciation_list(self):
+        if self._pronunciations is None or not self._get("pronunciations.enabled", True):
+            return None
+        current = getattr(self._pronunciations, "current", None)
+        return current() if callable(current) else self._pronunciations
+
+    # --- Resume (files only, and only while resume.enabled is on) ------------------------------
+
+    def _resume_on(self) -> bool:
+        return self._store is not None and bool(self._get("resume.enabled", False))
+
+    def _file_of(self, doc) -> tuple | None:
+        """(path, size, mtime_ns, fingerprint) for a document read from a file, else None."""
+        source = getattr(doc, "source", None)
+        path = getattr(source, "path", "") if getattr(source, "kind", "") == "file" else ""
+        if not path or self._store is None:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return path, st.st_size, st.st_mtime_ns, _fingerprint(doc)
+
+    def _resume_start(self, doc) -> int:
+        """Where a file starts: its saved place when there is one (resumeApplied follows), else 0."""
+        self._resumed = None
+        if self._file is None or not self._resume_on():
+            return 0
+        try:
+            found = self._store.lookup(*self._file)
+        except Exception as e:
+            log.warning("Couldn't look up the saved place (%s)", type(e).__name__)
+            return 0
+        if not found:
+            return 0
+        point, exact = found
+        n = len(doc.sentences)
+        # An exact match keeps the offset exact, but not always the sentence number: sentences are split on the
+        # spoken text, which Skip citations and Skip links change without changing the shown text.
+        start = (point.sentence if exact and 0 <= point.sentence < n and doc.sentences[point.sentence].start
+                 == point.offset else sentence_at_offset(doc, point.offset))
+        if start <= 0:
+            return 0
+        self._resumed = (start, bool(exact))
+        log.info("Continuing at sentence %d of %d (%s)", start + 1, n, "exact" if exact else "near")
+        return start
+
+    def _remember(self) -> None:
+        """Save the current file's place (path and numbers only, never text)."""
+        if (self._doc is None or self._file is None or not self._resume_on()
+                or self._underlying() == FINISHED or (self._state == OPENING and self._open_prev == FINISHED)):
+            return
+        path, size, mtime_ns, fingerprint = self._file
+        s = _clamp(self._cur, 0, len(self._doc.sentences) - 1)
+        point = ResumePoint(path, size, mtime_ns, fingerprint, self._doc.sentences[s].start, s, time.time(),
+                            _page_of(self._doc, s))
+        try:
+            self._store.remember(point)
+        except Exception as e:
+            log.warning("Couldn't save the place (%s)", type(e).__name__)
+
+    def _forget(self) -> None:
+        if self._file is None or not self._resume_on():
+            return
+        try:
+            self._store.forget(self._file[0])
+        except Exception as e:
+            log.warning("Couldn't forget the place (%s)", type(e).__name__)
+
+    def _on_resume_due(self) -> None:
+        if self._base() in _PLAYING:
+            self._remember()
+            self._arm_resume_timer()
+
+    def _arm_resume_timer(self) -> None:
+        if self._base() in _PLAYING and self._file is not None and self._resume_on():
+            self._resume_timer.start(RESUME_SAVE_MS)
+        else:
+            self._resume_timer.stop()
 
     # --- Seeking -------------------------------------------------------------------------------
 
@@ -771,11 +1261,12 @@ class Engine(QObject):
     def _predicted_note(self, v: float) -> str:
         if self._doc is None or v == self._rate:
             return ""
-        if self._state == PAUSED:
+        state = self._base()
+        if state == PAUSED:
             return f"{speed_label(v)} when resumed"
-        if self._state == READING and self._cur >= len(self._doc.sentences) - 1:
+        if state == READING and self._cur >= len(self._doc.sentences) - 1:
             return f"{speed_label(v)} from next reading"
-        if self._state in (READING, WAITING):
+        if state in (READING, WAITING):
             return f"{speed_label(v)} from next sentence"
         return ""
 
@@ -797,7 +1288,7 @@ class Engine(QObject):
         self._flush_seek()
         self._committed = v
         self._settings.set("speed", v)
-        state = self._underlying()
+        state = self._base()
         log.info("Speed %s committed in state %s", rate_string(v), state)
         if state not in SESSION or self._doc is None:
             self._rate = v
@@ -932,6 +1423,13 @@ class Engine(QObject):
                 self.set_speed(v)
         elif key == "volume":
             self.set_volume(int(self._get("volume", self._volume)))
+        elif key in REBUILD_KEYS:
+            if self._doc is not None:
+                self._rebuild_timer.start(0)  # one rebuild for several changes in a row
+        elif key == "resume.enabled":
+            if self._resume_on():  # turned on: remember this place now ("Remember this page next time")
+                self._remember()
+            self._arm_resume_timer()
 
     def _base_idle(self) -> str:
         if not self._shortcut_ok:
@@ -943,27 +1441,34 @@ class Engine(QObject):
         if self._state in IDLE:
             self._set_state(idle)
             return
-        if self._state == NOTHING_SELECTED and self._rest in IDLE:
+        if self._state in OVERLAYS and self._rest in IDLE:
             self._rest = idle
         elif self._state == COPYING and self._copy_prev in IDLE:
             self._copy_prev = idle
+        elif self._state == OPENING and self._open_prev in IDLE:
+            self._open_prev = idle
         self._publish()
 
     # --- Sessions and the chunk pipeline -------------------------------------------------------
 
     def _make_doc(self, text: str) -> Document:
-        return Document.from_raw(text, skip_citations=bool(self._get("skip_citations", True)),
-                                 skip_urls=bool(self._get("skip_urls", True)))
+        return self._build(text)
 
-    def _new_session(self, text: str, doc: Document | None = None) -> bool:
-        """Start reading text (or its already-built document) from the first sentence; False if unspeakable."""
+    def _new_session(self, text: str, doc: Document | None = None, *, raw=None) -> bool:
+        """Start reading text (or its already-built document) from the first sentence, or from a file's saved
+        place; False if unspeakable. Long text is built on the builder's worker first (as Opening)."""
+        if doc is None and self._builds_async(text):
+            token = self.begin_opening("", "text")
+            self._builder.start(token, text)
+            return True
         doc = doc if doc is not None else self._make_doc(text)
         if not doc.sentences:
             log.info("Nothing to read after normalizing %d characters", len(text))
             return False
         self._purge(announce=False)
         self._settle_speed()
-        self._doc = doc
+        self._doc, self._raw = doc, raw if raw is not None else text
+        self._file = self._file_of(doc)
         self._mid_session = self._back_online = False
         self._time_left_value = None
         log.info("New reading: %d sentences, %d characters", len(doc.sentences), len(doc.text))
@@ -971,14 +1476,18 @@ class Engine(QObject):
         if new_reading is not None:  # each reading starts on the chosen voice again
             new_reading()
         self.sessionChanged.emit(doc)
-        self._cur = 0
+        start = self._resume_start(doc)
+        self._cur = start
         self._set_state(PREPARING)
-        self._start_at(0, play=True)
+        self._start_at(start, play=True)
         self._emit_time_left(force=True)
+        if self._resumed is not None:
+            self.resumeApplied.emit(start)
         return True
 
     def _purge(self, *, announce: bool = True) -> None:
-        """Forget the text and delete the cached audio (privacy)."""
+        """Forget the text and delete the cached audio (privacy). A file's place is saved first (resume)."""
+        self._remember()
         self._seek_timer.stop()
         self._seek_target = None
         self._bump_gen()
@@ -988,7 +1497,11 @@ class Engine(QObject):
         self._after_cut = None
         self._purge_timer.stop()
         had_text = self._doc is not None
-        self._doc = None
+        self._doc = self._raw = self._file = self._resumed = self._suffix = None
+        self._rebuild_timer.stop()
+        if self._rebuild_live is not None:
+            self.openingCancelled.emit(self._rebuild_live)
+            self._rebuild_live = None
         self._cur = self._floor = 0
         self._pos_ms = self._played_idx = 0.0
         self._played_any = False
@@ -1005,10 +1518,12 @@ class Engine(QObject):
         self._doomed.clear()
         self._open.clear()
         idle = self._base_idle()
-        if self._state == NOTHING_SELECTED:
+        if self._state in OVERLAYS:
             self._rest = idle
         elif self._state == COPYING:
             self._copy_prev = idle
+        elif self._state == OPENING and self._open_prev in RESTING:
+            self._open_prev = idle
         elif self._state in RESTING:
             self._set_state(idle)
             return
@@ -1308,6 +1823,7 @@ class Engine(QObject):
     def _finish(self) -> None:
         self._cur = len(self._doc.sentences) - 1
         log.info("Finished reading")
+        self._forget()  # a finished file is not offered again
         self._set_state(FINISHED)
         self.notice.emit("finished")
         self._emit_position()
@@ -1315,11 +1831,19 @@ class Engine(QObject):
 
     # --- State publication ---------------------------------------------------------------------
 
+    def _base(self) -> str:
+        """The state that decides the timers and media keys: the one under an overlay or under Opening."""
+        if self._state in OVERLAYS:
+            return self._rest
+        return self._open_prev if self._state == OPENING else self._state
+
     def _set_state(self, state: str) -> None:
-        old, self._state = self._state, state
-        if state in SESSION:
+        old, old_base = self._state, self._base()
+        self._state = state
+        base = self._base()
+        if base in SESSION:
             self._purge_timer.stop()
-        elif state in RESTING:
+        elif base in RESTING:
             self._rate = self._committed
             self._drop_other_rates()
             if self._speed_pending and not self._commit_timer.is_active():
@@ -1327,12 +1851,16 @@ class Engine(QObject):
                 self._speed_pending, self._note = False, ""
                 self._note_timer.stop()
                 self.speedChanged.emit(self._speed, "")
-            if self._doc is not None and state not in IDLE and not self._purge_timer.is_active():
+            if self._doc is not None and base not in IDLE and not self._purge_timer.is_active():
                 self._purge_timer.start(PURGE_MS)
-        if state != PAUSED:
+        if base != PAUSED:
             self._media_timer.stop()
-        elif old != PAUSED:
+        elif old_base != PAUSED:
             self._media_timer.start(MEDIA_PAUSE_MS)
+        if base not in _PLAYING:
+            self._resume_timer.stop()
+        elif not self._resume_timer.is_active():
+            self._arm_resume_timer()
         if state != WAITING:
             self._hold_waiting = False
             self._waiting_timer.stop()
@@ -1353,6 +1881,8 @@ class Engine(QObject):
         shown = self._state
         if shown == COPYING and not self._copy_shown:
             shown = self._copy_prev
+        elif shown == OPENING and not self._open_shown:
+            shown = self._open_prev
         elif shown == WAITING and self._hold_waiting:
             shown = READING
         info = self._info(shown)
@@ -1361,17 +1891,29 @@ class Engine(QObject):
             self.stateChanged.emit(shown, dict(info))
 
     def _info(self, shown: str) -> dict:
-        base = self._rest if shown == NOTHING_SELECTED else shown
+        base = self._rest if shown in OVERLAYS else shown
         doc = self._doc
         n = len(doc.sentences) if doc is not None else 0
         has_text = doc is not None
         overlay = shown == NOTHING_SELECTED
+        source = getattr(doc, "source", None)
+        label = LABELS[shown]
+        if shown == OPEN_FAILED:
+            label = OPEN_LABELS.get(self._fail_kind, label)
+        elif shown == OPENING and self._open_kind != "file":
+            label = LABELS[PREPARING]  # a long text being built: it reads as the start of preparing
+        if shown == OPENING:
+            title = self._open_title
+        elif shown == OPEN_FAILED:
+            title = self._fail_title
+        else:
+            title = getattr(source, "title", "") if getattr(source, "kind", "") == "file" else ""
         return {
-            "label": LABELS[shown],
+            "label": label,
             "sentence": self._cur if has_text and base not in IDLE else -1,
             "total": n,
             "reason": self._reason if overlay else "",
-            "underlying": base if overlay else "",
+            "underlying": base if shown in OVERLAYS else "",
             "pending_note": self._note,
             "speed": self._speed,
             "speed_pending": self._speed_pending,
@@ -1385,30 +1927,50 @@ class Engine(QObject):
             "can_next": base in (READING, WAITING, PAUSED) and has_text and self._cur < n - 1,
             "can_stop": base in ACTIVE or base in ERRORS,
             "can_seek": base in (READING, WAITING, PAUSED, FINISHED, STOPPED) and has_text,
-            "can_type": shown != COPYING,
-            "can_clear": has_text and shown != COPYING,
+            "can_type": shown not in (COPYING, OPENING),
+            "can_clear": has_text and shown not in (COPYING, OPENING),
+            # files, open notices and pages
+            "source": getattr(source, "kind", "") if has_text else "",
+            "title": title,                                   # UI only, never logged
+            "kind": self._fail_kind if shown == OPEN_FAILED else "",
+            "open_kind": self._open_kind if shown == OPENING else "",
+            "open_done": self._open_progress[0] if shown == OPENING else 0,
+            "open_total": self._open_progress[1] if shown == OPENING else 0,
+            "page": _page_of(doc, self._cur) if has_text and n else 0,
+            "pages": int(getattr(self._raw, "pages", 0) or 0) if has_text else 0,
+            "end_of_main_text": base == FINISHED and has_text and self._unspoken_tail(),
         }
 
+    def _unspoken_tail(self) -> bool:
+        """Text is shown after the last sentence read aloud (notes or a reference list that are skipped)."""
+        doc = self._doc
+        return bool(doc.sentences) and _NON_SPACE.search(doc.text, doc.sentences[-1].end) is not None
+
     def _emit_position(self) -> None:
-        """position(sentence, word_lo, word_hi, played, buffered, in_word)."""
+        """position(sentence, word_lo, word_hi, played, buffered, in_word). Played and buffered are fractions of
+        the spoken span (spoken_span()); while a file opens they are 0 and the share of pages read so far."""
         if self._shut:
             return
+        if self._state == OPENING and self._open_shown:
+            done, total = self._open_progress
+            self.position.emit(-1, -1, -1, 0.0, _clamp(done / total, 0.0, 1.0) if total > 0 else 0.0, False)
+            return
         doc = self._doc
-        if doc is None or not doc.text:
+        if doc is None or not doc.text or not doc.sentences:
             self._played_idx = 0.0
             self.position.emit(-1, -1, -1, 0.0, 0.0, False)
             return
-        total = len(doc.text)
+        base = self._base()
         s = self._cur
         sent = doc.sentences[s]
         lo = hi = -1
         in_word = False
         idx = float(sent.start)
         chunk = self._chunks.get(self._loaded) if self._seek_target is None else None
-        if self._state == FINISHED:
-            idx = float(total)
+        if base == FINISHED:
+            idx = float(spoken_span(doc)[1])
         elif (chunk is not None and chunk.timing is not None and chunk.contains(s)
-              and self._state in (READING, PAUSED)):
+              and base in (READING, PAUSED)):
             pos = self._pos_ms
             word, in_word = chunk.timing.word_at(pos, s)
             if word is not None:
@@ -1422,13 +1984,13 @@ class Engine(QObject):
                 idx += len(sent.text) * frac
                 in_word = chunk.timing.proportional and a <= pos < b
         self._played_idx = idx
-        self.position.emit(s, lo, hi, idx / total, self._buffered(total), in_word)
+        self.position.emit(s, lo, hi, span_fraction(doc, idx), span_fraction(doc, self._buffered()), in_word)
 
-    def _buffered(self, total: int) -> float:
-        """End of the contiguous ready audio from the position, as a fraction of the text."""
+    def _buffered(self) -> float:
+        """End of the contiguous ready audio from the position, as a shown offset."""
         doc = self._doc
-        if self._state == FINISHED:
-            return 1.0
+        if self._base() == FINISHED:
+            return float(spoken_span(doc)[1])
         chunk = self._chunks.get(self._loaded)
         if chunk is not None and chunk.contains(self._cur) and self._after_cut is not None:
             last = self._after_cut - 1
@@ -1437,14 +1999,14 @@ class Engine(QObject):
         else:
             chunk = self._ready_chunk(self._cur)
             if chunk is None:
-                return doc.sentences[self._cur].start / total
+                return float(doc.sentences[self._cur].start)
             last = chunk.plan.last
         while last + 1 < len(doc.sentences):
             following = self._ready_chunk(last + 1)
             if following is None:
                 break
             last = following.plan.last
-        return doc.sentences[last].end / total
+        return float(doc.sentences[last].end)
 
     def _measure(self, chunk: _Chunk) -> None:
         """Exponential moving average of audio ms per character, per speed (for time left)."""
@@ -1455,12 +2017,33 @@ class Engine(QObject):
             self._mpc += MPC_ALPHA * (m - self._mpc)
 
     def _time_left(self) -> int:
-        if self._doc is None or self._mpc is None:
+        doc = self._doc
+        if doc is None or self._mpc is None or not doc.sentences:
             return -1
-        if self._state == FINISHED:
+        if self._base() == FINISHED:
             return 0
         mpc = self._mpc * self._mpc_speed / self._rate  # old ms/char x old speed / new speed
-        return int(round(max(0.0, len(self._doc.text) - self._played_idx) * mpc / 1000))
+        s = _clamp(self._cur, 0, len(doc.sentences) - 1)
+        sent = doc.sentences[s]
+        done = _clamp((self._played_idx - sent.start) / max(1, len(sent.text)), 0.0, 1.0)
+        left = self._spoken_from(s + 1) + len(_say(sent)) * (1.0 - done)
+        return int(round(left * mpc / 1000))
+
+    def _spoken_from(self, sentence: int) -> int:
+        """Spoken characters from `sentence` to the end, with the spaces chunks put between sentences (the
+        unit the ms-per-character measurement uses). Skipped citations, notes and references don't count."""
+        doc = self._doc
+        own = getattr(doc, "spoken_chars_from", None)
+        if own is not None:
+            return own(sentence)
+        if self._suffix is None or self._suffix[0] is not doc:
+            n = len(doc.sentences)
+            sums = [0] * (n + 1)
+            for i in range(n - 1, -1, -1):
+                sums[i] = sums[i + 1] + len(_say(doc.sentences[i])) + (1 if i < n - 1 else 0)
+            self._suffix = (doc, sums)
+        sums = self._suffix[1]
+        return sums[_clamp(sentence, 0, len(sums) - 1)]
 
     def _emit_time_left(self, force: bool = False) -> None:
         """timeLeft at most once a second (or when forced), and only when the value changes."""
@@ -1474,9 +2057,9 @@ class Engine(QObject):
             self.timeLeft.emit(value)
 
     def _update_media_keys(self) -> None:
+        base = self._base()
         want = bool(self._get("media_keys", True)) and (
-            self._state in (PREPARING, READING, WAITING)
-            or (self._state == PAUSED and self._media_timer.is_active()))
+            base in (PREPARING, READING, WAITING) or (base == PAUSED and self._media_timer.is_active()))
         self._set_media(want)
 
     def _set_media(self, on: bool) -> None:

@@ -25,6 +25,7 @@ The texts kept in this repository are in [`licenses/`](licenses).
 | attrs | 26.1.0 | MIT | Inside the archive |
 | idna | 3.19 | BSD-3-Clause | Inside the archive |
 | certifi | 2026.7.22 | MPL-2.0 | `cacert.pem` ships unmodified in `_internal\certifi` |
+| pypdf | 6.14.2 | BSD-3-Clause | Inside the archive; loaded only when a PDF is opened |
 | PyInstaller bootloader | 6.22.3 | GPL-2.0-or-later with the bootloader exception, which allows any licence for the app | Inside `Saylight.exe` |
 
 The LGPL-3.0 builds on the GPL-3.0, so both texts ship: [`licenses/LGPL-3.0.txt`](licenses/LGPL-3.0.txt) and
@@ -40,6 +41,10 @@ Qt includes code from other projects. They are listed in
 
 Windows provides the rest and Saylight doesn't ship it: Microsoft's online voices, Windows audio (MCI), and the
 Segoe, Verdana, Calibri and Sitka fonts.
+
+pypdf can use two optional packages that Saylight leaves out: Pillow (for pictures, which Saylight doesn't read)
+and cryptography (for AES-encrypted PDFs, which would add more than 10 MB). Without cryptography, an
+AES-encrypted PDF shows "This PDF is protected" and how to read it from your PDF reader instead.
 
 ## Inside Saylight-Setup.exe
 

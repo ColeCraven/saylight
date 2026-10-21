@@ -1,20 +1,24 @@
 """Tests for the reading card (ui/sentence_view.py): high-contrast sentence ring, the "Back to current" chip,
-no-break glue, and the action chips, card hover and message fit rule of the empty card.
+no-break glue, the action chips, card hover and message fit rule of the empty card, and text shown but not
+read aloud: its colour, tooltips and click targets, section chips and rules, the corner chip, words under the
+pointer and the paragraph-by-paragraph layout of long documents.
 
 Widgets are rendered into a QImage and never shown.
 """
 
 import sys
 import unittest
+from collections import namedtuple
+from types import SimpleNamespace
 
-from PySide6.QtCore import QCoreApplication, QObject, QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetricsF, QImage, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from saylight.text_model import Document
 from saylight.theme import Theme
 from saylight.ui.controls import measure_parts
-from saylight.ui.sentence_view import _GLUE, SentenceView
+from saylight.ui.sentence_view import _GLUE, REGION_TIPS, SentenceView, word_bounds
 
 _app = None
 
@@ -244,6 +248,282 @@ class TestMessageFit(unittest.TestCase):
     def test_body_role_when_a_line_is_too_wide(self) -> None:
         view = card()
         self.assertEqual(view._message_role([[("text", "word " * 30)]]), "body")
+
+
+# --- Text shown but not read aloud, sections, corner chips, words ---------------------------------
+
+Region = namedtuple("Region", "start end kind")
+Edit = namedtuple("Edit", "start end spoken kind")
+CITED = "Reading improved with synchronised speech (Smith et al., 2020). The effect lasted for weeks."
+NOTES_TAIL = "\n\nNotes\n\nA note that is shown but not read aloud."
+
+
+def cited_doc() -> Document:
+    """One citation in the first sentence, marked as a skip region (as the two-text model gives it)."""
+    doc = Document.from_raw(CITED, skip_citations=False)
+    a = doc.text.index("(Smith")
+    doc.regions = [Region(a, doc.text.index(")", a) + 1, "skip")]
+    return doc
+
+
+def notes_doc(read: bool = False) -> Document:
+    """Two sentences, then a Notes section that is skipped (an aside region) or, when `read`, only listed."""
+    body = Document.from_raw("The first sentence is here. The second one follows it.")
+    doc = Document(body.text + NOTES_TAIL, body.sentences)
+    start = doc.text.index("Notes")
+    doc.regions = [] if read else [Region(start, len(doc.text), "aside")]
+    if read:
+        doc.sections = {"notes": start}
+    return doc
+
+
+def text_card(doc: Document, *, hc: bool = False, sentence: int = 0, **values: str) -> SentenceView:
+    view = card(hc=hc, **values)
+    view.set_document(doc)
+    view.show_text()
+    view.swap.snap(1.0)
+    view.set_position(sentence, 0, 0)
+    return view
+
+
+def point_of(view: SentenceView, offset: int) -> QPointF:
+    """The middle of the glyph at `offset`, in view coordinates."""
+    lay = view._layout
+    row = lay.line_of(offset)
+    line = lay.lineAt(row)
+    x1, x2 = line.cursorToX(offset), line.cursorToX(offset + 1)
+    lh = view.line_height()
+    return QPointF(view.pad_x() + (x1 + x2) / 2, view.pad_y() - view.scroll.value + row * lh + lh / 2)
+
+
+def colour_pixels(img: QImage, color: QColor, rect: QRectF | None = None) -> int:
+    rgb = color.rgb()
+    r = (rect or QRectF(img.rect())).toAlignedRect().intersected(img.rect())
+    return sum(1 for y in range(r.top(), r.bottom() + 1) for x in range(r.left(), r.right() + 1)
+               if img.pixel(x, y) == rgb)
+
+
+def span_rect(view: SentenceView, a: int, b: int) -> QRectF:
+    """The rows' rectangle around shown text [a, b) on one row."""
+    p1, p2 = point_of(view, a), point_of(view, b - 1)
+    lh = view.line_height()
+    return QRectF(p1.x() - 6, p1.y() - lh / 2, p2.x() - p1.x() + 12, lh)
+
+
+class TestSkippedText(unittest.TestCase):
+    def test_painted_in_the_skipped_colour_in_every_style(self) -> None:
+        for style in ("active", "paused", "muted", "stopped", "finished"):
+            with self.subTest(style):
+                doc = cited_doc()
+                view = text_card(doc, sentence=1)  # the cited sentence is an earlier one: dimmed, then skipped
+                view.set_style(style)
+                colors = view.theme.reading_colors()
+                img = render(view)
+                a, b, _ = view._dim[0]
+                inside = span_rect(view, a, b)
+                self.assertGreater(colour_pixels(img, colors["skipped"], inside), 5)
+                self.assertEqual(colour_pixels(img, colors["skipped"]), colour_pixels(img, colors["skipped"], inside))
+                if style != "finished":  # the rest of the earlier sentence keeps the earlier-sentence colour
+                    self.assertGreater(colour_pixels(img, colors["secondary"], span_rect(view, 0, 7)), 5)
+
+    def test_high_contrast_uses_gray_text(self) -> None:
+        view = text_card(cited_doc(), hc=True)
+        a, b, _ = view._dim[0]
+        gray = QColor(*HC_BLACK["graytext"])
+        self.assertEqual(view.theme.reading_colors()["skipped"], gray)
+        self.assertGreater(colour_pixels(render(view), gray, span_rect(view, a, b)), 5)
+
+    def test_tooltips(self) -> None:
+        doc = cited_doc()
+        s = doc.sentences[1]
+        said = doc.text.index("weeks")
+        doc.regions.append(Region(said, said + 5, "said"))
+        s.align = SimpleNamespace(edits=[Edit(said - s.start, said - s.start + 5, "wicks", "say")])
+        view = text_card(doc)
+        self.assertEqual(view.tip_at(point_of(view, view._dim[0][0] + 2)), REGION_TIPS["skip"])
+        self.assertEqual(view.tip_at(point_of(view, said + 1)), "Read aloud as “wicks”.")
+        self.assertEqual(view.tip_at(point_of(view, 2)), "")
+        view.show_messages([[("text", "Ready")]])
+        self.assertEqual(view.tip_at(point_of(view, 2)), "")
+
+    def test_inline_citations_belong_to_their_sentence_but_notes_take_no_clicks(self) -> None:
+        view = text_card(cited_doc())
+        self.assertEqual(view.sentence_at(point_of(view, view._dim[0][0] + 2)), 0)
+        doc = notes_doc()
+        view = text_card(doc, sentence=1)
+        note = doc.text.index("A note")
+        self.assertIsNone(view.sentence_at(point_of(view, note + 3)))
+        self.assertEqual(view.tip_at(point_of(view, note + 3)), REGION_TIPS["aside"])
+        self.assertEqual(view.sentence_at(point_of(view, 3)), 0)
+
+
+class TestWords(unittest.TestCase):
+    def test_word_bounds_trim_punctuation(self) -> None:
+        text = "“Hello,” she said (e.g. fMRI). Don't—no; COVID-19… ok"
+        for word, expected in (("Hello", "Hello"), ("e.g", "e.g"), ("fMRI", "fMRI"), ("Don't", "Don't—no"),
+                               ("COVID", "COVID-19"), ("ok", "ok")):
+            a, b = word_bounds(text, text.index(word) + 1)
+            self.assertEqual(text[a:b], expected)
+        self.assertIsNone(word_bounds(text, text.index(" she")))
+        self.assertIsNone(word_bounds("a , b", 2))
+        self.assertIsNone(word_bounds("abc", 5))
+
+    def test_word_at_the_pointer(self) -> None:
+        doc = cited_doc()
+        view = text_card(doc)
+        start = doc.text.index("synchronised")
+        self.assertEqual(view.word_at(point_of(view, start + 4)), (start, start + len("synchronised")))
+        a = doc.text.index("Smith")
+        self.assertEqual(view.word_at(point_of(view, a)), (a, a + 5))  # "(Smith" without the bracket
+        self.assertIsNone(view.word_at(point_of(view, doc.text.index(" with"))))  # a space
+        self.assertIsNone(view.word_at(QPointF(view.width() - 3, 3)))
+        got = []
+        view.pronunciationRequested.connect(got.append)
+        self.assertTrue(view.request_pronunciation(point_of(view, start)))
+        self.assertEqual(got, ["synchronised"])
+        view.show_messages([[("text", "Ready")]])
+        self.assertIsNone(view.word_at(point_of(view, start)))
+
+
+class TestSections(unittest.TestCase):
+    def test_chip_and_rule_on_the_blank_row_before_the_notes(self) -> None:
+        doc = notes_doc()
+        view = text_card(doc)
+        (section, rect), = view._section_rects()
+        heading_row = view._layout.line_of(doc.text.index("Notes"))
+        self.assertEqual(view._section_row(section), heading_row - 1)
+        lh = view.line_height()
+        self.assertAlmostEqual(rect.right(), view.width() - 14)
+        self.assertEqual(round(rect.height()), min(24, lh - 2))
+        self.assertAlmostEqual(rect.center().y(), view.pad_y() + (heading_row - 1) * lh + lh / 2)
+        self.assertEqual(view.action_at(rect.center()), "section:notes")
+        self.assertEqual(view.tip_at(rect.center()), "Read the notes after the main text, for this file only.")
+        self.assertIn("Read the notes too", view.accessibleDescription())
+        img = render(view)
+        y = int(rect.center().y())
+        skipped = view.theme.reading_colors()["skipped"].rgb()
+        self.assertEqual(img.pixel(view.pad_x() + 20, y), skipped)       # the 48 DIP rule
+        self.assertNotEqual(img.pixel(view.pad_x() + 60, y), skipped)
+
+    def test_a_section_read_aloud_offers_to_skip_it_again(self) -> None:
+        view = text_card(notes_doc(read=True))
+        (section, rect), = view._section_rects()
+        self.assertTrue(section.read)
+        self.assertEqual(view.tip_at(rect.center()), "Skip them again, for this file.")
+        self.assertIn("Skip the notes", view.accessibleDescription())
+
+    def test_rebuild_keeps_the_place_and_crossfades_the_label(self) -> None:
+        view = text_card(notes_doc(), sentence=1)
+        view.scroll.snap(view.line_height())
+        layout = view._layout
+        view.set_document(notes_doc(read=True))  # same shown text: a rebuild
+        self.assertIs(view._layout, layout)
+        self.assertEqual((view.sentence, view.scroll.value), (1, view.line_height()))
+        self.assertEqual(view._section_prev["notes"], "Read the notes too")
+        self.assertEqual(view._sections[0].read, True)
+
+    def test_hidden_under_a_corner_chip(self) -> None:
+        doc = notes_doc()
+        view = text_card(doc, sentence=1)
+        view.set_style("finished")
+        (section, _), = view._section_rects()
+        view.scroll.snap(view._section_row(section) * view.line_height())  # its row scrolled to the top
+        self.assertEqual(len(view._section_rects()), 1)
+        view.set_corner_chip("start_over", "Start from the beginning")
+        self.assertIsNotNone(view.corner_rect())
+        self.assertEqual(view._section_rects(), [])
+        self.assertIsNone(view.action_at(view.corner_rect().center() - QPointF(view.corner_rect().width(), 0)))
+
+
+LONG = (CITED + " Readers kept their place more often when each word was marked as it was spoken. The gain was "
+        "largest for the longest passages, and it did not fade over the weeks of the study.")
+
+
+class TestCornerChip(unittest.TestCase):
+    def test_waits_while_it_would_cover_unread_text(self) -> None:
+        """Row 1 holds text already read, except at the very start: there the chip waits for the reading."""
+        view = text_card(Document.from_raw(LONG), sentence=0)
+        view.set_corner_chip("back", "Back to page 2")
+        self.assertIsNone(view.corner_rect())  # the first row is still to be read
+        self.assertIsNone(view.action_at(QPointF(view.width() - 20, 20)))
+        view.set_position(2, 0, 0)
+        self.assertIsNotNone(view.corner_rect())
+        view.set_style("finished")
+        view.set_position(0, 0, 0)
+        self.assertIsNotNone(view.corner_rect())  # nothing is unread once finished
+
+    def test_top_right_slot(self) -> None:
+        view = text_card(Document.from_raw(LONG), sentence=2)
+        self.assertIsNone(view.corner_rect())
+        tip = "Read “Smith 2024” from the first page"
+        view.set_corner_chip("start_over", "Start from the beginning", tooltip=tip)
+        r = view.corner_rect()
+        w = QFontMetricsF(view.theme.font("small")).horizontalAdvance("Start from the beginning") + 20
+        self.assertEqual((r.right(), r.top(), r.height()), (view.width() - 8, 8, 24))
+        self.assertAlmostEqual(r.width(), w)
+        self.assertLess(r.bottom(), view.pad_y() + view.line_height() + 1)  # row 1 only: earlier text
+        self.assertEqual(view.action_at(r.center()), "corner:start_over")
+        self.assertEqual(view.tip_at(r.center()), tip)
+        self.assertEqual(view.track_pointer(r.center()), "corner:start_over")
+        self.assertEqual(view.cursor().shape(), Qt.CursorShape.PointingHandCursor)
+        self.assertEqual(view._chip_hover["corner:start_over"].target, 1.0)
+        view.set_corner_chip("remembered", "Saylight will remember your place", clickable=False)
+        self.assertIsNone(view.action_at(view.corner_rect().center()))
+        self.assertEqual(view._corner_prev, "Start from the beginning")  # a new label crossfades
+        view.show_messages([[("text", "Ready")]])
+        self.assertIsNone(view.corner_rect())
+        view.show_text()
+        view.set_corner_chip(None)
+        self.assertIsNone(view.corner_rect())
+
+    def test_hover_and_press_paint(self) -> None:
+        view = text_card(Document.from_raw(LONG), sentence=2)
+        view.set_corner_chip("start_over", "Start from the beginning")
+        r = view.corner_rect()
+        at = (int(r.left() + 4), int(r.center().y()))
+        rest = render(view).pixel(*at)
+        view.set_action_state("corner:start_over", True, False, True)
+        hover = render(view).pixel(*at)
+        view.set_action_state("corner:start_over", True, True, True)
+        pressed = render(view).pixel(*at)
+        self.assertEqual(len({rest, hover, pressed}), 3)
+
+
+class TestActionLabels(unittest.TestCase):
+    def test_label_override_sets_the_chip_width(self) -> None:
+        view = card()
+        line = [("text", "or "), ("action", "continue")]
+        view.show_messages([line])
+        view.set_action_label("continue", "Continue “Smith 2024” from page 14")
+        render(view)
+        fm = QFontMetricsF(view.theme.font("message"))
+        self.assertAlmostEqual(view._hits["continue"].width(),
+                               32 + fm.horizontalAdvance("Continue “Smith 2024” from page 14") + 10, places=3)
+        self.assertEqual(view.accessibleDescription(), "Actions: Continue “Smith 2024” from page 14.")
+
+
+class TestLongDocuments(unittest.TestCase):
+    def test_laid_out_as_far_as_needed_then_while_idle(self) -> None:
+        para = "Working memory capacity predicts reading comprehension in adults with dyslexia. " * 4
+        doc = Document.from_raw("\n\n".join([para.strip()] * 400))
+        view = text_card(doc)
+        lay = view._layout
+        self.assertFalse(lay.done)
+        laid = len(lay.rows)
+        self.assertLess(laid, 60)
+        late = len(doc.sentences) - 3
+        view.set_position(late, 0, 0)  # jumping far ahead lays out up to there
+        self.assertGreater(len(lay.rows), laid)
+        while not lay.step():
+            pass
+        full = SentenceView(view.theme, view.settings)
+        full.resize(view.size())
+        full.set_document(doc)
+        full._layout.ensure_rows(10 ** 9)
+        self.assertEqual(lay.lineCount(), full._layout.lineCount())
+        self.assertEqual(lay.starts, full._layout.starts)
+        self.assertEqual(lay.line_of(doc.sentences[late].start), full._layout.line_of(doc.sentences[late].start))
+        render(view)  # paints only the rows on screen
 
 
 if __name__ == "__main__":

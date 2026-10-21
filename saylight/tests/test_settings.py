@@ -306,6 +306,64 @@ class TestEarlierFiles(Base):
                 out[name] = value
 
 
+class TestDocumentKeys(Base):
+    """Keys added in 1.3: what's read aloud, pronunciations, pick up where you left off, and one-time tips."""
+
+    KEYS = {"read_references": False, "read_asides": False, "pronunciations.enabled": True, "resume.enabled": False,
+            "resume.offer_count": 0, "tips.dimmed_note_shown": False}
+
+    def test_defaults(self) -> None:
+        s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+        self.assertEqual(s.get("resume"), {"enabled": False, "offer_count": 0})
+        self.assertEqual(s.get("tips"), {"dimmed_note_shown": False})
+
+    def test_a_1_2_file_loads_with_the_new_defaults(self) -> None:
+        self.write_json({**EARLIER_FILES["1.1"], "voice": "edge:en-US-AvaNeural",
+                         "updates": {"check": True, "last_check": 0.0, "etag": "", "skipped": ""}})
+        with self.assertNoLogs("saylight.settings", "WARNING"):
+            s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+
+    def test_offer_count_stays_between_0_and_3(self) -> None:
+        self.assertEqual(S.RESUME_OFFERS, 3)
+        s = Settings(self.path)
+        for value, expected in ((1, 1), (7, 3), (-2, 0), ("2", 2), (1.6, 2)):
+            s.set("resume.offer_count", value)
+            self.assertEqual(s.get("resume.offer_count"), expected, value)
+
+    def test_bad_values_fall_back_without_echoing_them(self) -> None:
+        self.write_json({"read_references": "SECRET", "read_asides": 2, "pronunciations": {"enabled": None},
+                         "resume": {"enabled": "SECRET", "offer_count": "SECRET"}, "tips": "SECRET"})
+        with self.assertLogs("saylight.settings", "WARNING") as logs:
+            s = Settings(self.path)
+        for key, value in self.KEYS.items():
+            self.assertEqual(s.get(key), value, key)
+        self.assertFalse(any("SECRET" in line for line in logs.output))
+
+    def test_changes_are_saved(self) -> None:
+        s = Settings(self.path)
+        for key in ("read_references", "read_asides", "resume.enabled", "tips.dimmed_note_shown"):
+            s.set(key, True)
+        s.set("pronunciations.enabled", False)
+        s.set("resume.offer_count", 2)
+        self.assertTrue(s.flush())
+        data = self.read_json()
+        self.assertEqual((data["read_references"], data["read_asides"]), (True, True))
+        self.assertEqual(data["resume"], {"enabled": True, "offer_count": 2})
+        self.assertEqual(data["pronunciations"], {"enabled": False})
+        self.assertEqual(data["tips"], {"dimmed_note_shown": True})
+
+    def test_no_new_key_can_hold_text(self) -> None:
+        """Paths, titles, words and places live elsewhere (the resume file, the pronunciation list), never here."""
+        for key in self.KEYS:
+            self.assertIn(type(SCHEMA[key][0]), (bool, int), key)
+            with self.assertRaises(ValueError, msg=key):
+                SCHEMA[key][1]("C:\\Users\\someone\\paper.pdf")
+
+
 class TestBadFile(Base):
     def check_quarantined(self, raw: bytes) -> None:
         self.write_raw(raw)

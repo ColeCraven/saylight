@@ -29,6 +29,14 @@ def speed_label(v: float) -> str:
     return f"{text}×"
 
 
+def elide_middle(text: str, limit: int) -> str:
+    """At most `limit` characters, with "…" in the middle: "Attention Is…for Dyslexia"."""
+    if len(text) <= limit:
+        return text
+    keep = limit - 1
+    return text[:(keep + 1) // 2].rstrip() + "…" + text[len(text) - keep // 2:].lstrip()
+
+
 class TrayIconEngine(QIconEngine):
     """Renders exactly the requested pixel size at DPR 1 so the shell never rescales (blur fix)."""
 
@@ -133,6 +141,7 @@ class Tray:
     # --- State ------------------------------------------------------------------------------
 
     def set_state(self, state: str, info: dict) -> None:
+        was = self._state
         self._state, self._info = state, info
         if state == "nothing_selected":
             self._set_badge("Caution", 3000)
@@ -140,9 +149,15 @@ class Tray:
             self._set_badge("Critical", 60_000)
         elif state == "shortcut_unavailable":
             self._set_badge("Critical", 0)
-        elif state in ("copying", "preparing", "reading", "waiting", "paused"):
+        elif state == "open_failed":  # a Caution dot stays while the notice is up; a Critical one for 60 s
+            critical = info.get("kind") in ("corrupt", "io", "missing")
+            self._set_badge("Critical" if critical else "Caution", 60_000 if critical else 0)
+        elif state in ("copying", "opening", "preparing", "reading", "waiting", "paused"):
             self._set_badge(None, 0)
-        animated = state in ("copying", "preparing", "reading", "waiting") and not self.theme.reduced_motion
+        elif was == "open_failed" and self._badge == "Caution":
+            self._set_badge(None, 0)
+        animated = (state in ("copying", "opening", "preparing", "reading", "waiting")
+                    and not self.theme.reduced_motion)
         if animated and not self._anim.isActive():
             self._frame = 0
             self._anim.start()
@@ -172,7 +187,7 @@ class Tray:
         fg = t.tray_color("Foreground")
         state = self._state
         spec = {"mode": "idle", "color": fg, "frame": self._frame, "opacity": 1.0}
-        if state in ("copying", "preparing", "waiting"):
+        if state in ("copying", "opening", "preparing", "waiting"):
             spec["mode"] = "wave"
         elif state == "reading":
             spec["mode"] = "reading" if not t.reduced_motion else "idle"
@@ -190,15 +205,29 @@ class Tray:
         self.icon.setIcon(QIcon(TrayIconEngine(self._icon_spec())))
 
     def _tooltip(self) -> str:
+        text = self._state_tooltip()
+        saving = getattr(self.ctl, "save_fraction", lambda: None)()
+        if saving is not None:  # a save's progress is always the second line
+            text = text.split("\n")[0] + f"\nSaving audio {int(saving * 100)}%"
+        return text
+
+    def _state_tooltip(self) -> str:
         i = self._info
         st = self._state
         counter = f"{i.get('sentence', 0) + 1} of {i.get('total', 0)}" if i.get("total") else ""
+        if i.get("source") == "file" and i.get("page") and i.get("pages"):
+            counter = f"page {i['page']} of {i['pages']}"
         if st in ("ready", "finished", "stopped"):
             label = {"ready": "Ready", "finished": "Finished", "stopped": "Stopped"}[st]
             return f"Saylight · {label}\nClick to show or hide · Ctrl+` reads"
         if st == "ready_offline":
             return "Saylight · Offline (reading needs internet)"
-        if st in ("copying", "preparing", "waiting"):
+        if st == "opening" and i.get("open_kind") == "file":
+            title = elide_middle(i.get("title", ""), 40)
+            done, total = i.get("open_done") or 0, i.get("open_total") or 0
+            pages = f" page {max(1, done)} of {total}" if total and done < total else ""
+            return f"Saylight · Opening “{title}”…{pages}" if title else f"Saylight · Opening a file…{pages}"
+        if st in ("copying", "preparing", "waiting", "opening"):
             return "Saylight · Preparing audio…"
         if st == "reading":
             return f"Saylight · Reading {counter} · {speed_label(self.ctl.speed())}\nCtrl+` or middle-click to pause"
@@ -209,6 +238,15 @@ class Tray:
         if st == "shortcut_unavailable":
             return "Saylight · Ctrl+` is in use by another app"
         return f"Saylight · {i.get('label', 'Error')}"
+
+    def refresh(self) -> None:
+        """The tooltip again (a save's progress changed)."""
+        self.icon.setToolTip(self._tooltip()[:127])
+
+    def flash_badge(self, token: str | None, ms: int = 0) -> None:
+        """A dot on the icon for something that happened away from the panel (a failed save, an open notice)."""
+        self._set_badge(token, ms)
+        self._refresh_icon()
 
     # --- Interaction --------------------------------------------------------------------------
 
@@ -234,6 +272,9 @@ class Tray:
         ctl = self.ctl
         if ctl.composing():
             ctl.close_compose("tray")  # keeps the text; aboutToHide gives the foreground back
+        close_sheets = getattr(ctl, "close_sheets", None)
+        if close_sheets is not None:
+            close_sheets("tray")
         m = self.menu
         m.clear()
         header = m.addAction(self._tooltip().split("\n")[0])
@@ -248,20 +289,40 @@ class Tray:
         hud.setChecked(bool(ctl.settings.get("hud_when_hidden")))
         hud.triggered.connect(lambda on: ctl.settings.set("hud_when_hidden", on))
         m.addSeparator()
-        m.addAction("Open a file…").setEnabled(False)  # a placeholder until Saylight can open documents
+        state = self._state
         can_type = bool(self._info.get("can_type"))
+        files = hasattr(ctl, "choose_file")
+        opened = m.addAction("Open a file…", lambda: ctl.choose_file("tray")) if files else m.addAction("Open a file…")
+        opened.setEnabled(files and can_type)  # not while copying or opening
+        point = getattr(ctl, "continue_point", lambda: None)()
+        if point is not None:
+            m.addAction(f"Continue reading “{elide_middle(point[0], 32)}”", lambda: ctl.continue_reading("tray"))
+        if state == "open_failed" and self._info.get("kind") == "password":
+            m.addAction("Enter PDF password…", lambda: ctl.open_password("tray"))
         compose = m.addAction("Type or paste text…", lambda: ctl.open_compose("tray"))
         compose.setEnabled(can_type)
-        if self._state in ("copying", "preparing", "reading", "waiting", "paused"):
-            m.addAction("Resume" if self._state == "paused" else "Pause", ctl.engine.toggle_pause)
+        under = self._info.get("underlying") if state in ("open_failed", "nothing_selected") else state
+        if under in ("copying", "opening", "preparing", "reading", "waiting", "paused"):
+            m.addAction("Resume" if under == "paused" else "Pause", ctl.engine.toggle_pause)
             m.addAction("Stop", ctl.engine.stop)
         elif ctl.has_text():
             m.addAction("Read again from start", ctl.engine.replay_from_start)
+        if under == "finished" and self._info.get("end_of_main_text") and hasattr(ctl, "read_sections"):
+            m.addAction("Read the notes and references too", ctl.read_sections)
         if self._info.get("can_clear") or (can_type and ctl.has_draft()):
             m.addAction("Clear text", ctl.clear_box)
         if ctl.can_undo_clear():
             m.addAction("Undo clear", ctl.undo_clear)
         m.addSeparator()
+        saving = getattr(ctl, "save_fraction", lambda: None)()
+        if saving is not None:
+            m.addAction(f"Saving audio… {int(saving * 100)}%").setEnabled(False)
+            m.addAction("Cancel saving audio", ctl.cancel_save)
+        elif hasattr(ctl, "open_save"):
+            save = m.addAction("Save as audio…", lambda: ctl.open_save("tray"))
+            save.setEnabled(ctl.engine.document is not None and state != "opening")
+        if getattr(ctl, "saved_audio", lambda: "")():
+            m.addAction("Show saved audio in folder", ctl.show_saved_audio)
         speed_menu = m.addMenu("Speed")
         group = QActionGroup(speed_menu)
         current = ctl.speed()
@@ -272,6 +333,8 @@ class Tray:
             a.triggered.connect(lambda _=False, v=v: ctl.set_speed(v))
             group.addAction(a)
             speed_menu.addAction(a)
+        if hasattr(ctl, "open_pronunciations"):
+            m.addAction("Pronunciations…", lambda: ctl.open_pronunciations("tray"))
         m.addAction("Settings…", ctl.open_settings)
         m.addSeparator()
         update = self._update_item()
@@ -284,4 +347,4 @@ class Tray:
         m.addAction("Reset panel position", ctl.reset_position)
         m.addAction("Open log", ctl.open_log)
         m.addSeparator()
-        m.addAction("Quit Saylight", ctl.quit)
+        m.addAction("Quit Saylight (stops saving audio)" if saving is not None else "Quit Saylight", ctl.quit)

@@ -285,6 +285,7 @@ class TestHighContrast(unittest.TestCase):
         self.assertEqual((colors["keycap_fill"], colors["keycap_stroke"], colors["keycap_text"]),
                          (QColor(*HC_COLORS["window"]), QColor(*HC_COLORS["windowtext"]),
                           QColor(*HC_COLORS["windowtext"])))
+        self.assertEqual(colors["skipped"], QColor(*HC_COLORS["graytext"]))  # text shown but not read aloud
 
     def test_bad_system_colours_use_defaults(self) -> None:
         theme = make(hc=True, colors={"window": None, "windowtext": (1, 2), "highlight": "x"})
@@ -446,6 +447,7 @@ class TestReadingPresets(unittest.TestCase):
             self.assertEqual((colors["keycap_fill"], colors["keycap_stroke"]),
                              (QColor(T._LIGHT["KeycapFill"]), QColor(T._LIGHT["KeycapStroke"])))
             self.assertEqual(hexes(colors["keycap_text"]), "#24211C")
+            self.assertEqual(colors["skipped"], colors["secondary"])
             unknown = make(FakeSettings(reading_tint="gone"), scheme_dark=False).reading_colors()
             self.assertEqual(hexes(unknown["background"]), T._CREAM["background"])
 
@@ -458,6 +460,22 @@ class TestReadingPresets(unittest.TestCase):
         self.assertEqual((hexes(dark["keycap_fill"]), hexes(dark["keycap_stroke"])), ("#2F2F31", "#474747"))
         for colors in (light, dark):
             self.assertGreaterEqual(contrast_ratio(colors["keycap_text"], colors["keycap_fill"]), 4.5)
+
+    def test_skipped_text_is_readable_and_unlike_earlier_sentences(self) -> None:
+        """Text shown but not read aloud reaches 4.5:1 on the background and on the band (a skipped citation can sit
+        in the current sentence), at about the lightness of the earlier sentences but with the opposite hue cast."""
+        for tint in T.READING_PRESETS:
+            for dark in (True, False):
+                colors = make(FakeSettings(reading_tint=tint), scheme_dark=dark).reading_colors()
+                with self.subTest(tint=tint, dark=dark):
+                    self.assertIn("skipped", T.READING_PRESETS[tint]["dark" if dark else "light"])
+                    for bg in ("background", "band"):
+                        self.assertGreaterEqual(contrast_ratio(colors["skipped"], colors[bg]), 4.5, bg)
+                    gap = abs(colors["skipped"].hsvHue() - colors["secondary"].hsvHue()) % 360
+                    self.assertGreaterEqual(min(gap, 360 - gap), 90)
+                    ratio = (contrast_ratio(colors["skipped"], colors["background"])
+                             / contrast_ratio(colors["secondary"], colors["background"]))
+                    self.assertLess(abs(ratio - 1), 0.15)
 
     def test_every_preset_is_readable(self) -> None:
         """Every preset, including any added later, meets WCAG AA (4.5:1) for all reading text."""

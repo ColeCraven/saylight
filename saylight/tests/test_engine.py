@@ -4,8 +4,12 @@ Everything is faked: synth, player, input thread and settings are QObjects with 
 and a fake clock drives the engine's injected one-shot timers. No audio, no network, no windows.
 """
 
+import hashlib
 import logging
+import os
 import re
+import shutil
+import tempfile
 import unittest
 from dataclasses import dataclass
 from unittest import mock
@@ -13,7 +17,8 @@ from unittest import mock
 from PySide6.QtCore import QObject, Signal
 
 from saylight import engine as E
-from saylight.text_model import Document
+from saylight.resume import ResumePoint, ResumeStore
+from saylight.text_model import BuildOptions, Document
 
 _quiet = logging.NullHandler()
 
@@ -241,14 +246,14 @@ class FakeSettings(QObject):
 class H:
     """Test harness: an engine wired to fakes, with recorders for every engine signal."""
 
-    def __init__(self, synth=None, **settings):
+    def __init__(self, synth=None, engine_kwargs=None, **settings):
         self.clock = FakeClock()
         self.synth, self.player, self.input = synth or FakeSynth(), FakePlayer(), FakeInput()
         self.settings = FakeSettings(**settings)
         self.beeps: list[str] = []
         self.engine = E.Engine(synth=self.synth, player=self.player, input_thread=self.input,
                                settings=self.settings, clock=self.clock, timer_factory=self.clock.timer,
-                               beep=self.beeps.append)
+                               beep=self.beeps.append, **(engine_kwargs or {}))
         e = self.engine
         self.states, self.sessions, self.positions, self.time_left = [], [], [], []
         self.speeds, self.volumes, self.notices, self.media = [], [], [], []
@@ -2809,6 +2814,524 @@ class SynthExtrasTests(unittest.TestCase):
         self.assertEqual(h.synth.readings, 2)
         self.assertTrue(h.engine.read_text(make_text(2)))
         self.assertEqual(h.synth.readings, 3)
+
+
+# --- Files: opening, open notices, rebuilds, spoken-span progress and resume --------------------
+
+class FakeSource:
+    """Stands in for documents.DocSource."""
+
+    def __init__(self, kind="file", path="", title=""):
+        self.kind, self.path, self.title = kind, path, title
+
+
+class FakeLoaded:
+    """Stands in for documents.LoadedDocument: the raw input of a file."""
+
+    def __init__(self, text, pages=0):
+        self.text, self.pages = text, pages
+
+
+NOTES = "\n\nNotes\n\nA note that is shown but not read aloud. Another one."
+
+
+def file_doc(n=12, *, path="", title="Smith 2024", tail="", pages_of=None) -> Document:
+    """A document read from a file: n test sentences, then `tail` (shown, never spoken)."""
+    body = Document.from_raw(make_text(n))
+    doc = Document(body.text + tail, body.sentences)
+    doc.source = FakeSource("file", path, title)
+    if pages_of is not None:
+        doc.page_of = pages_of
+    return doc
+
+
+class FakeBuilder:
+    """builder(raw) -> Document, recording calls; with `async_=True` it also has start(token, raw)."""
+
+    def __init__(self, make, async_=False):
+        self.make, self.calls, self.started = make, [], []
+        if async_:
+            self.start = lambda token, raw: self.started.append((token, raw))
+
+    def __call__(self, raw):
+        self.calls.append(raw)
+        return self.make(raw)
+
+
+class FakeStore:
+    """Stands in for resume.ResumeStore."""
+
+    def __init__(self, found=None):
+        self.found, self.lookups, self.remembered, self.forgotten = found, [], [], []
+
+    def lookup(self, path, size, mtime_ns, fingerprint):
+        self.lookups.append((path, size, mtime_ns, fingerprint))
+        return self.found
+
+    def remember(self, point):
+        self.remembered.append(point)
+
+    def forget(self, path=None):
+        self.forgotten.append(path)
+
+
+def opened(h, doc, raw=None, title="Smith 2024") -> int:
+    """Open `doc` as a file through begin_opening and read_document; returns the token."""
+    token = h.engine.begin_opening(title, "file")
+    assert h.engine.read_document(doc, raw if raw is not None else FakeLoaded(doc.text), token=token)
+    return token
+
+
+class OpeningTests(unittest.TestCase):
+    def test_opening_shows_after_150_ms_and_reads_the_file(self):
+        h = H()
+        cancelled = []
+        h.engine.openingCancelled.connect(cancelled.append)
+        token = h.engine.begin_opening("Smith 2024", "file")
+        self.assertEqual(h.state, E.OPENING)
+        self.assertEqual(h.shown, E.READY)
+        h.advance(E.OPEN_SHOW_MS - 1)
+        self.assertEqual(h.shown, E.READY)
+        h.advance(2)
+        self.assertEqual(h.shown, E.OPENING)
+        info = h.info
+        self.assertEqual((info["label"], info["title"], info["open_kind"]), ("Opening…", "Smith 2024", "file"))
+        self.assertEqual(info["play_action"], "none")
+        self.assertTrue(info["can_stop"])
+        self.assertFalse(info["can_type"] or info["can_clear"] or info["can_seek"] or info["can_next"])
+        self.assertIn("opening", h.notices)
+        h.engine.opening_progress(token, 40, 160)
+        self.assertEqual((h.info["open_done"], h.info["open_total"]), (40, 160))
+        self.assertEqual(h.positions[-1], (-1, -1, -1, 0.0, 0.25, False))
+        h.engine.opening_progress(token + 1, 80, 160)  # not this opening's
+        self.assertEqual(h.info["open_done"], 40)
+        doc, raw = file_doc(), FakeLoaded("raw text", pages=18)
+        self.assertTrue(h.engine.read_document(doc, raw, token=token))
+        self.assertEqual(h.state, E.PREPARING)
+        self.assertIs(h.sessions[-1], doc)
+        self.assertIs(h.engine.raw, raw)
+        self.assertEqual((h.info["source"], h.info["title"], h.info["pages"]), ("file", "Smith 2024", 18))
+        self.assertEqual(cancelled, [])
+        self.assertEqual(h.beeps, [])
+
+    def test_the_current_document_stays_until_the_new_one_is_read(self):
+        h = H()
+        a, _ = h.play()
+        old = h.engine.document
+        token = h.engine.begin_opening("Smith 2024", "file")
+        self.assertEqual(h.state, E.OPENING)
+        self.assertIn(("pause",), h.player.cmds)  # a reading pauses, as it does for Ctrl+`
+        self.assertIs(h.engine.document, old)
+        self.assertEqual(len(h.sessions), 1)
+        doc = file_doc(4)
+        h.engine.read_document(doc, FakeLoaded(doc.text), token=token)
+        self.assertIs(h.engine.document, doc)
+
+    def test_stop_cancels_opening_and_returns_to_the_paused_reading(self):
+        h = H()
+        a, _ = h.play()
+        cancelled = []
+        h.engine.openingCancelled.connect(cancelled.append)
+        token = h.engine.begin_opening("Smith 2024", "file")
+        h.advance(E.OPEN_SHOW_MS + 1)
+        beeps = len(h.beeps)
+        h.engine.stop()
+        self.assertEqual((h.state, h.shown), (E.PAUSED, E.PAUSED))
+        self.assertEqual(cancelled, [token])
+        self.assertEqual(len(h.beeps), beeps)  # no beep and no notice for a cancel
+        self.assertEqual(h.positions[-1][0], 0)  # the old document's place comes back
+        self.assertFalse(h.engine.read_document(file_doc(), token=token))  # the loader's late answer
+        self.assertTrue(h.engine.resume())
+        self.assertEqual(h.state, E.READING)
+
+    def test_opening_again_replaces_the_open_in_progress(self):
+        h = H()
+        cancelled = []
+        h.engine.openingCancelled.connect(cancelled.append)
+        first = h.engine.begin_opening("One", "file")
+        second = h.engine.begin_opening("Two", "file")
+        self.assertEqual(cancelled, [first])
+        self.assertFalse(h.engine.read_document(file_doc(), token=first))
+        h.engine.opening_failed(first, "io")  # stale: ignored
+        self.assertEqual(h.state, E.OPENING)
+        self.assertTrue(h.engine.read_document(file_doc(), token=second))
+
+    def test_failure_shows_a_notice_that_stays_until_the_next_action(self):
+        for kind, beep in (("password", "ok"), ("protected", "ok"), ("scanned", "ok"), ("unsupported", "ok"),
+                           ("too_large", "ok"), ("corrupt", "error"), ("io", "error")):
+            with self.subTest(kind):
+                h = H()
+                token = h.engine.begin_opening("Smith 2024", "file")
+                h.engine.opening_failed(token, kind)
+                self.assertEqual(h.shown, E.OPEN_FAILED)
+                self.assertEqual((h.info["kind"], h.info["title"], h.info["underlying"]),
+                                 (kind, "Smith 2024", E.READY))
+                self.assertEqual(h.info["label"], E.OPEN_LABELS[kind])
+                self.assertEqual((h.beeps, h.notices[-1]), ([beep], "open_failed"))
+                h.advance(60_000)
+                self.assertEqual(h.shown, E.OPEN_FAILED)
+                h.engine.stop()
+                self.assertEqual((h.shown, h.info["kind"]), (E.READY, ""))
+
+    def test_under_a_notice_play_acts_on_the_paused_reading(self):
+        h = H()
+        a, _ = h.play()
+        token = h.engine.begin_opening("Smith 2024", "file")
+        h.engine.opening_failed(token, "password")
+        self.assertEqual((h.shown, h.info["underlying"], h.info["play_action"]), (E.OPEN_FAILED, E.PAUSED, "resume"))
+        self.assertEqual(h.media[-1], True)  # media keys still work under the notice
+        h.engine.toggle_pause()
+        self.assertEqual((h.state, h.shown), (E.READING, E.READING))
+
+    def test_a_new_read_or_dismiss_ends_the_notice(self):
+        h = H()
+        h.engine.open_notice("missing", "Smith 2024")
+        self.assertEqual((h.shown, h.info["label"], h.beeps), (E.OPEN_FAILED, "File not found", ["error"]))
+        h.engine.dismiss_notice()
+        self.assertEqual(h.shown, E.READY)
+        h.engine.open_notice("unsupported")
+        self.assertTrue(h.engine.read_text(make_text(2)))
+        self.assertEqual(h.state, E.PREPARING)
+        h.engine.open_notice("unsupported")  # over a reading: it pauses underneath
+        self.assertEqual((h.shown, h.info["underlying"]), (E.OPEN_FAILED, E.PAUSED))
+        h.press()
+        self.assertEqual(h.state, E.PAUSED)  # Ctrl+` ended the notice; the copy result decides
+
+    def test_an_empty_document_gives_the_empty_notice(self):
+        h = H()
+        token = h.engine.begin_opening("Blank", "file")
+        self.assertFalse(h.engine.read_document(Document("", []), FakeLoaded(""), token=token))
+        self.assertEqual((h.shown, h.info["kind"], h.info["title"]), (E.OPEN_FAILED, "empty", "Blank"))
+
+    def test_ctrl_grave_and_typed_text_replace_the_opening(self):
+        h = H()
+        cancelled = []
+        h.engine.openingCancelled.connect(cancelled.append)
+        token = h.engine.begin_opening("Smith 2024", "file")
+        h.press()
+        self.assertEqual(cancelled, [token])
+        self.assertEqual(h.state, E.COPYING)
+        h.copied(make_text(3))
+        self.assertEqual(h.state, E.PREPARING)
+        token = h.engine.begin_opening("Smith 2024", "file")
+        self.assertTrue(h.engine.read_text(make_text(2)))
+        self.assertEqual(cancelled[-1], token)
+        self.assertEqual(len(h.sessions[-1].sentences), 2)
+
+    def test_clear_while_opening_keeps_the_open_going(self):
+        h = H()
+        h.play()
+        token = h.engine.begin_opening("Smith 2024", "file")
+        self.assertIsNotNone(h.engine.clear())
+        self.assertIsNone(h.engine.document)
+        self.assertEqual(h.state, E.OPENING)
+        self.assertTrue(h.engine.read_document(file_doc(), token=token))
+
+    def test_logs_never_hold_titles(self):
+        with self.assertLogs("saylight.engine", "INFO") as logs:
+            h = H()
+            token = h.engine.begin_opening("Secret Title", "file")
+            h.engine.opening_failed(token, "password")
+            h.engine.open_notice("missing", "Secret Title")
+        output = "\n".join(logs.output)
+        self.assertIn("Open failed: password", output)
+        self.assertNotIn("Secret", output)
+
+
+class SpokenSpanTests(unittest.TestCase):
+    def test_progress_measures_the_spoken_span_only(self):
+        """Notes shown after the main text don't count, so Finished is 100% and the bar never stops at 44%."""
+        h = H()
+        doc = file_doc(4, tail=NOTES)
+        h.engine.read_document(doc, FakeLoaded(doc.text))
+        lo, hi = E.spoken_span(doc)
+        self.assertEqual((lo, hi), (0, doc.sentences[-1].end))
+        self.assertLess(hi, len(doc.text))
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.tick(a, s_start(1) + 600 + 125)  # half-way through "alpha" of sentence 1
+        _, wlo, whi, played, buffered, _ = h.positions[-1]
+        self.assertAlmostEqual(played, (doc.sentences[1].start + wlo + (whi - wlo) * 0.5) / hi)
+        self.assertAlmostEqual(buffered, 1.0)  # the one chunk holds every spoken sentence
+        h.end(a)
+        self.assertEqual(h.state, E.FINISHED)
+        self.assertAlmostEqual(h.positions[-1][3], 1.0)
+        self.assertTrue(h.info["end_of_main_text"])
+
+    def test_no_end_of_main_text_without_an_unspoken_tail(self):
+        h = H()
+        a, _ = h.play(4)
+        h.end(a)
+        self.assertEqual(h.state, E.FINISHED)
+        self.assertFalse(h.info["end_of_main_text"])
+
+    def test_span_fraction(self):
+        doc = file_doc(4, tail=NOTES)
+        hi = doc.sentences[-1].end
+        self.assertEqual(E.span_fraction(doc, hi / 2), 0.5)
+        self.assertEqual(E.span_fraction(doc, len(doc.text)), 1.0)
+        self.assertEqual(E.span_fraction(None, 3), 0.0)
+        self.assertEqual(E.spoken_span(Document("", [])), (0, 0))
+
+    def test_time_left_counts_spoken_characters_only(self):
+        values = []
+        for tail in ("", NOTES * 20):
+            h = H()
+            doc = file_doc(12, tail=tail)
+            h.engine.read_document(doc, FakeLoaded(doc.text))
+            a = h.req(0)["chunk_id"]
+            h.ready(a)
+            h.started(a)
+            h.tick(a, 100)
+            values.append(h.time_left[-1])
+        self.assertGreater(values[0], 0)
+        self.assertEqual(values[0], values[1])
+
+
+class RebuildTests(unittest.TestCase):
+    def test_settings_rebuild_at_rest_keeps_the_place(self):
+        builder = FakeBuilder(lambda raw: Document.from_raw(raw))
+        h = H(engine_kwargs={"builder": builder})
+        a, _ = h.play(12)
+        h.tick(a, s_start(2) + 100)
+        h.engine.stop()
+        self.assertEqual(h.engine.current_sentence, 2)
+        builder.calls.clear()
+        h.settings.set("skip_citations", False)
+        h.settings.set("skip_urls", False)  # two changes, one rebuild
+        h.advance(1)
+        self.assertEqual(len(builder.calls), 1)
+        self.assertIsNot(h.sessions[-1], h.sessions[0])
+        self.assertEqual((h.state, h.engine.current_sentence), (E.STOPPED, 2))
+
+    def test_rebuild_while_reading_keeps_unchanged_audio_playing(self):
+        """Adding a section after the main text leaves every sentence read so far as it was: no restart."""
+        base = make_text(6)
+        builder = FakeBuilder(lambda raw: Document.from_raw(raw))
+        h = H(engine_kwargs={"builder": builder})
+        h.engine.read_text(base)
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.tick(a, s_start(1) + 100)
+        builder.make = lambda raw: Document.from_raw(raw + " " + make_text(9)[len(base) + 1:])
+        closes, loads = len(h.cmds("stop_close")), len(h.cmds("load"))
+        h.engine.rebuild()
+        self.assertEqual((len(h.cmds("stop_close")), len(h.cmds("load"))), (closes, loads))
+        self.assertEqual((h.state, h.engine.current_sentence), (E.READING, 1))
+        self.assertEqual(len(h.engine.document.sentences), 9)
+
+    def test_rebuild_that_changes_the_current_sentence_restarts_it(self):
+        builder = FakeBuilder(lambda raw: Document.from_raw(raw))
+        h = H(engine_kwargs={"builder": builder})
+        h.engine.read_text(make_text(6))
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.tick(a, s_start(2) + 100)
+        builder.make = lambda raw: Document.from_raw(raw.replace("Sentence 00", "Line 00"))
+        h.engine.rebuild()
+        self.assertEqual(h.engine.current_sentence, 2)
+        self.assertIn("Line 002", h.req()["text"])  # re-planned from the same sentence
+        self.assertEqual(h.state, E.WAITING)
+
+    def test_long_text_is_built_on_the_worker(self):
+        builder = FakeBuilder(lambda raw: Document.from_raw(raw), async_=True)
+        h = H(engine_kwargs={"builder": builder})
+        text = make_text(400)  # over 20k characters
+        self.assertGreater(len(text), E.BUILD_ASYNC_CHARS)
+        self.assertTrue(h.engine.read_text(text))
+        self.assertEqual(builder.calls, [])
+        (token, raw), = builder.started
+        self.assertEqual((h.state, raw), (E.OPENING, text))
+        h.advance(E.OPEN_SHOW_MS + 1)
+        self.assertEqual((h.info["label"], h.info["open_kind"]), ("Preparing audio…", "text"))
+        self.assertTrue(h.engine.read_document(Document.from_raw(text), text, token=token))
+        self.assertEqual(h.state, E.PREPARING)
+        self.assertIs(h.engine.raw, text)
+        # a rebuild of it goes to the worker too, and comes back keeping the place
+        h.engine.rebuild()
+        rebuild_token, _ = builder.started[-1]
+        self.assertNotEqual(rebuild_token, token)
+        self.assertEqual(h.state, E.PREPARING)
+        self.assertFalse(h.engine.read_document(Document.from_raw(text), "other raw", token=rebuild_token))
+        h.engine.rebuild()
+        newer, _ = builder.started[-1]
+        h.engine.opening_failed(newer, "corrupt")  # a failed rebuild keeps the document, with no notice
+        self.assertEqual((h.state, h.beeps), (E.PREPARING, []))
+        h.engine.rebuild()
+        newest, _ = builder.started[-1]
+        rebuilt = Document.from_raw(text)
+        self.assertTrue(h.engine.read_document(rebuilt, text, token=newest))
+        self.assertIs(h.engine.document, rebuilt)
+        self.assertEqual(h.state, E.PREPARING)
+
+    def test_from_finished_a_section_chip_reads_that_section(self):
+        body = make_text(3)
+
+        def build(raw, notes=False):
+            doc = Document.from_raw(raw if not notes else raw + " Notes heading here. A note to read.")
+            offset = len(Document.from_raw(raw).text) + 1
+            doc.sections = {"notes": offset}
+            return doc
+
+        builder = FakeBuilder(build)
+        h = H(engine_kwargs={"builder": builder})
+        h.engine.read_text(body)
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.end(a)
+        self.assertEqual(h.state, E.FINISHED)
+        builder.make = lambda raw: build(raw, notes=True)
+        h.engine.rebuild(read_section="notes")
+        self.assertEqual((h.state, h.engine.current_sentence), (E.WAITING, 3))
+        self.assertTrue(h.req()["text"].startswith("Notes heading here."))
+
+    def test_default_build_without_a_builder(self):
+        h = H(skip_citations=False)
+        h.engine.read_text("Reading improved (Smith, 2020). It lasted.")
+        self.assertIn("(Smith, 2020)", h.sessions[-1].text)
+
+    def test_purge_forgets_the_raw_input(self):
+        h = H()
+        h.engine.read_text(make_text(3))
+        self.assertIsNotNone(h.engine.raw)
+        token = h.engine.clear()
+        self.assertIsNone(h.engine.raw)
+        h.engine.restore(token)
+        self.assertEqual(h.engine.raw, make_text(3))
+
+
+class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".pdf")
+        os.write(fd, b"%PDF test")
+        os.close(fd)
+
+    def tearDown(self):
+        os.remove(self.path)
+
+    def point(self, sentence, offset=None, fingerprint="", exact=True):
+        """A saved place; `offset` defaults to where `sentence` starts in file_doc(12)."""
+        if offset is None:
+            starts = [s.start for s in file_doc(12).sentences]
+            offset = starts[sentence] if 0 <= sentence < len(starts) else 0
+        st = os.stat(self.path)
+        return (ResumePoint(self.path, st.st_size, st.st_mtime_ns, fingerprint, offset, sentence, 1.0, 3), exact)
+
+    def test_an_exact_match_continues_from_the_saved_sentence(self):
+        store = FakeStore(self.point(5))
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        applied = []
+        h.engine.resumeApplied.connect(applied.append)
+        doc = file_doc(12, path=self.path)
+        opened(h, doc)
+        (path, size, mtime_ns, fingerprint), = store.lookups
+        self.assertEqual((path, size), (self.path, os.stat(self.path).st_size))
+        self.assertEqual(fingerprint, hashlib.sha256(doc.text.encode("utf-8")).hexdigest())
+        self.assertEqual((applied, h.engine.current_sentence, h.engine.resumed), ([5], 5, (5, True)))
+        self.assertTrue(h.req(0)["text"].startswith(sentence(5)))
+
+    def test_an_exact_match_keeps_the_place_after_skip_citations_changes(self):
+        # The fingerprint covers the shown text, which Skip citations doesn't change, but sentences are split on
+        # the spoken text, so the saved sentence number can point somewhere else; the offset can't.
+        text = ("Earlier work agrees (Smith et al. 2019). (Jones, 2020) argues otherwise. A third sentence follows "
+                "here. And a fourth one.")
+        before = Document.build(text, BuildOptions(skip_citations=True))
+        after = Document.build(text, BuildOptions(skip_citations=False))
+        after.source = FakeSource("file", self.path, "paper")
+        self.assertEqual(before.fingerprint(), after.fingerprint())
+        self.assertNotEqual(len(before.sentences), len(after.sentences))
+        folder = tempfile.mkdtemp(prefix="slrs")
+        self.addCleanup(shutil.rmtree, folder, True)
+        store = ResumeStore(os.path.join(folder, "resume.json"))
+        k = len(before.sentences) - 1
+        st = os.stat(self.path)
+        store.remember(ResumePoint(self.path, st.st_size, st.st_mtime_ns, before.fingerprint(),
+                                   before.sentences[k].start, k, 1.0, 0))
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        opened(h, after)
+        self.assertEqual(after.sentences[h.engine.current_sentence].text, "And a fourth one.")
+
+    def test_a_changed_file_continues_near_the_saved_offset(self):
+        doc = file_doc(12, path=self.path)
+        store = FakeStore(self.point(99, offset=doc.sentences[7].start + 3, exact=False))
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        opened(h, doc)
+        self.assertEqual(h.engine.resumed, (7, False))
+
+    def test_saves_paths_and_numbers_on_pause_stop_and_every_30_s(self):
+        store = FakeStore()
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        doc = file_doc(12, path=self.path, pages_of=lambda s: 1 + s // 4)
+        opened(h, doc)
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.tick(a, s_start(2) + 100)
+        self.assertEqual(store.remembered, [])
+        h.advance(E.RESUME_SAVE_MS)
+        self.assertEqual(len(store.remembered), 1)
+        h.engine.pause()
+        point = store.remembered[-1]
+        self.assertEqual((point.path, point.sentence, point.offset, point.page),
+                         (self.path, 2, doc.sentences[2].start, 1))
+        for value in (point.size, point.mtime_ns, point.offset, point.sentence, point.page):
+            self.assertIsInstance(value, int)
+        self.assertNotIn(doc.sentences[2].text, repr(point))
+        h.engine.stop()
+        self.assertEqual(len(store.remembered), 3)
+        h.advance(E.RESUME_SAVE_MS * 3)  # nothing more while stopped
+        self.assertEqual(len(store.remembered), 3)
+
+    def test_finishing_forgets_the_file(self):
+        store = FakeStore()
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        opened(h, file_doc(4, path=self.path))
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        h.end(a)
+        self.assertEqual((h.state, store.forgotten), (E.FINISHED, [self.path]))
+        remembered = len(store.remembered)
+        h.engine.clear()  # a finished file is not saved again
+        self.assertEqual(len(store.remembered), remembered)
+
+    def test_nothing_is_stored_with_resume_off_or_for_selections(self):
+        store = FakeStore(self.point(5))
+        h = H(engine_kwargs={"resume": store})
+        opened(h, file_doc(12, path=self.path))
+        self.assertEqual((store.lookups, h.engine.current_sentence), ([], 0))
+        h.engine.pause()
+        h.engine.stop()
+        h2 = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        h2.engine.read_text(make_text(6))
+        h2.engine.pause()
+        self.assertEqual((store.lookups, store.remembered, store.forgotten), ([], [], []))
+
+    def test_turning_resume_on_remembers_this_place_now(self):
+        store = FakeStore()
+        h = H(engine_kwargs={"resume": store})
+        opened(h, file_doc(12, path=self.path))
+        h.engine.stop()
+        self.assertEqual(store.remembered, [])
+        h.settings.set("resume.enabled", True)
+        self.assertEqual(len(store.remembered), 1)
+
+    def test_start_over_reads_from_the_first_sentence(self):
+        store = FakeStore(self.point(5))
+        h = H(engine_kwargs={"resume": store}, **{"resume.enabled": True})
+        opened(h, file_doc(12, path=self.path))
+        a = h.req(0)["chunk_id"]
+        h.ready(a)
+        h.started(a)
+        requests = len(h.synth.requests)
+        h.engine.start_over()
+        self.assertEqual((h.engine.current_sentence, h.engine.resumed), (0, None))
+        h.advance(E.SEEK_DELAY_MS + 1)
+        self.assertTrue(h.req(requests)["text"].startswith(sentence(0)))
 
 
 if __name__ == "__main__":

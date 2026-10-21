@@ -27,6 +27,21 @@ with nothing highlighted to show or hide the panel, or to pause and resume while
 (<kbd>Ctrl</kbd> + <kbd>Enter</kbd>). Highlight part of it and <kbd>Ctrl</kbd> + <kbd>`</kbd> reads just that part.
 The box uses your reading font, size and background, so what you type looks like what you'll hear.
 
+**Open documents.** Drop a PDF, Word, text or Markdown file on the panel, choose **Open a file**, or use
+**Open with** in File Explorer. Citations stay on screen, dimmed, and aren't read aloud. Footnotes, captions and
+tables move to a dimmed *Notes* section after the main text, and the reference list stays dimmed at the end, so
+reading stops where the paper does. One click on *Read the notes too* or *Read the references too* reads them
+for that file.
+
+**Pronunciations.** Right-click a word to change how it's said, and hear the sentence with the new pronunciation
+before you save it. Your list works with every voice, and you can import or export it.
+
+**Save as audio** (in the ⋯ menu or the tray) makes an MP3 you can listen to anywhere: the whole document, or
+from the page you're on.
+
+**Pick up where you left off** (off by default) remembers your place in each file, never its text. Open the
+file again and Saylight carries on from there.
+
 **Follow along as you listen.**
 - A soft band marks the sentence being read, and a highlight follows the current word.
 - Earlier sentences are dimmed slightly. Text you haven't reached is never dimmed, so you can read ahead of the voice.
@@ -36,7 +51,9 @@ The box uses your reading font, size and background, so what you type looks like
 **Made for academic text.**
 - Words split across PDF line breaks are rejoined ("compre- hension" becomes "comprehension").
 - Ligatures (ﬁ, ﬂ), page headers and manuscript line numbers are cleaned up.
-- Citations such as *(Smith et al., 2019)* and *[12]* can be skipped, and web links are read as "link".
+- Citations such as *(Smith et al., 2019)* and *[12]* are skipped but stay on screen, dimmed, and web links are
+  read as "link". Point at dimmed text to see why it isn't read.
+- Abbreviations are read in full: *Fig.* as "figure", *e.g.* as "for example", *pp.* as "pages".
 - Sentence splitting understands *et al.*, *e.g.*, *Fig. 3*, decimals and statistics, so the highlight stays accurate.
 
 **Reading display you can tune.** Choose the text size, font (Verdana, Segoe UI, Calibri or Sitka), letter and line
@@ -61,7 +78,10 @@ highlighted while they read.
 
 **Unobtrusive by design.**
 - The panel floats on top but never takes keyboard focus, so the app you're reading in stays active. Only the Type
-  or paste box takes the keyboard, and only while it's open; it hands it back when you read or press <kbd>Esc</kbd>.
+  or paste box, and the small windows for Pronunciations, Save as audio and a PDF password, take the keyboard,
+  only while they're open; they hand it back when you're done or press <kbd>Esc</kbd>.
+- Opening a file never pops the panel up or takes the keyboard. If the panel is hidden, the status pill says how
+  it's going.
 - A tray icon and a small status pill show what's happening while the panel is hidden.
 - Follows Windows dark and light mode, high-contrast themes, text scaling and the *Animation effects* setting.
 - When a new version is out, one quiet line in the panel says so, with **Install** and **Not now**. No pop-ups.
@@ -90,7 +110,9 @@ Every reading background keeps text contrast between 11:1 and 15:1 (WCAG AAA).
 
 Saylight works on Windows 10 and 11. It goes into `%LOCALAPPDATA%\Programs\Saylight` and appears in the Start
 menu. To remove it, open **Settings → Apps → Installed apps**, find Saylight and choose **Uninstall**. It asks
-whether to remove your settings too.
+whether to remove your settings too. Setup adds Saylight to **Open with** for PDF, Word, text and Markdown files
+without making it the default for any of them. If a kind of file had no default app chosen, Windows may ask
+which app to use the next time you open one.
 
 **The Python version.** Each release also has **Saylight-Python.zip**, the same app run by Python instead of
 packaged as an .exe. Use it if Smart App Control is on (see below), or if you'd rather run it through Python.
@@ -134,8 +156,8 @@ On the Python version, or when Smart App Control is on, the line offers **Get it
 release page, so you can download the new version yourself. Saylight never swaps itself for a copy Windows
 might refuse to start.
 
-To stop the daily check, open ⚙ **Settings → General** and choose **Turn off** next to *Saylight checks GitHub
-for updates once a day*. **Check for updates** on the same page still works whenever you click it.
+To stop the daily check, open ⋯ **More → Settings → General** and choose **Turn off** next to *Saylight checks
+GitHub for updates once a day*. **Check for updates** on the same page still works whenever you click it.
 
 ### Running from source
 
@@ -152,6 +174,7 @@ Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 | `python saylight_app.py --install` | Start with Windows, add a Start menu entry, and start now |
 | `python saylight_app.py --uninstall` | Undo `--install` and quit |
 | `python saylight_app.py --start` / `--quit` | Start or quit the running copy |
+| `python saylight_app.py <file>` | Open a PDF, Word, text or Markdown file (in the running copy, if there is one) |
 
 ## Using it
 
@@ -162,9 +185,13 @@ Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 | Show / hide the panel | <kbd>Ctrl</kbd> + <kbd>`</kbd> with nothing highlighted (when not reading), or click the tray icon |
 | Jump to a sentence | Click it, or use the progress bar |
 | Re-read | Scroll over the text, or press ⏮ to replay the sentence |
-| Text size | <kbd>Ctrl</kbd> + scroll over the text, or ⚙ **Settings → Reading display** |
-| Choose a voice | ⚙ **Settings → Voice**. Click a voice to use it, or ▶ to hear a sample first |
-| Start with Windows, updates | ⚙ **Settings → General** |
+| Open a file | Drop it on the panel, ⋯ **More → Open a file…**, or right-click it in File Explorer and choose **Open with → Saylight** |
+| Read the notes or references | The *Read the notes too* and *Read the references too* buttons after the main text |
+| Change how a word is said | Right-click it in the panel, or ⋯ **More → Pronunciations…** |
+| Save as audio | ⋯ **More → Save as audio…**, or the tray menu |
+| Text size | <kbd>Ctrl</kbd> + scroll over the text, or ⋯ **More → Settings → Reading display** |
+| Choose a voice, what's read aloud | ⋯ **More → Settings → Voice**. Click a voice to use it, or ▶ to hear a sample first |
+| Start with Windows, updates, picking up where you left off | ⋯ **More → Settings → General** |
 | Speed | − / + buttons, or scroll over the speed control |
 | Media keys | Play/Pause, Next and Previous work while it's reading |
 | Read your own text | Click ✎ or the empty reading box, type or paste, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> or **Read aloud**. Highlight part of it to hear just that part. <kbd>Esc</kbd> goes back and keeps your text |
@@ -180,15 +207,26 @@ only its fixed sample sentence, never your text.
 Saylight itself stores no text and no audio. Text is kept in memory only while you're reading, and the audio
 plays from short-lived files in a temporary folder that Saylight empties as it goes and deletes when it quits.
 Text you type or paste stays in memory until you clear it or quit Saylight, and is sent to Microsoft only when
-you have it read aloud.
+you have it read aloud. Opening a document works the same way: its text is read into memory and never saved.
+
+There are three exceptions, and each is something you choose:
+- **Save as audio** writes an audio file, only to the place you pick. If you cancel, or the save fails, the
+  unfinished file is deleted.
+- **Pronunciations** keeps the words you add, and what to say for them.
+- **Pick up where you left off**, when you switch it on, keeps each file's location and your place in it, never
+  its text. Turning it off deletes that list at once.
+
+A PDF password is used once, to open the file, and is never stored or logged. Windows itself adds files you open
+or save through Saylight's Open and Save dialogs to its Recent list, as it does for other apps.
 
 Saylight goes online for only these things:
-- speaking, and voice previews (Microsoft);
+- speaking, saving audio with an online voice, and voice previews (Microsoft);
 - the full voice list, only when you switch on **Show all languages** (Microsoft);
 - the daily update check, which you can turn off, and the download when you click **Install** (GitHub).
 
-Everything Saylight saves is in `%LOCALAPPDATA%\Saylight`: your settings and a log. The log records counts and
-error types only, never text, file names or window titles. Uninstalling asks whether to delete your settings.
+Everything Saylight saves is in `%LOCALAPPDATA%\Saylight`: your settings, a log, and the pronunciation list and
+saved places if you use them. The log records counts and error types only, never text, file names or window
+titles. Uninstalling asks whether to delete your settings.
 
 ## Development
 
@@ -196,7 +234,13 @@ error types only, never text, file names or window titles. Uninstalling asks whe
 saylight_app.py          entry point, command-line options and the start-up crash message
 saylight/
   academic_text.py       cleans copied text and splits sentences
+  alignment.py           maps what's spoken back to what's shown (dimmed citations, "figure" for Fig.)
   text_model.py          sentences, synthesis chunks and word timing
+  documents/             reading PDF, Word, text and Markdown files
+  pronunciations.py      the pronunciation list
+  export.py              Save as audio
+  resume.py              Pick up where you left off
+  single_instance.py     Open with: hands a file to the running copy
   engine.py              the reading state machine
   voices/                the voice interface, the online voices (edge-tts), the voice list and previews
   audio_cache.py         the temporary folder for audio chunks
@@ -206,13 +250,14 @@ saylight/
   paths.py               where Saylight keeps its data
   updates.py             the update check, download and checksum
   update_service.py      when to check, and Install
-  ui/                    the panel, settings tabs, controls, reading view, tray, status pill and tooltips
+  ui/                    the panel, its ⋯ menu, settings tabs, controls, reading view, tray, status pill and tooltips
   ui/compose.py          the Type or paste box
+  ui/sheet.py            the windows that take the keyboard: Pronunciations, Save as audio, the PDF password
 packaging/               the PyInstaller spec, the installer script, the licence gate and the build tests
 scripts/build_release.py builds dist/Saylight-Setup.exe and its .sha256 file
 ```
 
-Run the test suite (about 1,200 tests) from the project folder:
+Run the test suite (about 1,600 tests) from the project folder:
 
 ```
 python -m unittest discover -s saylight/tests -t .
@@ -227,6 +272,7 @@ checksum. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists what's inside.
 
 - [edge-tts](https://github.com/rany2/edge-tts) for access to the neural voices (LGPL-3.0)
 - [Qt for Python (PySide6)](https://doc.qt.io/qtforpython-6/) for the interface (LGPL-3.0)
+- [pypdf](https://github.com/py-pdf/pypdf) for reading PDFs (BSD-3-Clause)
 - [PyInstaller](https://pyinstaller.org/) and [Inno Setup](https://jrsoftware.org/isinfo.php) for the Windows app
   and its installer
 - Segoe Fluent Icons and Segoe UI Variable, which ship with Windows 11

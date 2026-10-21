@@ -348,6 +348,10 @@ class HotkeyAndThreadTests(unittest.TestCase):
     def test_key_down_is_bool(self):
         self.assertIsInstance(win32.key_down(win32.VK_F24), bool)
 
+    def test_key_state_is_two_bools(self):
+        state = win32.key_state(0x07)  # an unassigned key code
+        self.assertEqual([type(v) for v in state], [bool, bool])
+
     def test_send_keys_builds_press_then_reverse_release(self):
         seen = []
         with mock.patch.object(win32, "send_key_events", side_effect=lambda ev: seen.extend(ev) or True):

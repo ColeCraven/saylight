@@ -1,6 +1,7 @@
 """Tests for controls in ui/controls.py: the focusable Read aloud pill and Clear / Undo / Paste buttons of the Type
 or paste box (keyboard activation, the keyboard-only focus ring, sizes and the room kept for the ring), and the
-settings page's link line and navigation row.
+settings page's link line and navigation row, and the v1.3 additions: glyphs, action chips with label overrides,
+described and focusable toggle rows, the focusable segmented control and focusable navigation rows.
 
 Widgets are rendered into a QImage and never shown.
 """
@@ -9,12 +10,14 @@ import sys
 import unittest
 
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QFocusEvent, QFontMetricsF, QImage, QKeyEvent, QMouseEvent
+from PySide6.QtGui import QFocusEvent, QFontMetricsF, QImage, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication, QWidget
 
 from saylight.theme import Theme
-from saylight.ui.controls import (G_CLEAR, G_OPEN, G_PLAY, G_UNDO, FOCUS_PAD, IconButton, LinkText, NavRow,
-                                  PillButton, TextButton, text_button_size)
+from saylight.ui import controls as C
+from saylight.ui.controls import (ACTION_PARTS, DESCRIBED_H, G_CLEAR, G_OPEN, G_PLAY, G_UNDO, FOCUS_PAD, TOGGLE_H,
+                                  IconButton, LinkText, NavRow, PillButton, Segmented, TextButton, ToggleRow,
+                                  action_label, measure_parts, paint_parts, text_button_size)
 
 _app = None
 
@@ -272,6 +275,145 @@ class NavRowTests(unittest.TestCase):
         self.assertEqual(row.detail, "12 words")
         render(row)  # paints with a detail and a glyph
 
+
+class GlyphTests(unittest.TestCase):
+    def test_v13_code_points(self) -> None:
+        expected = {"G_MORE": 0xE712, "G_OPEN_FILE": 0xE838, "G_DOCUMENT": 0xE8A5, "G_SAVE": 0xE74E,
+                    "G_DONE": 0xE930, "G_FOLDER": 0xEC50, "G_SPEECH": 0xEFA9, "G_HISTORY": 0xE81C,
+                    "G_LOCK": 0xE72E, "G_EYE": 0xE7B3, "G_EYE_OFF": 0xED1A, "G_TEST": 0xE767, "G_DELETE": 0xE74D,
+                    "G_FIND": 0xE721, "G_IMPORT": 0xE8B5, "G_EXPORT": 0xEDE1, "G_CANCEL": 0xE711, "G_ARROW": 0xE72A,
+                    "G_CHEVRON": 0xE76C, "G_SETTINGS": 0xE713, "G_PLUS": 0xE710, "G_CHECK": 0xE73E,
+                    "G_RETRY": 0xE72C, "G_COLLAPSE": 0xE73F}
+        for name, code in expected.items():
+            self.assertEqual(getattr(C, name), chr(code), name)
+
+    def test_the_links_glyph_is_unchanged(self) -> None:
+        self.assertEqual(G_OPEN, chr(0xE8A7))  # OpenInNewWindow, for "Privacy and licences"
+
+
+class ActionChipTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.t = theme()
+
+    def test_new_keys(self) -> None:
+        self.assertEqual(ACTION_PARTS["open"], (C.G_OPEN_FILE, "Open a file"))
+        self.assertEqual(ACTION_PARTS["continue"][0], C.G_HISTORY)
+        self.assertEqual(ACTION_PARTS["password"], (C.G_LOCK, "Enter password"))
+        self.assertEqual(ACTION_PARTS["retry"], (C.G_RETRY, "Try again"))
+        self.assertEqual(ACTION_PARTS["type"], (C.G_TYPE, "Type or paste text"))  # the 1.1 keys stay
+
+    def test_label_overrides(self) -> None:
+        label = "Continue Smith 2024 from page 14"
+        self.assertEqual(action_label("continue", {"continue": label}), label)
+        self.assertEqual(action_label("open", {"continue": label}), "Open a file")
+        self.assertEqual(action_label("retry", {"retry": ""}), "Try again")  # an empty override is no override
+        parts = [("action", "open"), ("action", "continue")]
+        plain = measure_parts(self.t, parts)
+        named = measure_parts(self.t, parts, labels={"continue": label})
+        fm = QFontMetricsF(self.t.font("body"))
+        self.assertAlmostEqual(named - plain, fm.horizontalAdvance(label) - fm.horizontalAdvance("Continue"), 3)
+
+    def test_painted_chip_matches_its_measured_width(self) -> None:
+        label = "Continue Smith 2024 from page 14"
+        img = QImage(600, 40, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        hits: dict = {}
+        p = QPainter(img)
+        end = paint_parts(p, self.t, 0, 0, 40, [("action", "continue")], self.t.color("TextPrimary"), hits=hits,
+                          labels={"continue": label})
+        p.end()
+        width = measure_parts(self.t, [("action", "continue")], labels={"continue": label})
+        self.assertAlmostEqual(end, width, 3)
+        self.assertAlmostEqual(hits["continue"].width(), width, 3)
+
+
+class ToggleRowTests(unittest.TestCase):
+    def test_row_heights(self) -> None:
+        for k in (1.0, 1.5):
+            t = theme(k)
+            self.assertEqual(ToggleRow(t, FakeTips(), "Skip citations").row_height(), t.px(TOGGLE_H))
+            row = ToggleRow(t, FakeTips(), "Match capitals", detail="Only “fMRI”, not “fmri” or “FMRI”.")
+            self.assertEqual(row.row_height(), t.px(DESCRIBED_H))
+        self.assertEqual((TOGGLE_H, DESCRIBED_H), (40, 52))
+
+    def test_a_described_row_keeps_its_height_and_names_its_detail(self) -> None:
+        t = theme()
+        row = ToggleRow(t, FakeTips(), "Pick up where you left off", focusable=True,
+                        detail="Remembers your place in up to 20 files, never their text.")
+        row.place(QRect(12, 0, 416, row.row_height()))
+        self.assertEqual(row.height(), t.px(DESCRIBED_H) + 2 * t.px(FOCUS_PAD))
+        self.assertEqual(row.accessibleDescription(), "Remembers your place in up to 20 files, never their text.")
+        row.set_detail("Saylight forgot your place in 3 files.")
+        self.assertEqual(row.accessibleDescription(), "Saylight forgot your place in 3 files.")
+        row.set_detail("")
+        self.assertEqual(row.row_height(), t.px(DESCRIBED_H))
+        render(row)
+
+    def test_focusable_row_toggles_from_the_keyboard(self) -> None:
+        row = ToggleRow(theme(), FakeTips(), "Whole word only", focusable=True)
+        self.assertEqual(row.focusPolicy(), Qt.FocusPolicy.TabFocus)
+        seen: list[bool] = []
+        row.toggled.connect(seen.append)
+        self.assertTrue(key(row, Qt.Key.Key_Space))
+        self.assertEqual((row.checked, seen, row.accessibleName()), (True, [True], "Whole word only: on"))
+
+    def test_settings_rows_stay_unfocusable(self) -> None:
+        row = ToggleRow(theme(), FakeTips(), "Skip citations")
+        self.assertEqual(row.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        self.assertFalse(row.described)
+        row.resize(416, 40)
+        render(row)
+
+
+class SegmentedTests(unittest.TestCase):
+    ITEMS = [("Whole document", 14, "Whole document"), ("From page 14", 14, "From page 14")]
+
+    def test_arrow_keys_move_a_focusable_control(self) -> None:
+        seg = Segmented(theme(), FakeTips(), self.ITEMS, name="Save", focusable=True)
+        seg.place(QRect(0, 0, 300, 34))
+        self.assertEqual(seg.focusPolicy(), Qt.FocusPolicy.TabFocus)
+        seen: list[int] = []
+        seg.selected.connect(seen.append)
+        self.assertTrue(key(seg, Qt.Key.Key_Right))
+        self.assertTrue(key(seg, Qt.Key.Key_Right))  # already last: nothing more
+        self.assertTrue(key(seg, Qt.Key.Key_Home))
+        self.assertTrue(key(seg, Qt.Key.Key_End))
+        self.assertEqual(seen, [1, 0, 1])
+        self.assertEqual(seg.accessibleName(), "Save: From page 14")
+        render(seg)
+
+    def test_clicks_land_on_the_face(self) -> None:
+        t = theme()
+        seg = Segmented(t, FakeTips(), self.ITEMS, name="Save", focusable=True)
+        seg.place(QRect(0, 0, 300, 34))
+        pad = t.px(FOCUS_PAD)
+        self.assertEqual(seg._index_at(pad + 149), 0)
+        self.assertEqual(seg._index_at(pad + 151), 1)
+
+    def test_a_settings_control_ignores_keys(self) -> None:
+        seg = Segmented(theme(), FakeTips(), self.ITEMS, name="Save")
+        seg.resize(300, 34)
+        self.assertEqual(seg.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        key(seg, Qt.Key.Key_Right)
+        self.assertEqual(seg.index, 0)
+        self.assertEqual(seg._index_at(151), 1)
+
+
+class FocusableNavRowTests(unittest.TestCase):
+    def test_focusable_row_and_detail_description(self) -> None:
+        t = theme()
+        row = NavRow(t, FakeTips(), "Pronunciations", focusable=True, detail="12 words")
+        row.place(QRect(12, 0, 416, 40))
+        self.assertEqual(row.focusPolicy(), Qt.FocusPolicy.TabFocus)
+        self.assertEqual(row.height(), t.px(40) + 2 * t.px(FOCUS_PAD))
+        self.assertEqual(row.accessibleDescription(), "12 words")
+        clicks: list[int] = []
+        row.clicked.connect(lambda: clicks.append(1))
+        key(row, Qt.Key.Key_Return)
+        self.assertEqual(clicks, [1])
+        row.set_detail("12 words · off")
+        self.assertEqual(row.accessibleDescription(), "12 words · off")
+        render(row)
 
 if __name__ == "__main__":
     unittest.main()

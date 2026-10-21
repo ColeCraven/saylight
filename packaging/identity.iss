@@ -16,6 +16,7 @@
   #define DataDirName    "SaylightTest"
   #define CachePrefix    "saylighttest_"
   #define OpenPipe       "SaylightTest.Open"
+  #define ProgId         "SaylightTest.Document"
   #define OldRunValue    "SaylightTest.Old"
   #define OldQuitEvent   "Local\SaylightTest.Old.Quit"
   #define OldShortcut    "Saylight Test Old"
@@ -34,6 +35,8 @@
   #define DataDirName    "Saylight"
   #define CachePrefix    "saylight_"
   #define OpenPipe       "Saylight.Open"
+  ; Lists Saylight under "Open with" for the file kinds it reads; it is never made the default app.
+  #define ProgId         "Saylight.Document"
   ; The app's earlier name ("Read Aloud").
   #define OldRunValue    "ReadAloudHotkey"
   #define OldQuitEvent   "Local\ReadAloudHotkey.Quit"

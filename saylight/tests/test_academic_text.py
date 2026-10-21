@@ -8,7 +8,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from saylight.academic_text import (  # noqa: E402
-    chunk_sentences, chunk_text, normalize, prepare, split_sentences,
+    chunk_sentences, chunk_text, normalize, normalize_pair, prepare, references_end, references_start,
+    split_sentences, spoken_forms,
 )
 
 N = normalize
@@ -983,6 +984,64 @@ class RegressionPerformance(unittest.TestCase):
                      "ab-\n\nAb ", "ab-\n\n\n\n", "1https://a.org/b ", "https://a.org/b.\n2 A\n"):
             with self.subTest(unit=unit[:12]):
                 self.assertLess(self._best_time(self._fit(unit)), self.LIMIT)
+
+class NormalizePairTests(unittest.TestCase):
+    def test_shown_keeps_citations_and_links(self):
+        pairs = normalize_pair("Reading is hard (Smith, 2019). See https://osf.io/x for data.\n\n(Lee, 2001)")
+        self.assertEqual(pairs, [("Reading is hard (Smith, 2019). See https://osf.io/x for data.",
+                                  "Reading is hard. See link for data."),
+                                 ("(Lee, 2001)", "")])
+
+    def test_flags_off_give_identical_pairs(self):
+        self.assertEqual(normalize_pair("A (Smith, 2019) b.", skip_citations=False, skip_urls=False),
+                         [("A (Smith, 2019) b.", "A (Smith, 2019) b.")])
+
+    def test_nothing_left_reads_the_citation(self):
+        self.assertEqual(normalize_pair("(Smith, 2019)"), [("(Smith, 2019)", "(Smith, 2019)")])
+        self.assertEqual(normalize_pair("   \n "), [])
+        with self.assertRaises(TypeError):
+            normalize_pair(None)
+
+
+class ReferencesTests(unittest.TestCase):
+    BODY = "\n".join(f"Body line {i} of the paper." for i in range(30))
+
+    def test_last_heading_in_the_last_part(self):
+        text = "References are discussed below.\n" + self.BODY + "\nReferences\nLee, A. 2001. A book."
+        at = references_start(text)
+        self.assertEqual(text[at:].split("\n")[0], "References")
+        for heading in ("7 References", "REFERENCES", "Bibliography", "Works Cited", "Literature Cited",
+                        "IV. References", "Reference list"):
+            text = self.BODY + "\n" + heading + "\nLee, A. 2001."
+            self.assertIsNotNone(references_start(text), heading)
+
+    def test_too_early_or_missing(self):
+        self.assertIsNone(references_start("References\n" + self.BODY))
+        self.assertIsNone(references_start(self.BODY))
+        self.assertIsNone(references_start(self.BODY + "\nThe references below are short."))
+
+    def test_end_at_an_appendix(self):
+        refs = "References\nLee, A. 2001. A book.\nSmith, B. 2019. A paper.\n"
+        for heading in ("Appendix A. More results", "Appendices", "Supplementary Material"):
+            text = refs + heading + "\nProse again."
+            self.assertEqual(text[references_end(text, 0):].split("\n")[0], heading)
+        text = refs + "A Additional Details\nSome prose.\nA.1 Training\nMore prose."
+        self.assertEqual(text[references_end(text, 0):].split("\n")[0], "A Additional Details")
+        text = refs + "A Study of Reading. Journal, 2019.\nNo appendix here."
+        self.assertEqual(references_end(text, 0), len(text))
+
+
+class SpokenFormsTests(unittest.TestCase):
+    def test_found_with_capitals_kept(self):
+        text = "Fig. 2, figs. 3 and Eq. (4); e.g. this, E.g. that, i.e. so; approx. 5 on pp. 6."
+        self.assertEqual([(text[a:b], said) for a, b, said in spoken_forms(text)],
+                         [("Fig.", "Figure"), ("figs.", "figures"), ("Eq.", "Equation"), ("e.g.", "for example"),
+                          ("E.g.", "For example"), ("i.e.", "that is"), ("approx.", "approximately"),
+                          ("pp.", "pages")])
+
+    def test_only_before_what_they_name(self):
+        self.assertEqual(spoken_forms("A fig. tree. The eq. sign. Mrs. pp. Pop."), [])
+        self.assertEqual(spoken_forms(""), [])
 
 
 if __name__ == "__main__":

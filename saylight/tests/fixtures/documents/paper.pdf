@@ -1,0 +1,122 @@
+%PDF-1.4
+%ту╧╙
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 120] /Resources << /Font << /F3 3 0 R >> >>  /Length 191 >>
+stream
+BT /F3 7 Tf 1 0 0 1 10 100 Tm (Accuracy) Tj ET
+BT /F3 7 Tf 1 0 0 1 10 60 Tm (0.8) Tj ET
+BT /F3 7 Tf 1 0 0 1 10 20 Tm (0.6) Tj ET
+BT /F3 7 Tf 1 0 0 1 80 5 Tm (Time \(s\)) Tj ET
+0 0 m 200 0 l S
+endstream
+endobj
+5 0 obj
+<<  /Length 1735 >>
+stream
+BT /F3 8 Tf 1 0 0 1 72 760 Tm (Journal of Reading Research 12 \(2026\) 101Ц103) Tj ET
+BT /F3 7 Tf 1 0 0 1 72 40 Tm (Downloaded from https://journals.example.org on 1 January 2026) Tj ET
+BT /F3 8 Tf 1 0 0 1 300 52 Tm (101) Tj ET
+BT /F1 18 Tf 0 1 -1 0 30 250 Tm (arXiv:2601.00001v1 [cs.CL] 1 Jan 2026) Tj ET
+BT /F2 17 Tf 1 0 0 1 110 720 Tm (Reading Aloud Helps Readers with Dyslexia) Tj ET
+BT /F1 12 Tf 1 0 0 1 190 696 Tm (Ada Lovelace and Grace Hopper) Tj ET
+BT /F2 12 Tf 1 0 0 1 280 670 Tm (Abstract) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 650 Tm (We test whether hearing a text while reading it helps adults with dyslexia. In two studies) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 638 Tm (\(n = 120\), listening along improved comprehension by 12%, as shown in [3]. The effect held) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 626 Tm (across ages and texts.) Tj ET
+BT /F2 12 Tf 1 0 0 1 72 604 Tm (1 Introduction) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 584 Tm (Dyslexia affects reading for about one in ten people \(Snowling et al., 2020; Peters, 2018a\).) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 572 Tm (Many readers use text-to-speech programs to keep up with long texts.) Tj ET
+BT 1 0 0 1 72 560 Tm /F1 10 Tf (Some programs mark each word as it is spoken,) Tj /F1 6 Tf (1) Tj /F1 10 Tf ( which may help readers keep their place.) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 548 Tm (Earlier work found mixed effects of such support on accuracy \(Wood et al., 2018, p. 12\),) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 536 Tm (but few studies looked at the compre-) Tj ET
+q 1 0 0 1 380 250 cm /Fm1 Do Q
+BT /F1 10 Tf 1 0 0 1 72 190 Tm (Figure 1: Accuracy by condition. Bars show the mean of each group.) Tj ET
+BT /F1 8 Tf 1 0 0 1 72 90 Tm (1 See the project page for the programs we tested and their settings.) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> /XObject << /Fm1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<<  /Length 1332 >>
+stream
+BT /F3 8 Tf 1 0 0 1 72 760 Tm (Journal of Reading Research 12 \(2026\) 101Ц103) Tj ET
+BT /F3 7 Tf 1 0 0 1 72 40 Tm (Downloaded from https://journals.example.org on 1 January 2026) Tj ET
+BT /F3 8 Tf 1 0 0 1 300 52 Tm (102) Tj ET
+BT /F1 18 Tf 0 1 -1 0 30 250 Tm (arXiv:2601.00001v1 [cs.CL] 1 Jan 2026) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 720 Tm (hension of long texts. We therefore asked whether reading along helps, e.g. in university) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 708 Tm (courses, and whether the help lasts. Code and data are at https://osf.io/abc12 for anyone.) Tj ET
+BT /F2 12 Tf 1 0 0 1 72 686 Tm (2 Method) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 666 Tm (Participants read twelve passages, half with the voice and half without \(see Fig. 1\).) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 654 Tm (Each passage was followed by ten questions; we report the share answered correctly.) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 622 Tm (Table 1: Mean accuracy and reading time by group.) Tj ET
+BT /F1 8 Tf 1 0 0 1 72 606 Tm (Group Accuracy Time n) Tj ET
+BT /F1 8 Tf 1 0 0 1 72 596 Tm (Dyslexic 0.81 1.2 40) Tj ET
+BT /F1 8 Tf 1 0 0 1 72 586 Tm (Control 0.93 0.9 40) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 556 Tm (Listening along raised accuracy in both groups, and the gain was larger for readers with) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 544 Tm (dyslexia than for the control group.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<<  /Length 1550 >>
+stream
+BT /F3 8 Tf 1 0 0 1 72 760 Tm (Journal of Reading Research 12 \(2026\) 101Ц103) Tj ET
+BT /F3 7 Tf 1 0 0 1 72 40 Tm (Downloaded from https://journals.example.org on 1 January 2026) Tj ET
+BT /F3 8 Tf 1 0 0 1 300 52 Tm (103) Tj ET
+BT /F1 18 Tf 0 1 -1 0 30 250 Tm (arXiv:2601.00001v1 [cs.CL] 1 Jan 2026) Tj ET
+BT /F2 12 Tf 1 0 0 1 72 720 Tm (3 Results) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 700 Tm (The gain held a month later. Readers said the voice helped them keep their place.) Tj ET
+BT 1 0 0 1 72 688 Tm /F1 10 Tf (A model trained on the answers, BERT) Tj /F1 7 Tf (BASE) Tj /F1 10 Tf (, agreed with the raters.) Tj ET
+BT /F2 12 Tf 1 0 0 1 72 664 Tm (References) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 644 Tm (Peters, M. 2018a. Deep contextual word representations. In Proceedings of NAACL,) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 632 Tm (pages 2227Ц2237.) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 620 Tm (Snowling, M. J., Hulme, C., and Nation, K. 2020. Defining and understanding dyslexia.) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 608 Tm (Oxford Review of Education, 46\(4\):501Ц513.) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 596 Tm (Wood, S. G., Moxley, J. H., Tighe, E. L., and Wagner, R. K. 2018. Does use of text-to-speech) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 584 Tm (and related read-aloud tools improve reading comprehension? Journal of Learning) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 572 Tm (Disabilities, 51\(1\):73Ц84.) Tj ET
+BT /F2 12 Tf 1 0 0 1 72 548 Tm (Appendix A. Passages) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 528 Tm (The twelve passages came from first-year textbooks, four from each of three subjects.) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 9 0 R >>
+endobj
+11 0 obj
+<< /Type /Pages /Kids [6 0 R 8 0 R 10 0 R] /Count 3 >>
+endobj
+12 0 obj
+<< /Type /Catalog /Pages 11 0 R >>
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000015 00000 n 
+0000000114 00000 n 
+0000000212 00000 n 
+0000000309 00000 n 
+0000000641 00000 n 
+0000002429 00000 n 
+0000002602 00000 n 
+0000003987 00000 n 
+0000004134 00000 n 
+0000005737 00000 n 
+0000005885 00000 n 
+0000005956 00000 n 
+trailer
+<< /Size 13 /Root 12 0 R >>
+startxref
+6007
+%%EOF

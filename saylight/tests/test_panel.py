@@ -1,5 +1,6 @@
 """Tests for the panel (ui/panel.py): the Type and Clear buttons, the empty card that opens Type or paste,
-"Text cleared. [Undo]", the covered state and the geometry helpers the Type or paste box uses.
+"Text cleared. [Undo]", the covered state and the geometry helpers the Type or paste box uses; for 1.3, More and
+its flyout, the Open and Continue chips, the open notices, header notes, page info, drops and the corner chips.
 
 The panel gets a fake controller and engine. Its window is created but never shown, and clicks on the card are
 delivered as synthetic mouse events.
@@ -136,6 +137,33 @@ class FakeCtl:
 
     def undo_clear(self) -> None:
         self.calls.append(("undo_clear",))
+
+    # 1.3: files
+    point: tuple[str, int] | None = None
+
+    def continue_point(self):
+        return self.point
+
+    def choose_file(self, source: str) -> None:
+        self.calls.append(("choose_file", source))
+
+    def continue_reading(self, source: str) -> None:
+        self.calls.append(("continue_reading", source))
+
+    def open_password(self, source: str) -> None:
+        self.calls.append(("open_password", source))
+
+    def retry_open(self) -> None:
+        self.calls.append(("retry_open",))
+
+    def open_path(self, path: str, source: str) -> None:
+        self.calls.append(("open_path", path, source))
+
+    def toggle_section(self, name: str) -> None:
+        self.calls.append(("toggle_section", name))
+
+    def remember_place(self) -> None:
+        self.calls.append(("remember_place",))
 
 
 def info(state: str, *, has_text: bool = False, underlying: str = "") -> dict:
@@ -309,7 +337,7 @@ class CardMessageTests(PanelCase):
         self.present("ready")
         v = self.panel.view
         self.assertEqual(len(v.messages), 3)
-        self.assertEqual(v.messages[1], [("text", "or "), ("action", "type")])
+        self.assertEqual(v.messages[1], [("text", "or "), ("action", "type"), ("text", "  "), ("action", "open")])
         self.assertEqual(v._secondary_from, 2)
 
     def test_cleared_line_during_the_undo_window(self) -> None:
@@ -328,21 +356,33 @@ class CardMessageTests(PanelCase):
 
     def test_type_chip_disabled_while_copying(self) -> None:
         self.present("copying")
-        self.assertEqual(self.panel.view.messages[1], [("text", "or "), ("action", "type")])
+        self.assertEqual(self.panel.view.messages[1], P.READY_ACTIONS)
         self.assertFalse(self.panel.view._action_enabled["type"])
+        self.assertFalse(self.panel.view._action_enabled["open"])
         self.present("ready")
         self.assertTrue(self.panel.view._action_enabled["type"])
+        self.assertTrue(self.panel.view._action_enabled["open"])
 
 
 class ExpandedCardTests(PanelCase):
     expanded = True
 
-    def test_six_lines_without_the_spacer(self) -> None:
+    def test_seven_lines_without_the_spacer(self) -> None:
         self.present("ready")
         v = self.panel.view
-        self.assertEqual(len(v.messages), 6)
+        self.assertEqual(len(v.messages), 7)  # 7 x 28 = 196, within the larger card
         self.assertNotIn([("text", "")], v.messages)
         self.assertEqual(v._secondary_from, 2)
+        self.assertEqual(v.messages[-1][-2], ("glyph", P.G_MORE))  # "...in Settings, under (More)."
+
+    def test_with_a_file_to_continue_the_last_line_goes(self) -> None:
+        self.ctl.point = ("Smith 2024", 14)
+        self.present("ready")
+        v = self.panel.view
+        self.assertEqual(len(v.messages), 7)
+        self.assertEqual(v.messages[2], P.CONTINUE_LINE)
+        self.assertEqual(v._secondary_from, 3)
+        self.assertNotIn(P.READY_SETTINGS, v.messages)
 
 
 class CardClickTests(PanelCase):

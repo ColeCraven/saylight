@@ -86,7 +86,9 @@ subprocess.run([sys.executable, os.path.join(HERE, "make_icon.py"), ICON, "--src
 
 # Never bundled: GUI toolkits and numeric libraries Saylight doesn't use (some hooks pull them in when
 # installed), and Qt modules it doesn't import.
-EXCLUDES = ["tkinter", "_tkinter", "PIL", "numpy",
+# Pillow is a dev tool only, even though pypdf imports it when it is installed. cryptography (AES-encrypted PDFs)
+# is left out too: it would add more than 10 MB, so those PDFs get the "This PDF is protected" notice instead.
+EXCLUDES = ["tkinter", "_tkinter", "PIL", "numpy", "cryptography", "Crypto", "Cryptodome",
             "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtOpenGL", "PySide6.QtSvg", "PySide6.QtPdf",
             "PySide6.QtDBus", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtConcurrent", "PySide6.QtPrintSupport",
             "PySide6.QtXml", "PySide6.QtHelp", "PySide6.QtOpenGLWidgets", "PySide6.QtUiTools",
@@ -103,8 +105,14 @@ def _app_modules() -> list[str]:
     return sorted(names)
 
 
+def _pypdf_modules() -> list[str]:
+    """pypdf is imported only when a PDF is opened, so the analysis may not see all of it."""
+    from PyInstaller.utils.hooks import collect_submodules
+    return collect_submodules("pypdf")
+
+
 # The test copy carries its self-test module next to saylight_app.py; a release build has none.
-HIDDEN = _app_modules() + (["saylight_selftest"] if TEST_COPY else [])
+HIDDEN = _app_modules() + _pypdf_modules() + (["saylight_selftest"] if TEST_COPY else [])
 
 a = Analysis(
     [ENTRY],

@@ -33,6 +33,7 @@ SPACINGS = ("standard", "wide", "extra")
 HIGHLIGHTS = ("word", "sentence", "off")
 SNAP_X = ("left", "center", "right")
 SNAP_Y = ("top", "bottom")
+RESUME_OFFERS = 3  # "Remember this page next time" is offered at most this many times, ever
 
 SAVE_DELAY_MS = 500
 RETRY_MAX_MS = 30_000  # back-off cap when the file stays locked (antivirus, OneDrive)
@@ -183,6 +184,12 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "first_hide_tip_shown": (False, _bool),
     "skip_citations": (True, _bool),
     "skip_urls": (True, _bool),
+    "read_references": (False, _bool),
+    "read_asides": (False, _bool),
+    "pronunciations.enabled": (True, _bool),
+    "resume.enabled": (False, _bool),
+    "resume.offer_count": (0, _int_range(0, RESUME_OFFERS)),
+    "tips.dimmed_note_shown": (False, _bool),
     "text_size": ("medium", _choice(*TEXT_SIZES)),
     "reading_tint": ("auto", _choice(*READING_TINTS)),
     "reading_font": ("verdana", _choice(*READING_FONTS)),

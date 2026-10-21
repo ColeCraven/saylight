@@ -105,6 +105,8 @@ OutputBaseFilename={#SetupName}
 ; for a copy that doesn't answer, but Setup never restarts anything on its own.
 CloseApplications=yes
 RestartApplications=no
+; Open with is registered below; Explorer is told, so it lists Saylight straight away.
+ChangesAssociations=yes
 ; Code signing, if a certificate is ever available (signs Setup and the uninstaller):
 ; SignTool=signtool sign /fd sha256 /tr http://timestamp.acs.microsoft.com /td sha256 $f
 ; SignedUninstaller=yes
@@ -177,6 +179,25 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; The sign-in entry of the app's earlier name, if one is still there.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#OldRunValue}"; \
   Flags: deletevalue
+; Open with: Saylight is listed for the file kinds it reads, through its own ProgID. It never sets a default:
+; no file kind's default value or UserChoice is touched, and uninstalling removes all of it. .markdown is left
+; out: it rarely has a default, and Windows then asks "Pick an app" for it after install.
+Root: HKCU; Subkey: "Software\Classes\{#ProgId}"; ValueType: string; ValueName: ""; \
+  ValueData: "{#AppName} document"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\{#ProgId}\DefaultIcon"; ValueType: string; ValueName: ""; \
+  ValueData: """{app}\{#AppExe}"",0"
+Root: HKCU; Subkey: "Software\Classes\{#ProgId}\shell\open"; ValueType: string; \
+  ValueName: "FriendlyAppName"; ValueData: "{#AppName}"
+Root: HKCU; Subkey: "Software\Classes\{#ProgId}\shell\open\command"; ValueType: string; ValueName: ""; \
+  ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; \
+  ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.docx\OpenWithProgids"; ValueType: string; \
+  ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.txt\OpenWithProgids"; ValueType: string; \
+  ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.md\OpenWithProgids"; ValueType: string; \
+  ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchNow}"; Flags: nowait postinstall skipifsilent

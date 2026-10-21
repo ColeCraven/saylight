@@ -13,10 +13,10 @@ from PySide6.QtWidgets import QWidget
 from ..voices.base import DEFAULT_VOICE_ID, parse_voice_id
 from ..voices.base import EDGE as EDGE_BACKEND
 from ..voices.catalog import online_voice
-from .controls import (G_BUSY, G_CHECK, G_ERROR, G_PLAY, Control, FadeLabel, ToggleRow, draw_glyph, hc_outline,
-                       paint_stop_square)
+from .controls import (G_BUSY, G_CHECK, G_ERROR, G_PLAY, Control, FadeLabel, NavRow, ToggleRow, draw_glyph,
+                       hc_outline, paint_stop_square)
 from .motion import MEDIUM, Tween, decelerate, with_alpha
-from .settings_pages import EDGE, FADE, OPTICAL, SettingsPage
+from .settings_pages import EDGE, FADE, OPTICAL, PITCH, SettingsPage
 
 ROW_H, HEADER_H, ZONE = 32, 28, 28   # DIP: a voice row, a group header, the preview button
 NAME_X = 46                          # names start where the header's status does (panel coordinates)
@@ -373,21 +373,53 @@ class VoiceList(Control):
             p.fillRect(QRectF(inner.left(), inner.bottom() - fade, inner.width(), fade), g)
 
 
+def pronunciations_detail(count: int, enabled: bool) -> str:
+    """The Pronunciations row's detail: "12 words", "1 word", "None yet", "12 words · off"."""
+    if not count:
+        return "None yet"
+    words = f"{count} word{'s' if count != 1 else ''}"
+    return words if enabled else f"{words} · off"
+
+
+# What's read aloud: (setting, label, tooltip, shown inverted). The keys say what is read; the switches what's
+# skipped, so the last two show the opposite of their setting.
+READ_ALOUD_ROWS = (
+    ("skip_citations", "Skip citations", "Leave out references such as (Smith et al., 2019) and [12]. They stay on "
+                                         "screen, dimmed. Changes apply at once.", False),
+    ("skip_urls", "Skip links and DOIs", "Say “link” instead of reading web addresses and DOIs. Changes apply at "
+                                         "once.", False),
+    ("read_asides", "Skip notes, captions and tables", "In files, these are shown dimmed in a Notes section after "
+                                                       "the main text. Changes apply at once.", True),
+    ("read_references", "Skip the reference list", "Reading stops before the References or Bibliography. It stays "
+                                                   "on screen, dimmed. Changes apply at once.", True),
+)
+READ_ALOUD_CAPTION = "What's read aloud · dimmed text is shown but not read"
+READ_ALOUD_H = 9 + 22 + 5 * 42   # DIP: the divider, the caption and five rows
+
+
 class VoicePage(SettingsPage):
-    """Voice: the caption that says what the list shows, the list, and "Show all languages"."""
+    """Voice: the caption that says what the list shows, the list, "Show all languages", then what's read aloud
+    (four Skip switches) and Pronunciations."""
 
     title = "Voice"
-    tooltip = "Choose the voice that reads to you, and hear a sample"
+    tooltip = "Choose the voice that reads to you, hear a sample, and choose what's read aloud"
 
     def __init__(self, host: QWidget, ctl) -> None:
         super().__init__(host, ctl)
         t, tips = self.theme, self.tips
         self.catalog = getattr(ctl, "catalog", None)
         self.preview = getattr(ctl, "preview", None)
+        self.store = getattr(ctl, "pronunciations", None)
         self.caption = FadeLabel(t, "small", "TextSecondary", host)
         self.list = VoiceList(t, tips, host)
         self.row_all = ToggleRow(t, tips, "Show all languages", host,
                                  tooltip="Load Microsoft's full list of voices in every language. Needs internet.")
+        self.lbl_read = FadeLabel(t, "small", "TextSecondary", host)
+        self.lbl_read.set_text(READ_ALOUD_CAPTION, animate=False)
+        self.read_rows = [(key, ToggleRow(t, tips, label, host, tooltip=tip), inverted)
+                          for key, label, tip, inverted in READ_ALOUD_ROWS]
+        self.row_pron = NavRow(t, tips, "Pronunciations", host, tooltip="Change how words are said")
+        self.row_pron.setEnabled(hasattr(ctl, "open_pronunciations"))
         self.all_languages = False
         self.failed = False      # the full list couldn't be loaded; the English list is shown
         self.reading = False
@@ -396,23 +428,50 @@ class VoicePage(SettingsPage):
         self.list.previewClicked.connect(self._preview)
         self.row_all.toggled.connect(self._toggle_all)
         self.row_all.setEnabled(self.catalog is not None)
+        s = self.settings
+        for key, row, inverted in self.read_rows:
+            row.toggled.connect(lambda on, key=key, inverted=inverted: s.set(key, (not on) if inverted else on))
+        self.row_pron.clicked.connect(lambda: ctl.open_pronunciations("settings"))
         if self.catalog is not None:
             self.catalog.changed.connect(self._on_catalog)
         if self.preview is not None:
             self.preview.stateChanged.connect(lambda _state: self._sync_preview())
-        self.settings.changed.connect(lambda key: self.sync() if key == "voice" else None)
+        if self.store is not None and hasattr(self.store, "changed"):
+            self.store.changed.connect(self._sync_read_aloud)
+        keys = {"voice"} | {key for key, *_ in READ_ALOUD_ROWS} | {"pronunciations.enabled"}
+        s.changed.connect(lambda key: self.sync() if key in keys else None)
 
     def widgets(self) -> list[QWidget]:
-        return [self.caption, self.list, self.row_all]
+        return [self.caption, self.list, self.row_all, self.lbl_read] + [row for _k, row, _i in self.read_rows] + [
+            self.row_pron]
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
         px = self.theme.px
-        fixed = px(22) + px(8) + px(40) + px(EDGE)
+        fixed = px(22) + px(8) + px(40) + px(READ_ALOUD_H) + px(EDGE)
         list_h = max(px(LIST_MIN), fill - fixed)
+        row_w = w - 2 * px(EDGE)
         self.caption.setGeometry(x + px(OPTICAL), y, w - 2 * px(OPTICAL), px(20))
-        self.list.setGeometry(x + px(EDGE), y + px(22), w - 2 * px(EDGE), list_h)
-        self.row_all.setGeometry(x + px(EDGE), y + px(22) + list_h + px(8), w - 2 * px(EDGE), px(40))
+        self.list.setGeometry(x + px(EDGE), y + px(22), row_w, list_h)
+        y += px(22) + list_h + px(8)
+        self.row_all.setGeometry(x + px(EDGE), y, row_w, px(40))
+        y += px(PITCH)
+        self.rules = [y + px(4)]
+        y += px(9)
+        self.lbl_read.setGeometry(x + px(OPTICAL), y, w - 2 * px(OPTICAL), px(20))
+        y += px(22)
+        for _key, row, _inverted in self.read_rows:
+            row.setGeometry(x + px(EDGE), y, row_w, px(40))
+            y += px(PITCH)
+        self.row_pron.setGeometry(x + px(EDGE), y, row_w, px(40))
         return fixed + list_h
+
+    def _sync_read_aloud(self) -> None:
+        s = self.settings
+        for key, row, inverted in self.read_rows:
+            on = bool(s.get(key))
+            row.set_checked((not on) if inverted else on)
+        count = len(self.store) if self.store is not None else 0
+        self.row_pron.set_detail(pronunciations_detail(count, bool(s.get("pronunciations.enabled"))))
 
     # --- State
 
@@ -420,6 +479,7 @@ class VoicePage(SettingsPage):
         return str(self.settings.get("voice") or "")
 
     def sync(self) -> None:
+        self._sync_read_aloud()
         if self.catalog is None:
             return
         self.row_all.set_checked(self.all_languages)

@@ -5,6 +5,7 @@ import unittest
 from dataclasses import dataclass
 
 from saylight import text_model as tm
+from saylight.documents import Aside, LoadedDocument
 
 
 @dataclass(frozen=True)
@@ -294,11 +295,124 @@ class AcademicPipelineTests(unittest.TestCase):
         self.assertEqual([sid for p in plans for sid in p.sentence_ids], list(range(len(doc.sentences))))
 
     def test_skip_flags_reach_normalize(self):
+        # The citation and the link stay on screen either way; the flags decide what the voice gets.
         raw = "Results were strong (Smith, 2019). See https://example.org/page for more."
-        self.assertNotIn("Smith", tm.Document.from_raw(raw).text)
-        self.assertIn("Smith", tm.Document.from_raw(raw, skip_citations=False).text)
-        self.assertNotIn("example.org", tm.Document.from_raw(raw).text)
-        self.assertIn("example.org", tm.Document.from_raw(raw, skip_urls=False).text)
+        said = lambda **kw: " ".join(s.say for s in tm.Document.from_raw(raw, **kw).sentences)  # noqa: E731
+        self.assertEqual(tm.Document.from_raw(raw).text, raw)
+        self.assertNotIn("Smith", said())
+        self.assertIn("Smith", said(skip_citations=False))
+        self.assertNotIn("example.org", said())
+        self.assertIn("example.org", said(skip_urls=False))
+        self.assertEqual(tm.Document.from_raw(raw, skip_citations=False, skip_urls=False).regions, [])
+
+
+def loaded(**kw) -> LoadedDocument:
+    base = dict(kind="pdf", title="Paper", pages=3,
+                text="Intro\n\nThe first page has a sentence that runs\n\nonto the second page. Then (Lee, 2001) "
+                     "more.\n\nThe third page starts here.\n\nReferences\n\nLee, A. 2001. A book. Press.",
+                asides=[Aside("1 A footnote on page one.", "footnote", 1), Aside("Table 2: Two.", "table", 3),
+                        Aside("Figure 1: One.", "caption", 1)])
+    base.update(kw)
+    text = base["text"]
+    base.setdefault("references_at", text.index("References"))
+    base.setdefault("page_starts", [0, text.index("onto"), text.index("The third")])
+    return LoadedDocument(**base)
+
+
+class BuildFromFileTests(unittest.TestCase):
+    """The shown text for files: the body, then a Notes section and the reference list, dimmed and unread."""
+
+    def setUp(self):
+        self.ld = loaded()
+        self.doc = tm.Document.build(self.ld, tm.BuildOptions())
+
+    def test_shown_text_layout(self):
+        self.assertEqual(self.doc.text, (
+            "Intro\n\nThe first page has a sentence that runs onto the second page. Then (Lee, 2001) more.\n\n"
+            "The third page starts here.\n\nNotes\n\nPage 1\n\n1 A footnote on page one.\n\nFigure 1: One.\n\n"
+            "Page 3\n\nTable 2: Two.\n\nReferences\n\nLee, A. 2001. A book. Press."))
+
+    def test_sections_are_regions_and_not_spoken(self):
+        notes, refs = self.doc.sections["notes"], self.doc.sections["refs"]
+        self.assertEqual(list(self.doc.sections), ["notes", "refs"])
+        self.assertTrue(self.doc.text[notes:].startswith("Notes\n\nPage 1"))
+        self.assertEqual(self.doc.text[refs:], "References\n\nLee, A. 2001. A book. Press.")
+        self.assertEqual(self.doc.text[notes - 2:notes], "\n\n")   # the blank row for the rule
+        kinds = [(r.kind, r.start, r.end) for r in self.doc.regions]
+        self.assertIn(("aside", notes, refs - 2), kinds)
+        self.assertIn(("refs", refs, len(self.doc.text)), kinds)
+        self.assertTrue(all(s.end <= notes for s in self.doc.sentences))
+        self.assertEqual(self.doc.sentences[-1].say, "The third page starts here.")
+
+    def test_reading_the_sections(self):
+        doc = tm.Document.build(self.ld, tm.BuildOptions(read_asides=True, read_references=True))
+        said = [s.say for s in doc.sentences]
+        notes = said.index("Notes")
+        self.assertEqual(said[notes:notes + 3], ["Notes", "Page 1", "1 A footnote on page one."])
+        self.assertIn("References", said)
+        self.assertEqual([r.kind for r in doc.regions if r.kind in ("aside", "refs")], [])
+        self.assertEqual(doc.sections, self.doc.sections)
+        self.assertEqual(doc.text, self.doc.text)                 # the screen doesn't change
+        self.assertEqual(doc.fingerprint(), self.doc.fingerprint())
+
+    def test_word_files_have_no_page_labels(self):
+        doc = tm.Document.build(loaded(kind="docx", pages=0, page_starts=[],
+                                       asides=[Aside("A footnote.", "footnote", None)]), tm.BuildOptions())
+        self.assertIn("Notes\n\nA footnote.", doc.text)
+        self.assertNotIn("Page ", doc.text)
+        self.assertIsNone(doc.page_of(0))
+        self.assertEqual(doc.page_starts, [])
+
+    def test_page_of(self):
+        pages = [self.doc.page_of(i) for i in range(len(self.doc.sentences))]
+        self.assertEqual([s.say for s in self.doc.sentences],
+                         ["Intro", "The first page has a sentence that runs onto the second page.", "Then more.",
+                          "The third page starts here."])
+        self.assertEqual(pages, [1, 1, 2, 3])
+        self.assertEqual(len(self.doc.page_starts), 3)
+        self.assertEqual(self.doc.text[self.doc.page_starts[2]:].split("\n")[0], "The third page starts here.")
+        self.assertIsNone(self.doc.page_of(99))
+        doc = tm.Document.build(self.ld, tm.BuildOptions(read_asides=True, read_references=True))
+        page_of = {s.say: doc.page_of(s.index) for s in doc.sentences}
+        self.assertEqual((page_of["Page 1"], page_of["Table 2: Two."], page_of["References"]), (1, 3, 3))
+        self.assertIsNone(tm.Document.from_raw("Plain text.").page_of(0))
+
+    def test_appendix_after_the_references_is_read_before_the_notes(self):
+        text = self.ld.text + "\n\nAppendix A. More\n\nThe appendix is prose again."
+        doc = tm.Document.build(loaded(text=text), tm.BuildOptions())
+        self.assertEqual(doc.sentences[-1].say, "The appendix is prose again.")
+        self.assertLess(doc.text.index("Appendix A."), doc.sections["notes"])
+        self.assertTrue(doc.text.endswith("Lee, A. 2001. A book. Press."))
+        self.assertEqual(doc.page_of(len(doc.sentences) - 1), 3)
+
+    def test_queries(self):
+        doc = self.doc
+        then = doc.text.index("Then")
+        self.assertEqual(doc.sentence_at_offset(then + 2), 2)
+        self.assertEqual(doc.sentence_at_offset(doc.text.index("(Lee")), 2)       # a citation is in its sentence
+        self.assertEqual(doc.sentence_at_offset(doc.sections["notes"] + 3), 3)    # past the last: the last
+        self.assertEqual(doc.sentence_at_offset(0), 0)
+        self.assertEqual(tm.Document.from_raw("").sentence_at_offset(0), -1)
+        self.assertEqual(doc.spoken_chars_from(0), sum(len(s.say) for s in doc.sentences) + 3)
+        self.assertEqual(doc.spoken_chars_from(3), len("The third page starts here."))
+        self.assertEqual(doc.spoken_chars_from(4), 0)
+        self.assertEqual(len(doc.fingerprint()), 64)
+        self.assertEqual(doc.skipped(), [(r.start, r.end) for r in doc.regions if r.kind != "said"])
+        self.assertEqual(sorted({r.kind for r in doc.regions}), ["aside", "refs", "skip"])
+
+    def test_text_input_has_no_sections(self):
+        doc = tm.Document.build(self.ld.text, tm.BuildOptions())
+        self.assertEqual(doc.sections, {})
+        self.assertIn("Lee, A. 2001.", " ".join(s.say for s in doc.sentences))   # a selection is read in full
+
+
+class SentenceDefaultsTests(unittest.TestCase):
+    def test_old_constructors_still_work(self):
+        s = tm.Sentence(0, "One.", 0, 4)
+        self.assertEqual((s.say, s.spoken, s.align), ("One.", "", None))
+        plan = tm.ChunkPlan(0, [0], "One.", [0])
+        self.assertEqual((plan.ends, plan.aligns), ([4], []))
+        self.assertEqual(tm.Document("One.", [s]).regions, [])
 
 
 if __name__ == "__main__":
