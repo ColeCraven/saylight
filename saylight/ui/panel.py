@@ -13,10 +13,10 @@ from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 from .. import win32
-from .controls import (G_BACK, G_COLLAPSE, G_ERROR, G_EXPAND, G_HIDE, G_NEXT, G_NOTHING, G_OFFLINE, G_PAUSE,
-                       G_PLAY, G_PREV, G_RETRY, G_SETTINGS, FadeLabel, IconButton, Indicator, Part, PlayButton,
-                       ProgressBar, Segmented, SpeedStepper, SwatchRow, ToggleRow, VolumeSlider,
-                       paint_stop_square, volume_glyph)
+from .controls import (ACTION_PARTS, G_BACK, G_CLEAR, G_COLLAPSE, G_ERROR, G_EXPAND, G_HIDE, G_NEXT, G_NOTHING,
+                       G_OFFLINE, G_PAUSE, G_PLAY, G_PREV, G_RETRY, G_SETTINGS, G_TYPE, FadeLabel, IconButton,
+                       Indicator, Part, PlayButton, ProgressBar, Segmented, SpeedStepper, SwatchRow, ToggleRow,
+                       VolumeSlider, paint_stop_square, volume_glyph)
 from .motion import MEDIUM, SLOW, Tween, decelerate, exit_curve
 from .sentence_view import SentenceView
 from .tray import SPEEDS, speed_label
@@ -51,6 +51,8 @@ HIGHLIGHTS = (("word", "Word", 13, "Highlight the sentence and the word being re
               ("off", "Off", 13, "No highlight"))
 
 ACTIVE = {"copying", "preparing", "reading", "waiting", "paused"}
+SESSION = {"preparing", "reading", "waiting", "paused"}
+IDLE = {"ready", "ready_offline", "shortcut_unavailable"}
 
 
 def K(*parts: Part) -> list[Part]:
@@ -58,13 +60,17 @@ def K(*parts: Part) -> list[Part]:
 
 
 READY_HINT = [K(("text", "Highlight text anywhere, then press "), ("key", "Ctrl"), ("key", "`")),
+              K(("text", "or "), ("action", "type")),
               K(("text", "With nothing highlighted, it shows or hides this panel."))]
 READY_HINT_EXPANDED = READY_HINT + [
     K(("key", "`"), ("text", " is the key below Esc, left of 1.")),
-    K(("text", "")),
     K(("text", "While reading, click any sentence to jump to it.")),
     K(("text", "Text size and background are under Reading display.")),
 ]
+READY_SECONDARY_FROM = 2  # the two lines that say what to do are in the text colour, the notes below them dimmed
+CLEARED_HINT = [K(("text", "Text cleared. "), ("action", "undo"))]
+TYPE_LINE = K(("text", "Or "), ("action", "type"))  # under a message on an empty card a click can type into
+UNDO_NOTE = " You can undo this for 10 seconds."
 NOTHING_TEXT = {
     "empty": [K(("text", "Highlight some text, then click "), ("glyph", G_PLAY)),
               K(("text", "or press "), ("key", "Ctrl"), ("key", "`"), ("text", "."))],
@@ -120,6 +126,10 @@ class Panel(QWidget):
         self.btn_next = IconButton(t, tips, G_NEXT, parent=self, tooltip="Next sentence", name="Next sentence")
         self.btn_stop = IconButton(t, tips, "", parent=self, tooltip="Stop", name="Stop")
         self.btn_stop.painter_glyph = paint_stop_square(t)
+        self.btn_type = IconButton(t, tips, G_TYPE, size=32, parent=self, tooltip=self._type_tip,
+                                   name="Type or paste text")
+        self.btn_clear = IconButton(t, tips, G_CLEAR, size=32, parent=self, tooltip=self._clear_tip,
+                                    name="Clear text")
         self.stepper = SpeedStepper(t, tips, self)
         self.btn_volume = IconButton(t, tips, volume_glyph(100), parent=self, tooltip=self._volume_tip,
                                      name="Volume")
@@ -157,8 +167,8 @@ class Panel(QWidget):
         for _key, lbl, seg, _opts in self.option_rows:
             self._settings_widgets += [lbl, seg]
         self._reading_widgets = [self.indicator, self.btn_expand, self.btn_settings, self.view, self.progress,
-                                 self.btn_prev, self.play, self.btn_next, self.btn_stop, self.stepper,
-                                 self.btn_volume]
+                                 self.btn_prev, self.play, self.btn_next, self.btn_stop, self.btn_type,
+                                 self.btn_clear, self.stepper, self.btn_volume]
 
         self.page = "reading"
         self.expanded = bool(self.settings.get("panel.expanded"))
@@ -168,6 +178,11 @@ class Panel(QWidget):
         self.state = "ready"
         self.info_dict: dict = {}
         self.doc = None
+        self.cleared = False   # the undo window after a Clear: the card offers Undo
+        self._undo_card = False  # the card shown is "Text cleared. [Undo]", where only the chip takes clicks
+        self.covered = False   # the Type or paste box is over the panel, which stays shown at opacity 0
+        self._card_pointer: str | None = None  # over the clickable empty card: "card", or the chip under it
+        self._card_press: str | None = None
         self.volume_open = False
         self._time_left = -1
         self._speed_note = ""
@@ -212,6 +227,8 @@ class Panel(QWidget):
         self.btn_prev.clicked.connect(e.prev)
         self.btn_next.clicked.connect(e.next)
         self.btn_stop.clicked.connect(e.stop)
+        self.btn_type.clicked.connect(lambda: self.ctl.open_compose("button"))
+        self.btn_clear.clicked.connect(self.ctl.clear_box)
         self.progress.jumpRequested.connect(e.jump_to)
         self.stepper.stepped.connect(self._step_speed)
         self.stepper.resetRequested.connect(lambda: self.ctl.set_speed(1.0))
@@ -223,9 +240,9 @@ class Panel(QWidget):
         self.swatches.selected.connect(lambda key: self.settings.set("reading_tint", key))
         self.row_citations.toggled.connect(lambda on: self.settings.set("skip_citations", on))
         self.row_links.toggled.connect(lambda on: self.settings.set("skip_urls", on))
-        self.view.sizeStepRequested.connect(self._step_text_size)
+        self.view.sizeStepRequested.connect(self.step_text_size)
 
-    def _step_text_size(self, direction: int) -> None:
+    def step_text_size(self, direction: int) -> None:
         keys = [k for k, *_ in TEXT_SIZES]
         current = self.settings.get("text_size")
         i = keys.index(current) if current in keys else 1
@@ -289,13 +306,22 @@ class Panel(QWidget):
         self.row_citations.set_checked(bool(s.get("skip_citations")))
         self.row_links.set_checked(bool(s.get("skip_urls")))
 
-    def panel_width(self) -> int:
+    def reading_width(self, expanded: bool) -> int:
+        """The reading page's width in the compact or the larger view, widened for larger text."""
         t = self.theme
-        w = t.px(EXPANDED_W if self.expanded else COMPACT_W)
-        if self.page == "reading":  # the settings page keeps the base width so rows never jump under the pointer
-            per_char = QFontMetricsF(t.font("reading")).horizontalAdvance(WIDTH_SAMPLE) / len(WIDTH_SAMPLE)
-            chars, cap = (EXPANDED_CPL, MAX_EXPANDED_W) if self.expanded else (COMPACT_CPL, MAX_COMPACT_W)
-            w = max(w, min(t.px(cap), round(per_char * chars) + t.px(52)))  # 52 = 2x12 card inset + 2x14 text pad
+        per_char = QFontMetricsF(t.font("reading")).horizontalAdvance(WIDTH_SAMPLE) / len(WIDTH_SAMPLE)
+        base = t.px(EXPANDED_W if expanded else COMPACT_W)
+        chars, cap = (EXPANDED_CPL, MAX_EXPANDED_W) if expanded else (COMPACT_CPL, MAX_COMPACT_W)
+        w = max(base, min(t.px(cap), round(per_char * chars) + t.px(52)))  # 52 = 2x12 card inset + 2x14 text pad
+        return self._fit_screen(w)
+
+    def panel_width(self) -> int:
+        if self.page == "reading":
+            return self.reading_width(self.expanded)
+        # The settings page keeps the base width so rows never jump under the pointer.
+        return self._fit_screen(self.theme.px(EXPANDED_W if self.expanded else COMPACT_W))
+
+    def _fit_screen(self, w: int) -> int:
         screen = self.screen() or QGuiApplication.primaryScreen()
         return min(w, int(screen.availableGeometry().width() * 0.9))
 
@@ -365,6 +391,8 @@ class Panel(QWidget):
             self.play.move(px(48), yt - px(4))
             self.btn_next.move(px(96), yt + px(2))
             self.btn_stop.move(px(140), yt + px(2))
+            self.btn_type.move(px(192), yt + px(4))   # 32 DIP plates on the transport centre line (yt + 20)
+            self.btn_clear.move(px(228), yt + px(4))
             self.btn_volume.move(W - px(EDGE) - px(36), yt + px(2))
             self.stepper.move(self.btn_volume.x() - px(4) - self.stepper.width(), yt + px(4))
             self.slider.move(self.stepper.pos())
@@ -558,6 +586,7 @@ class Panel(QWidget):
         self.btn_stop.setEnabled(bool(info.get("can_stop")))
         self.progress.set_interactive(bool(info.get("can_seek")))
         self.progress.dim.to(1.0 if state == "stopped" else 0.0)
+        self.refresh_box_actions()
         self._present_card()
         self._present_info()
         self.relayout()
@@ -567,23 +596,30 @@ class Panel(QWidget):
         v = self.view
         # Every message except the ready hint is drawn in one colour (secondary_from=len), so no sentence
         # changes colour halfway through.
-        if state in ("ready",) or (state == "copying" and self.doc is None):
-            v.show_messages(READY_HINT_EXPANDED if self.expanded else READY_HINT)
+        self._undo_card = self.cleared and self.doc is None and state in IDLE
+        if self._undo_card:
+            v.show_messages(CLEARED_HINT)
+        elif state in ("ready",) or (state == "copying" and self.doc is None):
+            v.show_messages(READY_HINT_EXPANDED if self.expanded else READY_HINT, READY_SECONDARY_FROM)
         elif state == "ready_offline":
             lines = [K(("text", "No internet connection.")), K(("text", "Reading aloud needs internet."))]
             v.show_messages(lines, secondary_from=len(lines))
         elif state == "nothing_selected":
             lines = NOTHING_TEXT.get(info.get("reason", "empty"), NOTHING_TEXT["empty"])
+            if self._card_can_type():
+                lines = lines + [TYPE_LINE]
             v.show_messages(lines, secondary_from=len(lines))
         elif state == "shortcut_unavailable":
             lines = [K(("text", "Another app is using "), ("key", "Ctrl"), ("key", "`"), ("text", ".")),
                      K(("text", "Use "), ("glyph", G_PLAY), ("text", ", or choose Retry shortcut in the tray menu."))]
+            if self._card_can_type():
+                lines.append(TYPE_LINE)
             v.show_messages(lines, secondary_from=len(lines))
         elif state.startswith("error"):
             lines = self._error_lines(state, info)
             v.show_messages(lines, secondary_from=len(lines))
         elif self.doc is None:
-            v.show_messages(READY_HINT)
+            v.show_messages(READY_HINT, READY_SECONDARY_FROM)
         else:
             v.show_text()
             v.set_style({"preparing": "muted", "waiting": "muted", "copying": "muted", "paused": "paused",
@@ -591,6 +627,10 @@ class Panel(QWidget):
             sentence = info.get("sentence")
             if isinstance(sentence, int) and sentence >= 0 and v.sentence < 0:
                 v.set_position(sentence, 0, 0)
+        if self._card_pointer is not None and not self._card_clickable():
+            self._set_card_pointer(None)
+        else:
+            self._sync_card_actions()
 
     def _error_lines(self, state: str, info: dict) -> list[list[Part]]:
         retry = ("glyph", G_RETRY)
@@ -647,6 +687,84 @@ class Panel(QWidget):
             return f"{seconds // 3600} h {(seconds % 3600) // 60} min left"
         return f"{seconds // 60}:{seconds % 60:02d} left"
 
+    # --- Type or paste, Clear and the empty card ------------------------------------------------
+
+    def _box_state(self) -> str:
+        """The state Type and Clear follow: under the Nothing-selected overlay, the one beneath it."""
+        if self.state == "nothing_selected":
+            return self.info_dict.get("underlying") or "ready"
+        return self.state
+
+    def _can_clear(self) -> bool:
+        """Clear works on the box's text, or on typed text alone; never while copying."""
+        info = self.info_dict
+        return bool(info.get("can_clear")) or (bool(info.get("can_type")) and self.ctl.has_draft())
+
+    def _type_tip(self) -> str:
+        chord = self.ctl.compose_shortcut()
+        keys = f" ({chord})" if chord else ""
+        if self.ctl.has_draft():
+            return f"Type or paste text{keys}. The text you typed is still there."
+        return f"Type or paste text to read aloud{keys}"
+
+    def _clear_tip(self) -> str:
+        if self._box_state() in SESSION:
+            return "Stop and clear text." + UNDO_NOTE
+        if self.doc is None and self.ctl.has_draft():
+            return "Clear the text you typed." + UNDO_NOTE
+        return "Clear text." + UNDO_NOTE
+
+    def refresh_box_actions(self) -> None:
+        """Re-evaluate Type and Clear (also when the typed text changes)."""
+        self.btn_type.setEnabled(bool(self.info_dict.get("can_type")))
+        self.btn_clear.setEnabled(self._can_clear())
+        self.btn_type.set_tooltip(self._type_tip)  # also refreshes the accessible description
+        self.btn_clear.set_tooltip(self._clear_tip)
+
+    def set_cleared(self, on: bool) -> None:
+        """During the undo window after a Clear, the empty card reads "Text cleared. [Undo]"."""
+        if on != self.cleared:
+            self.cleared = on
+            self._present_card()
+            self._set_card_pointer(None)  # what the card does under the pointer changes; the next move tells
+
+    def _card_can_type(self) -> bool:
+        """The card is empty and nothing is under way, so a click on it could open Type or paste."""
+        info = self.info_dict
+        if self.page != "reading" or self.doc is not None or not info.get("can_type"):
+            return False
+        return self.state in IDLE or (self.state == "nothing_selected" and info.get("underlying") in IDLE)
+
+    def _card_clickable(self) -> bool:
+        """The card takes clicks: it could open Type or paste and shows a chip that says what a click does (so
+        not the Offline card, where reading would fail anyway)."""
+        lines = self.view.messages or []
+        return self._card_can_type() and any(kind == "action" for line in lines for kind, _ in line)
+
+    def _card_target(self, pos) -> str | None:
+        """What a click at `pos` on the clickable card is for: an action chip, or "card" for the rest of it. After
+        a Clear only the Undo chip counts, so a near miss never opens the box."""
+        hit = self.view.action_at(pos)
+        return hit if self._undo_card else hit or "card"
+
+    def _set_card_pointer(self, where: str | None) -> None:
+        """Where the pointer is on the clickable card: None (not on a target), "card", or the action chip under it."""
+        self._card_pointer = where
+        self.view.set_card_hover(where is not None and not self._undo_card)
+        if where in ACTION_PARTS:
+            self.view.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif self._undo_card:
+            self.view.setCursor(Qt.CursorShape.ArrowCursor)
+        self._sync_card_actions()
+
+    def _sync_card_actions(self) -> None:
+        """The Type chip takes hover and press from the whole card, since a click anywhere opens the box;
+        Undo only from itself."""
+        where, press = self._card_pointer, self._card_press
+        self.view.set_action_state("type", where in ("card", "type"), press in ("card", "type"),
+                                   bool(self.info_dict.get("can_type")))
+        self.view.set_action_state("undo", where == "undo", press == "undo", True)
+
     # --- Show / hide motion -------------------------------------------------------------------
 
     def show_animated(self) -> None:
@@ -674,19 +792,39 @@ class Panel(QWidget):
         if self._drag is None and not self.snap_anim.running:
             dy = round(self.theme.px(8) * self.slide.value) * self._slide_dir
             self.move(self._rest.x(), self._rest.y() + dy)
-        o = self.fade.value
-        self.setWindowOpacity(1.0 if o >= 0.999 else max(0.0, o))
-        if self._hiding and o <= 0.0:
+        self.setWindowOpacity(self._window_opacity())
+        if self._hiding and self.fade.value <= 0.0:
             self._hiding = False
             self.hide()
             self.move(self._rest)
-            self.setWindowOpacity(1.0)
+            self.setWindowOpacity(0.0 if self.covered else 1.0)
+
+    def _window_opacity(self) -> float:
+        o = self.fade.value
+        return 0.0 if self.covered else 1.0 if o >= 0.999 else max(0.0, o)
+
+    def set_covered(self, on: bool) -> None:
+        """While the Type or paste box covers the panel, the panel stays shown (so its visibility setting
+        never changes) but is drawn at opacity 0."""
+        if on == self.covered:
+            return
+        self.covered = on
+        if on and not self._hiding:
+            self.fade.snap(1.0)
+            self.slide.snap(0.0)
+        self.setWindowOpacity(self._window_opacity())
 
     # --- Positioning --------------------------------------------------------------------------
 
     def _bottom_margin(self, screen) -> int:
         auto_hidden = screen.availableGeometry() == screen.geometry()
         return self.theme.px(TASKBAR_GAP if auto_hidden else EDGE)
+
+    def rest_rect(self) -> QRect:
+        """Where the panel rests, whether or not it is shown."""
+        if self._rest.isNull():
+            self.restore_position()
+        return QRect(self._rest, self.size())
 
     def _clamp(self, pos: QPoint, area: QRect) -> QPoint:
         x = max(area.left(), min(pos.x(), area.right() + 1 - self.width()))
@@ -803,6 +941,8 @@ class Panel(QWidget):
             d["moving"] = True
             self.setCursor(Qt.CursorShape.SizeAllCursor)
             self.view.set_hover(None)
+            self._card_press = None
+            self._set_card_pointer(None)
             self.ctl.tips.press(self)
         if d["moving"]:
             self.move(d["origin"] + delta)
@@ -819,6 +959,15 @@ class Panel(QWidget):
             self._save_position(target, sx, sy, screen)
             self._update_slide_dir()
         elif d["source"] is self.view:
+            pressed, self._card_press = self._card_press, None
+            self._sync_card_actions()
+            if pressed is not None and self._card_clickable():
+                # Right here in the click: Windows lets the box take the foreground only from user input.
+                if pressed == "undo":
+                    self.ctl.undo_clear()
+                else:
+                    self.ctl.open_compose("card")
+                return
             if self.view.chip_visible() and self.view.chip_rect().contains(d["local"]):
                 self.view.follow_now()
                 return
@@ -846,10 +995,15 @@ class Panel(QWidget):
             et = event.type()
             if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._press(event.globalPosition().toPoint(), self.view, event.position())
+                if self._card_clickable():
+                    self._card_press = self._card_target(event.position())
+                    self._sync_card_actions()
                 return True
             if et == QEvent.Type.MouseMove:
                 if self._drag is not None:
                     self._move(event.globalPosition().toPoint())
+                elif self._card_clickable():
+                    self._set_card_pointer(self._card_target(event.position()))
                 elif self.view.chip_visible() and self.view.chip_rect().contains(event.position()):
                     self.view.set_hover(None)
                     self.view.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -862,6 +1016,7 @@ class Panel(QWidget):
                 return True
             if et == QEvent.Type.Leave:
                 self.view.set_hover(None)
+                self._set_card_pointer(None)
         return super().eventFilter(obj, event)
 
     # --- Native ---------------------------------------------------------------------------------

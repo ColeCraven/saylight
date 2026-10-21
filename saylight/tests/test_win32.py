@@ -174,6 +174,26 @@ class WindowTests(unittest.TestCase):
             with mock.patch.object(win32, "get_class_name", return_value="Shell_TrayWnd"):
                 self.assertFalse(win32.is_app_window(1234))
 
+    def test_is_own_window(self):
+        self.assertTrue(win32.is_own_window(self.hwnd))
+        with mock.patch.object(win32, "is_window", return_value=True), \
+                mock.patch.object(win32, "get_window_pid", return_value=os.getpid() + 1):
+            self.assertFalse(win32.is_own_window(1234))  # another process
+        with mock.patch.object(win32, "is_window", return_value=True), \
+                mock.patch.object(win32, "get_class_name", return_value="Shell_TrayWnd"), \
+                mock.patch.object(win32, "get_window_pid", return_value=os.getpid()):
+            self.assertTrue(win32.is_own_window(1234))  # any class, as long as it is ours
+        win32.user32.DestroyWindow(self.hwnd)
+        self.assertFalse(win32.is_own_window(self.hwnd))
+        self.assertFalse(win32.is_own_window(0))
+
+    def test_own_and_app_windows_never_overlap(self):
+        for pid in (os.getpid(), os.getpid() + 1):
+            with mock.patch.object(win32, "is_window", return_value=True), \
+                    mock.patch.object(win32, "get_class_name", return_value="Notepad"), \
+                    mock.patch.object(win32, "get_window_pid", return_value=pid):
+                self.assertNotEqual(win32.is_own_window(1234), win32.is_app_window(1234), pid)
+
     def test_dwm_attributes(self):
         self.assertTrue(win32.dwm_set_corner(self.hwnd))
         self.assertTrue(win32.dwm_set_corner(self.hwnd, small=True))
@@ -233,6 +253,28 @@ class SystemStateTests(unittest.TestCase):
         self.assertIsInstance(win32.animations_enabled(), bool)
         self.assertIsInstance(win32.high_contrast(), bool)
         self.assertGreater(win32.small_icon_size(), 0)
+
+    def test_caret_width(self):
+        width = win32.caret_width_px()
+        self.assertIsInstance(width, int)
+        self.assertGreaterEqual(width, 1)
+
+    def test_caret_width_reads_spi_getcaretwidth_and_falls_back_to_1(self):
+        calls = []
+
+        def fake_spi(action, ui_param, pv_param, flags, width=4):
+            calls.append((action, ui_param, flags))
+            ctypes.cast(pv_param, ctypes.POINTER(wintypes.DWORD))[0] = width
+            return True
+
+        with mock.patch.object(win32.user32, "SystemParametersInfoW", fake_spi):
+            self.assertEqual(win32.caret_width_px(), 4)
+        self.assertEqual(calls, [(0x2006, 0, 0)])
+        with mock.patch.object(win32.user32, "SystemParametersInfoW", return_value=False):
+            self.assertEqual(win32.caret_width_px(), 1)
+        with mock.patch.object(win32.user32, "SystemParametersInfoW",
+                               lambda a, u, pv, f: fake_spi(a, u, pv, f, width=0)):
+            self.assertEqual(win32.caret_width_px(), 1)
 
     def test_sys_colors(self):
         self.assertEqual((win32.COLOR_WINDOW, win32.COLOR_WINDOWTEXT, win32.COLOR_HIGHLIGHT,

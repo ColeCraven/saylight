@@ -37,6 +37,8 @@ LOG_PATH = os.path.join(HERE, "saylight.log")
 CRASH_PATH = os.path.join(HERE, "saylight_crash.log")
 ICON_PATH = os.path.join(HERE, "saylight.ico")
 QUIT_WAIT_S = 1.5                           # time a copy asked to quit gets to save its settings and exit
+UNDO_MS = 10_000                            # how long Undo is offered after a Clear
+AWAY_SETTLE_MS = 50                         # how long light dismiss lets the foreground settle (as the box does)
 
 # The same app under its earlier name. --install replaces that install, --uninstall and --quit reach it too,
 # and its settings file is renamed on the first start (migrate_settings).
@@ -283,17 +285,18 @@ def run() -> int:
 # --- The app controller ----------------------------------------------------------------------------
 
 def _build_app_class():
-    from PySide6.QtCore import QObject, QRect, QTimer
+    from PySide6.QtCore import QObject, QRect, Qt, QTimer
     from PySide6.QtGui import QColor, QGuiApplication
 
     from saylight import win32
-    from saylight.engine import Engine
+    from saylight.engine import COPYING, Engine
     from saylight.foreground import ForegroundTracker
-    from saylight.input_thread import HK_PANEL, HK_PAUSE, HK_READ, InputThread
+    from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, InputThread
     from saylight.player import PlayerThread
     from saylight.settings import Settings
     from saylight.synth import SynthWorker
     from saylight.theme import READING_PRESETS, TINT_NAMES, Theme
+    from saylight.ui.compose import FOCUS_REASONS, ComposeWindow, should_resume
     from saylight.ui.controls import G_ERROR, G_NOTHING
     from saylight.ui.hud import Hud
     from saylight.ui.motion import Clock
@@ -318,6 +321,7 @@ def _build_app_class():
             self.engine = Engine(synth=self.synth, player=self.player, input_thread=self.input,
                                  settings=self.settings, parent=self, beep=win32.message_beep)
             self.panel = Panel(self)
+            self.compose = ComposeWindow(self)  # hidden until opened; unowned, and its flags never change
             self.tray = Tray(self, self.theme)
             self.hud = Hud(self.theme, self.clock)
             self._state = "ready"
@@ -326,6 +330,14 @@ def _build_app_class():
             self._override = False
             self._hud_preparing = False
             self._network = None
+            self._compose_hotkey = False  # hotkeys.compose is registered
+            self._undo: tuple | None = None  # (engine token, box snapshot) for the undo window after a Clear
+            self._undo_timer = QTimer(self)
+            self._undo_timer.setSingleShot(True)
+            self._undo_timer.timeout.connect(self._on_undo_timeout)
+            self._away_timer = QTimer(self)
+            self._away_timer.setSingleShot(True)
+            self._away_timer.timeout.connect(self._check_away)
 
             self._theme_timer = QTimer(self)
             self._theme_timer.setSingleShot(True)
@@ -333,6 +345,7 @@ def _build_app_class():
             self._screen_timer = QTimer(self)
             self._screen_timer.setSingleShot(True)
             self._screen_timer.timeout.connect(self.panel.reclamp)
+            self._screen_timer.timeout.connect(self._reanchor_compose)  # after the panel has found its place
             self._fullscreen_timer = QTimer(self)
             self._fullscreen_timer.setInterval(1000)
             self._fullscreen_timer.timeout.connect(self._check_fullscreen)
@@ -340,14 +353,30 @@ def _build_app_class():
             e = self.engine
             e.stateChanged.connect(self._on_state)
             e.sessionChanged.connect(self.panel.on_session)
+            e.sessionChanged.connect(self._on_session)
             e.position.connect(self.panel.on_position)
             e.timeLeft.connect(self.panel.on_time_left)
             e.speedChanged.connect(self.panel.on_speed)
+            e.speedChanged.connect(self.compose.on_speed)
             e.volumeChanged.connect(self.panel.on_volume)
             e.notice.connect(self._on_notice)
-            e.panelToggleRequested.connect(lambda: self.toggle_panel())
+            # An empty Ctrl+` from the shell while the box is open must not toggle the panel under it.
+            e.panelToggleRequested.connect(lambda: None if self.composing() else self.toggle_panel())
             e.mediaKeysWanted.connect(self.input.set_media_keys)
             self.input.quitRequested.connect(self.quit)
+            self.input.composeReadPressed.connect(self._on_compose_read_hotkey)
+            self.input.hotkeyPressed.connect(self._on_app_hotkey)  # after the engine's own connection
+            self.input.registered.connect(self._on_registered)
+            # Queued: the box is closed after the WinEvent callback has returned, never inside it.
+            self.foreground.appActivated.connect(self._on_app_activated, Qt.ConnectionType.QueuedConnection)
+            c = self.compose
+            c.readRequested.connect(self.read_typed)
+            c.clearRequested.connect(self.clear_box)
+            c.undoRequested.connect(self.undo_clear)
+            c.closeRequested.connect(self.close_compose)
+            c.sizeStepRequested.connect(self.panel.step_text_size)
+            c.textEdited.connect(self._on_compose_edited)
+            c.closed.connect(self._on_compose_closed)
             self.settings.changed.connect(self._on_setting)
             QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self.schedule_theme_refresh())
             qapp.screenAdded.connect(self._watch_screen)
@@ -387,6 +416,7 @@ def _build_app_class():
 
         def _shutdown(self) -> None:
             log.info("Shutting down")
+            self.close_compose("quit")  # hides it at once; typed text and the undo stash go with the process
             self._fullscreen_timer.stop()
             self.engine.shutdown()
             self.input.stop(3.0)
@@ -395,6 +425,9 @@ def _build_app_class():
             self.tray.hide()
 
         def quit(self) -> None:
+            # Qt asks every window to close before it quits, and the box turns a close into Back, which would
+            # cancel the quit: close it first.
+            self.close_compose("quit")
             self.qapp.quit()
 
         # --- Panel visibility -------------------------------------------------------------------
@@ -403,11 +436,15 @@ def _build_app_class():
             return self.panel.isVisible() and not self.panel._hiding
 
         def toggle_panel(self, from_tray: bool = False) -> None:
-            self.set_panel_visible(not self.panel_visible())
+            if self.composing():  # the box is over the panel: close it and leave the panel as it is
+                self.close_compose("tray" if from_tray else "hotkey")
+            else:
+                self.set_panel_visible(not self.panel_visible())
             if from_tray:
                 QTimer.singleShot(0, self.restore_foreground)
 
         def set_panel_visible(self, on: bool) -> None:
+            self.close_compose("tray")  # only the tray gets here while the box is open, and it restores focus
             if on:
                 self._override = self._suppressed
                 self._suppressed = False
@@ -426,17 +463,22 @@ def _build_app_class():
             self.settings.set("panel.visible", on)
 
         def open_settings(self) -> None:
+            self.close_compose("tray")
             if not self.panel_visible():
                 self.set_panel_visible(True)
             self.panel.set_page("settings")
 
         def reset_position(self) -> None:
+            self.close_compose("tray")
             self.panel.reset_position()
 
         def restore_foreground(self) -> None:
-            self.foreground.restore_foreground()
+            if not self.composing():  # the box has the foreground on purpose
+                self.foreground.restore_foreground()
 
         def _check_fullscreen(self) -> None:
+            if self.compose.isVisible():
+                return
             busy = win32.query_user_notification_state() in SUPPRESS_STATES
             if busy and not self._override and self.panel_visible():
                 self._suppressed = True
@@ -454,11 +496,14 @@ def _build_app_class():
             self.panel.present(state, info)
             self.tray.set_state(state, info)
             if state in ("preparing", "copying") and self._hud_allowed():
-                self._hud_preparing = True
-                self.hud.flash(self._hud_anchor(), "wave", "Accent", "Preparing audio…", seconds=0)
+                self._flash_preparing()
             elif self._hud_preparing and state not in ("preparing", "copying", "waiting", "reading"):
                 self._hud_preparing = False
                 self.hud.dismiss()
+
+        def _flash_preparing(self) -> None:
+            self._hud_preparing = True
+            self.hud.flash(self._hud_anchor(), "wave", "Accent", "Preparing audio…", seconds=0)
 
         def _on_notice(self, kind: str) -> None:
             if not self._hud_allowed():
@@ -484,13 +529,174 @@ def _build_app_class():
                 self.hud.flash(self._hud_anchor(), "glyph", "Critical", label, detail, glyph=G_ERROR, seconds=5.0)
 
         def _hud_allowed(self) -> bool:
-            return (not self.panel_visible() and bool(self.settings.get("hud_when_hidden"))
+            return (not self.panel_visible() and not self.compose.isVisible()
+                    and bool(self.settings.get("hud_when_hidden"))
                     and win32.query_user_notification_state() not in SUPPRESS_STATES)
 
         def _hud_anchor(self) -> QRect:
-            if self.panel._rest.isNull():
-                self.panel.restore_position()
-            return QRect(self.panel._rest, self.panel.size())
+            return self.panel.rest_rect()
+
+        # --- Type or paste, Clear and Undo --------------------------------------------------------
+
+        def composing(self) -> bool:
+            """The Type or paste box is opening or open (not closing)."""
+            return self.compose.session.phase in ("opening", "open")
+
+        def has_draft(self) -> bool:
+            return self.compose.has_draft()
+
+        def can_undo_clear(self) -> bool:
+            return self._undo is not None
+
+        def open_compose(self, source: str) -> None:
+            """Open the box over the panel ("button", "card", "tray" or "hotkey"), or bring it back to the front.
+
+            Call it right in the click or hotkey handler: Windows lets the box take the foreground only then."""
+            c, e = self.compose, self.engine
+            if self.composing():
+                c.activate()
+                return
+            if e.state == COPYING:  # the internal state, so also the first moments before Copying shows
+                return
+            fg = win32.get_foreground_window()
+            return_to = fg if win32.is_app_window(fg) else self.foreground.last_app()
+            p = self.panel
+            if p.page == "settings":
+                p.set_page("reading")
+            p.set_volume_open(False, animate=False)
+            self.tips.press(p)
+            doc = e.document
+            prefill = (doc.text, doc.sentences[max(0, e.current_sentence)].start) if doc is not None else None
+            self.input.set_compose_open(True)  # before the box can be in front, so Ctrl+` never copies from it
+            c.open_at(p.rest_rect(), panel_visible=self.panel_visible(), panel_lines=8 if p.expanded else 4,
+                      prefill=prefill, return_to=return_to)
+            # Paused once the box is showing, so the pause never flashes the HUD; leaving without reading resumes.
+            c.session.source = source
+            c.session.paused_doc = e.document if e.pause() else None
+            self._hud_preparing = False
+            self.hud.dismiss()
+            log.info("Compose opened (%s)", source)
+
+        def close_compose(self, reason: str) -> None:
+            """Close the box and keep its text (see compose.FOCUS_REASONS and RESUME_REASONS for what each reason
+            does). Does nothing when the box isn't open."""
+            if not self.composing():
+                return
+            c = self.compose
+            s = c.session
+            if reason in FOCUS_REASONS and c.is_foreground():  # never after you have gone to another app
+                target = s.return_to if win32.is_app_window(s.return_to) else self.foreground.last_app()
+                if target:
+                    win32.set_foreground_window(target)  # before hiding, so Windows never picks a window itself
+            self.input.set_compose_open(False)
+            if should_resume(s.paused_doc, self.engine.document, self.engine.state, reason):
+                self.engine.resume()
+            self.panel.set_covered(False)
+            c.close_animated(reason)
+
+        def read_typed(self, text: str, scope: str) -> None:
+            """Read aloud from the box: the highlighted part ("selection") or all of it ("all")."""
+            if not self.engine.read_text(text):  # a new reading also ends any undo window (_on_session)
+                self.compose.show_note("nothing")  # the box stays open; the note beeps
+                return
+            log.info("Compose: read %s characters (%s)", f"{len(text):,}", scope)
+            self.close_compose("read")
+
+        def clear_box(self) -> None:
+            """Clear: stop, forget the text, its audio and any typed text. Undo is offered for 10 s."""
+            c = self.compose
+            typed = c.has_draft()
+            token = self.engine.clear()
+            snap = c.snapshot()
+            if token is None and not snap.text:
+                return
+            c.clear_text()
+            c.session.paused_doc = None
+            self._undo = (token, snap)
+            self._undo_timer.start(UNDO_MS)
+            self.panel.set_cleared(True)
+            self.panel.refresh_box_actions()
+            c.set_undo_mode(True)
+            log.info("Cleared (%d sentences, typed text: %s)", len(token.doc.sentences) if token else 0,
+                     "yes" if typed else "no")
+
+        def undo_clear(self) -> None:
+            """Bring back what the last Clear removed, during its undo window."""
+            if self._undo is None:
+                return
+            token, snap = self._undo
+            if token is not None and not self.engine.restore(token):
+                return  # refused while copying; the window stays open
+            if token is None:
+                log.info("Clear undone")  # the engine logs it when it restores a reading
+            self.compose.restore_snapshot(snap)
+            self._end_undo()  # (restoring a reading may already have ended it, before the typed text was back)
+            self.panel.refresh_box_actions()
+
+        def _end_undo(self) -> None:
+            """End the undo window and drop what it kept; the card and the box's button go back."""
+            if self._undo is None:
+                return
+            self._undo = None
+            self._undo_timer.stop()
+            self.panel.set_cleared(False)
+            self.compose.set_undo_mode(False)
+            self.panel.refresh_box_actions()
+
+        def _on_undo_timeout(self) -> None:
+            if self.panel.isVisible() and self.panel.view.underMouse():  # never take Undo from under the pointer
+                self._undo_timer.start(UNDO_MS)
+            else:
+                self._end_undo()
+
+        def _on_session(self, doc) -> None:
+            if doc is not None:  # a new reading (or the cleared one coming back) ends the undo window
+                self._end_undo()
+            self._forget_prefill()  # a purge, or a newer reading replacing the one the box was filled from
+
+        def _forget_prefill(self) -> None:
+            """The hidden box holds a reading's text no longer than the engine does (the privacy purge reaches it
+            too); the next open loads the current reading again. Typed text stays."""
+            c = self.compose
+            if not c.isVisible() and not c.has_draft():
+                c.clear_text()
+
+        def _on_compose_edited(self) -> None:
+            self._end_undo()  # the first edit after a Clear
+            self.panel.refresh_box_actions()  # Clear follows the typed text
+
+        def _on_compose_closed(self, reason: str) -> None:
+            self._forget_prefill()  # the reading may have been purged while the box was open
+            if reason != "quit" and self._state in ("preparing", "copying") and self._hud_allowed():
+                self._flash_preparing()
+
+        def _on_compose_read_hotkey(self) -> None:
+            if self.composing():
+                self.compose.read_from_shortcut()
+
+        def _on_app_hotkey(self, hk_id: int) -> None:
+            """The Type or paste shortcut, and the panel shortcut while the box is open (which closes it)."""
+            if hk_id == HK_COMPOSE:
+                if self.composing():
+                    self.close_compose("hotkey")
+                else:
+                    self.open_compose("hotkey")
+            elif hk_id == HK_PANEL and self.composing():
+                self.close_compose("hotkey")
+
+        def _on_app_activated(self, _hwnd: int) -> None:
+            # Light dismiss: you clicked into another app. Judge by what is in front once things settle, not by
+            # the event alone: opening the emoji panel can pass the foreground through the shell and straight back.
+            if self.composing():
+                self._away_timer.start(AWAY_SETTLE_MS)
+
+        def _check_away(self) -> None:
+            if self.compose.is_dismissed_by(win32.get_foreground_window()):
+                self.close_compose("away")
+
+        def _reanchor_compose(self) -> None:
+            if self.composing():
+                self.compose.reanchor(self.panel.rest_rect())
 
         # --- Settings, speed, theme -------------------------------------------------------------
 
@@ -516,10 +722,21 @@ def _build_app_class():
         def _hotkey_map(self) -> dict[int, str]:
             h = self.settings.get("hotkeys") or {}
             return {HK_READ: h.get("read", "Ctrl+`"), HK_PANEL: h.get("toggle_panel", ""),
-                    HK_PAUSE: h.get("pause_resume", "")}
+                    HK_PAUSE: h.get("pause_resume", ""), HK_COMPOSE: h.get("compose", "")}
+
+        def compose_shortcut(self) -> str:
+            """The Type or paste shortcut while it is registered, else ""."""
+            return (self.settings.get("hotkeys") or {}).get("compose", "") if self._compose_hotkey else ""
+
+        def _on_registered(self, hk_id: int, ok: bool) -> None:
+            if hk_id == HK_COMPOSE:
+                self._compose_hotkey = ok
+                self.panel.refresh_box_actions()  # the Type tooltip names the shortcut
 
         def _on_setting(self, key: str) -> None:
             if key.startswith("hotkeys"):
+                self._compose_hotkey = False  # an unset shortcut is never reported back
+                self.panel.refresh_box_actions()
                 self.input.set_hotkeys(self._hotkey_map())
             elif key == "reading_tint":
                 self.panel.view.update()

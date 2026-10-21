@@ -1,5 +1,5 @@
-"""Tests for the reading card (ui/sentence_view.py): high-contrast sentence ring, the "Back to current" chip
-and no-break glue.
+"""Tests for the reading card (ui/sentence_view.py): high-contrast sentence ring, the "Back to current" chip,
+no-break glue, and the action chips, card hover and message fit rule of the empty card.
 
 Widgets are rendered into a QImage and never shown.
 """
@@ -8,11 +8,12 @@ import sys
 import unittest
 
 from PySide6.QtCore import QCoreApplication, QObject, QPoint, QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QWheelEvent
+from PySide6.QtGui import QColor, QFontMetricsF, QImage, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from saylight.text_model import Document
 from saylight.theme import Theme
+from saylight.ui.controls import measure_parts
 from saylight.ui.sentence_view import _GLUE, SentenceView
 
 _app = None
@@ -147,6 +148,102 @@ class TestGlue(unittest.TestCase):
         for text in ("sessions 1, 2, 3 and 4", "it was 2, then 3", "pages 12, 13"):
             with self.subTest(text=text):
                 self.assertEqual(self.glue(text), text)
+
+
+TYPE_LINE = [("text", "or "), ("action", "type")]
+READY = [[("text", "Highlight text anywhere, then press "), ("key", "Ctrl"), ("key", "`")], TYPE_LINE,
+         [("text", "With nothing highlighted, it shows or hides this panel.")]]
+
+
+def card(*, hc: bool = False, **values: str) -> SentenceView:
+    settings = FakeSettings(**values)
+    view = SentenceView(Theme(settings, system=FakeSystem(hc=hc)), settings)
+    view.resize(416, view.preferred_height())
+    return view
+
+
+class TestActionChips(unittest.TestCase):
+    def test_chip_width(self) -> None:
+        """Glyph at +10, label at +32 in the line's own font, 10 of right padding."""
+        view = card()
+        t = view.theme
+        for role in ("message", "body"):
+            fm = QFontMetricsF(t.font(role))
+            want = fm.horizontalAdvance("or ") + 32 + fm.horizontalAdvance("Type or paste text") + 10
+            self.assertAlmostEqual(measure_parts(t, TYPE_LINE, role=role), want, places=3)
+
+    def test_action_at_finds_the_painted_chip(self) -> None:
+        view = card()
+        view.show_messages(READY, 2)
+        self.assertIsNone(view.action_at(QPointF(200, 50)))  # nothing painted yet
+        render(view)
+        r = view._hits["type"]
+        self.assertEqual(round(r.height()), 24)  # message role: CAP_H 20 + 4
+        self.assertEqual(view.action_at(r.center()), "type")
+        self.assertIsNone(view.action_at(QPointF(r.right() + 4, r.center().y())))
+        view.set_document(Document.from_raw(TEXT))
+        view.show_text()
+        self.assertIsNone(view.action_at(r.center()))
+
+    def chip_fill(self, view: SentenceView) -> int:
+        img = render(view)
+        r = view._hits["type"]
+        return img.pixel(int(r.right() - 4), int(r.center().y()))  # the right padding: fill only
+
+    def test_hover_and_press_fill_but_never_when_disabled(self) -> None:
+        view = card()
+        view.show_messages([TYPE_LINE])
+        rest = self.chip_fill(view)
+        view.set_action_state("type", True, False, True)
+        hover = self.chip_fill(view)
+        view.set_action_state("type", True, True, True)
+        pressed = self.chip_fill(view)
+        self.assertEqual(len({rest, hover, pressed}), 3)
+        lightness = [QColor(c).lightness() for c in (rest, hover, pressed)]
+        self.assertLess(lightness[0], lightness[1])  # soft dark: the ink is light, so each step lightens
+        self.assertLess(lightness[1], lightness[2])
+        view.set_action_state("type", True, True, False)
+        self.assertEqual(self.chip_fill(view), rest)
+
+    def test_high_contrast_hover_is_an_outline(self) -> None:
+        view = card(hc=True)
+        view.show_messages([TYPE_LINE])
+        rest = self.chip_fill(view)
+        view.set_action_state("type", True, False, True)
+        self.assertEqual(self.chip_fill(view), rest)  # no blended fill
+        img = render(view)
+        r = view._hits["type"]
+        edge = QColor(img.pixel(int(r.center().x()), int(r.top() + 0.5)))
+        self.assertEqual(edge.rgb(), QColor(*HC_BLACK["highlight"]).rgb())
+
+
+class TestCardHover(unittest.TestCase):
+    def test_outline_and_ibeam(self) -> None:
+        view = card()
+        view.show_messages(READY, 2)
+        before = render(view)
+        view.set_card_hover(True)
+        self.assertEqual(view.cursor().shape(), Qt.CursorShape.IBeamCursor)
+        after = render(view)
+        mid = view.width() // 2
+        self.assertNotEqual(before.pixel(mid, 0), after.pixel(mid, 0))
+        self.assertEqual(before.pixel(mid, 30), after.pixel(mid, 30))  # only the edge changes
+        view.set_card_hover(False)
+        self.assertEqual(view.cursor().shape(), Qt.CursorShape.ArrowCursor)
+        self.assertEqual(render(view).pixel(mid, 0), before.pixel(mid, 0))
+
+
+class TestMessageFit(unittest.TestCase):
+    def test_message_role_only_when_the_lines_fit_the_rows(self) -> None:
+        """Small text with Standard spacing leaves 84 DIP of rows: three 28 DIP message lines fit, four don't."""
+        view = card(text_size="small", spacing="standard")
+        self.assertEqual(view.height() - 2 * view.pad_y(), 84)
+        self.assertEqual(view._message_role(READY), "message")
+        self.assertEqual(view._message_role(READY + [[("text", "One more line.")]]), "body")
+
+    def test_body_role_when_a_line_is_too_wide(self) -> None:
+        view = card()
+        self.assertEqual(view._message_role([[("text", "word " * 30)]]), "body")
 
 
 if __name__ == "__main__":

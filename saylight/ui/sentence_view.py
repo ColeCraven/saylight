@@ -7,7 +7,9 @@ Design, based on reading research with dyslexic readers:
 * earlier sentences dimmed to ~5:1, words not yet read never dimmed, no bold/underline/size changes;
 * the wheel scrolls back through the text (a "Back to current" chip returns at once; otherwise auto-follow
   resumes 4 s after the last scroll, waiting while the pointer is over the card), Ctrl+wheel changes text size,
-  and a click on any sentence reads from there (the panel forwards clicks, so the card never takes focus).
+  and a click on any sentence reads from there (the panel forwards clicks, so the card never takes focus);
+* with no text yet, the whole card is one click target that opens Type or paste; message lines can hold action
+  chips ("Type or paste text", "Undo"), which are hit-tested here.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QLinearGradient, QPain
                            QTextCharFormat, QTextLayout, QTextOption)
 from PySide6.QtWidgets import QWidget
 
-from .controls import Part, measure_parts, paint_parts
+from .controls import ACTION_PARTS, ActionState, Part, measure_parts, paint_parts
 from .motion import FAST, MEDIUM, Tween, decelerate, with_alpha
 
 LINE_SEP = " "
@@ -61,6 +63,11 @@ class SentenceView(QWidget):
         self._layout_key = None
         self._starts: list[int] = []
         self._hover_sentence: int | None = None
+        self._card_hover = False
+        self._hits: dict[str, QRectF] = {}  # action chips on the current message lines, as last painted
+        self._action_hover = {key: Tween(self, theme, 0.0, FAST) for key in ACTION_PARTS}
+        self._action_press = {key: Tween(self, theme, 0.0, FAST) for key in ACTION_PARTS}
+        self._action_enabled = dict.fromkeys(ACTION_PARTS, True)
         self._manual = False
         self.scroll = Tween(self, theme, 0.0, 160, decelerate())
         self.pill_x = Tween(self, theme, 0.0, FAST, decelerate())
@@ -140,6 +147,7 @@ class SentenceView(QWidget):
         self._prev_secondary_from = self._secondary_from
         self.messages = lines
         self._secondary_from = secondary_from
+        self._hits = {}
         self.swap.snap(0.0)
         self.swap.to(1.0)
         self.update()
@@ -149,6 +157,7 @@ class SentenceView(QWidget):
             self._prev_messages = self.messages or None
             self._prev_secondary_from = self._secondary_from
             self.messages = None
+            self._hits = {}
             self._ensure_layout()
             self._update_targets(animate=False)
             self.swap.snap(0.0)
@@ -198,6 +207,33 @@ class SentenceView(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor if sentence is not None else Qt.CursorShape.ArrowCursor)
         if sentence != self._hover_sentence:
             self._hover_sentence = sentence
+            self.update()
+
+    def action_at(self, pos: QPointF) -> str | None:
+        """The action chip ("type" or "undo") under `pos` on the message lines, or None."""
+        if self.messages is None:
+            return None
+        return next((key for key, r in self._hits.items() if r.contains(pos)), None)
+
+    def set_action_state(self, key: str, hover: bool, pressed: bool, enabled: bool) -> None:
+        """Show an action chip hovered or pressed; a disabled one takes neither."""
+        if enabled != self._action_enabled[key]:
+            self._action_enabled[key] = enabled
+            self.update()
+        for tween, on in ((self._action_hover[key], hover), (self._action_press[key], pressed)):
+            if enabled:
+                tween.to(1.0 if on else 0.0)
+            else:
+                tween.snap(0.0)
+
+    def set_card_hover(self, on: bool) -> None:
+        """Outline the whole card, with an I-beam, while a click on it opens Type or paste."""
+        if on:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        elif self._card_hover:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if on != self._card_hover:
+            self._card_hover = on
             self.update()
 
     def wheelEvent(self, event) -> None:
@@ -352,7 +388,8 @@ class SentenceView(QWidget):
         p.setOpacity(s if s < 1.0 else 1.0)
         rise = (1.0 - s) * t.k * 4
         if self.messages is not None:
-            self._paint_messages(p, colors, self.messages, rise, self._secondary_from)
+            self._hits = {}
+            self._paint_messages(p, colors, self.messages, rise, self._secondary_from, self._hits)
         else:
             # Clip to the text rows so a partly scrolled line never peeks into the padding.
             p.setClipRect(self._inner_rect(), Qt.ClipOperation.IntersectClip)
@@ -377,20 +414,38 @@ class SentenceView(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(colors["edge"], 0))
         p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), t.px(6), t.px(6))
+        if self._card_hover:  # the same idiom as the sentence hover outline, shown instantly
+            pen = (QPen(t.color("HoverOutline"), 0) if t.high_contrast
+                   else QPen(with_alpha(colors["text"], 0.35), max(1.0, t.k)))
+            inset = max(0.5, pen.widthF() / 2)
+            p.setPen(pen)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset), t.px(6), t.px(6))
 
-    def _paint_messages(self, p: QPainter, colors: dict, messages, rise: float, secondary_from: int) -> None:
+    def _message_role(self, messages: list[list[Part]]) -> str:
+        """The message role when every line fits the width and all of them fit the rows; else the body role."""
         t = self.theme
         avail_w = self.width() - 2 * self.pad_x()
-        role = "message" if all(measure_parts(t, m, role="message") <= avail_w for m in messages) else "body"
+        avail_h = self.height() - 2 * self.pad_y()
+        return ("message" if len(messages) * (t.line_height("message") + t.px(4)) <= avail_h
+                and all(measure_parts(t, m, role="message") <= avail_w for m in messages) else "body")
+
+    def _paint_messages(self, p: QPainter, colors: dict, messages, rise: float, secondary_from: int,
+                        hits: dict[str, QRectF] | None = None) -> None:
+        t = self.theme
+        role = self._message_role(messages)
         lh = t.line_height(role) + t.px(4)
         total = len(messages) * lh
         avail = self.height() - 2 * self.pad_y()
         y0 = self.pad_y() + max(0.0, (avail - total) / 2) + rise
         caps = (colors["keycap_fill"], colors["keycap_stroke"], colors["keycap_text"])
+        actions = {key: ActionState(self._action_hover[key].value, self._action_press[key].value,
+                                    self._action_enabled[key]) for key in ACTION_PARTS}
+        disabled = t.color("TextDisabled") if t.high_contrast else colors["secondary"]
         for i, parts in enumerate(messages):
             if parts:
                 color = colors["text"] if i < secondary_from else colors["secondary"]
-                paint_parts(p, t, self.pad_x(), y0 + i * lh, lh, parts, color, role=role, caps=caps)
+                paint_parts(p, t, self.pad_x(), y0 + i * lh, lh, parts, color, role=role, caps=caps,
+                            actions=actions, disabled=disabled, hits=hits)
 
     def _band_path(self, origin: QPointF, a: int, b: int) -> QPainterPath:
         """Rounded rectangles behind the text range [a, b), one per line, merged."""

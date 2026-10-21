@@ -14,8 +14,8 @@ from PySide6.QtCore import QCoreApplication, QEventLoop, QThread
 from PySide6.QtWidgets import QApplication
 
 from saylight import clipboard, input_thread, win32
-from saylight.input_thread import HK_PANEL, HK_PAUSE, HK_READ, InputThread
-from saylight.tests.test_win32 import CrossProcessLock
+from saylight.input_thread import HK_COMPOSE, HK_PANEL, HK_PAUSE, HK_READ, InputThread
+from saylight.tests.test_win32 import CrossProcessLock, _hidden_window
 
 F24, F23, F22 = "Ctrl+Alt+Shift+F24", "Ctrl+Alt+Shift+F23", "Ctrl+Alt+Shift+F22"
 VK_F23, VK_F22 = win32.VK_F24 - 1, win32.VK_F24 - 2
@@ -63,6 +63,7 @@ class Recorder:
         t.registered.connect(lambda hk, ok: self._add("registered", hk, ok))
         t.hotkeyPressed.connect(lambda hk: self._add("hotkey", hk))
         t.copied.connect(lambda token, text, reason: self._add("copied", token, text, reason))
+        t.composeReadPressed.connect(lambda: self._add("compose_read"))
         t.quitRequested.connect(lambda: self._add("quit"))
 
     def _add(self, *event):
@@ -88,7 +89,9 @@ class FakeCopy:
         return self.result
 
 
-class InputThreadTests(unittest.TestCase):
+class ThreadTestCase(unittest.TestCase):
+    """Starts InputThreads with the copy job faked, holding the cross-process hotkey lock."""
+
     lock: CrossProcessLock
 
     @classmethod
@@ -116,6 +119,8 @@ class InputThreadTests(unittest.TestCase):
         self.assertTrue(pump_until(lambda: rec.of("ready")), "ready never arrived")
         return t, rec
 
+
+class InputThreadTests(ThreadTestCase):
     def test_ready_follows_registration_and_disabled_ids_are_silent(self):
         with self.assertLogs("saylight.input_thread", "WARNING") as logs:
             t, rec = self.start({HK_READ: F24, HK_PANEL: "", HK_PAUSE: "Hyper+Q"})
@@ -388,6 +393,103 @@ class InputThreadTests(unittest.TestCase):
         t.stop()
         self.assertTrue(pump_until(lambda: rec.of("copied")))
         self.assertEqual(rec.of("copied"), [("copied", 2, "", "busy")])
+
+
+class ComposeGateTests(ThreadTestCase):
+    """Ctrl+` while the Type or paste box is open. Presses are posted WM_HOTKEY messages; the foreground
+    window is faked (one of our own hidden windows, or one that claims another process)."""
+
+    def setUp(self):
+        super().setUp()
+        self.own = _hidden_window()  # never shown
+        self.addCleanup(win32.user32.DestroyWindow, self.own)
+        self.fg = self.own
+        patcher = mock.patch.object(win32, "get_foreground_window", lambda: self.fg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, t: InputThread, hk_id: int) -> None:
+        self.assertTrue(win32.post_thread_message(t._thread_id, win32.WM_HOTKEY, hk_id, 0))
+
+    def test_read_press_goes_to_the_box_without_copying(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_compose_open(True)
+        with self.assertLogs("saylight.input_thread", "INFO") as logs:
+            self.post(t, HK_READ)
+            self.assertTrue(pump_until(lambda: rec.of("compose_read")))
+            pump_for(0.1)
+        self.assertEqual(rec.of("compose_read"), [("compose_read",)])
+        self.assertEqual((rec.of("hotkey"), rec.of("copied"), self.fake.calls), ([], [], []))
+        self.assertTrue(all(rec.on_gui), "a signal arrived off the GUI thread")
+        self.assertIn("routed to the Type or paste box", "\n".join(logs.output))
+
+    def test_box_closed_keeps_the_old_path(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_compose_open(True)
+        t.set_compose_open(False)
+        self.post(t, HK_READ)
+        self.assertTrue(pump_until(lambda: rec.of("copied")))
+        self.assertEqual(rec.events[-2:], [("hotkey", HK_READ), ("copied", 0, "Some text.", "ok")])
+        self.assertEqual(rec.of("compose_read"), [])
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_another_process_in_front_keeps_the_old_path(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_compose_open(True)
+        with mock.patch.object(win32, "get_window_pid", return_value=win32.get_window_pid(self.own) + 4):
+            self.post(t, HK_READ)
+            self.assertTrue(pump_until(lambda: rec.of("copied")))
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_READ)])
+        self.assertEqual(rec.of("compose_read"), [])
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_nothing_in_front_keeps_the_old_path(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_compose_open(True)
+        self.fg = 0
+        self.post(t, HK_READ)
+        self.assertTrue(pump_until(lambda: rec.of("copied")))
+        self.assertEqual(rec.of("compose_read"), [])
+
+    def test_only_the_read_shortcut_is_routed(self):
+        t, rec = self.start({HK_READ: F24, HK_PANEL: F23})
+        t.set_compose_open(True)
+        self.post(t, HK_PANEL)
+        self.assertTrue(pump_until(lambda: rec.of("hotkey")))
+        pump_for(0.1)
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_PANEL)])
+        self.assertEqual((rec.of("compose_read"), rec.of("copied")), ([], []))
+
+    def test_each_press_is_routed_while_open_then_copies_again_after_close(self):
+        t, rec = self.start({HK_READ: F24})
+        t.set_compose_open(True)
+        self.post(t, HK_READ)
+        self.post(t, HK_READ)
+        self.assertTrue(pump_until(lambda: len(rec.of("compose_read")) == 2))
+        t.set_compose_open(False)
+        self.post(t, HK_READ)
+        self.assertTrue(pump_until(lambda: rec.of("copied")))
+        self.assertEqual(len(rec.of("compose_read")), 2)
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_READ)])
+
+    def test_compose_shortcut_registers_only_when_set(self):
+        t, rec = self.start({HK_READ: F24, HK_COMPOSE: ""})
+        self.assertEqual(rec.of("registered"), [("registered", HK_READ, True)])
+        self.assertTrue(chord_free(F23))
+        t.set_hotkeys({HK_READ: F24, HK_COMPOSE: F23})
+        self.assertTrue(pump_until(lambda: len(rec.of("registered")) == 3))
+        self.assertEqual(rec.of("registered")[1:], [("registered", HK_READ, True), ("registered", HK_COMPOSE, True)])
+        self.assertFalse(chord_free(F23))
+        t.set_compose_open(True)  # the box's own shortcut is a plain press, never routed or copied
+        self.post(t, HK_COMPOSE)
+        self.assertTrue(pump_until(lambda: rec.of("hotkey")))
+        pump_for(0.1)
+        self.assertEqual(rec.of("hotkey"), [("hotkey", HK_COMPOSE)])
+        self.assertEqual((rec.of("copied"), rec.of("compose_read"), self.fake.calls), ([], [], []))
+        t.set_hotkeys({HK_READ: F24, HK_COMPOSE: ""})  # cleared again: unregistered silently
+        self.assertTrue(pump_until(lambda: len(rec.of("registered")) == 4))
+        self.assertEqual(rec.of("registered")[-1], ("registered", HK_READ, True))
+        self.assertTrue(chord_free(F23), "the compose chord stayed registered")
 
 
 if __name__ == "__main__":

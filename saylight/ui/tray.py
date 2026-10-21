@@ -213,7 +213,10 @@ class Tray:
     # --- Interaction --------------------------------------------------------------------------
 
     def _on_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger and self.ctl.composing():
+            self.ctl.close_compose("tray")  # keeps the text; the panel stays as it was
+            QTimer.singleShot(0, self.ctl.restore_foreground)
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.ctl.toggle_panel(from_tray=True)
         elif reason == QSystemTrayIcon.ActivationReason.MiddleClick:
             self.ctl.engine.toggle_pause()
@@ -224,6 +227,8 @@ class Tray:
 
     def _build_menu(self) -> None:
         ctl = self.ctl
+        if ctl.composing():
+            ctl.close_compose("tray")  # keeps the text; aboutToHide gives the foreground back
         m = self.menu
         m.clear()
         header = m.addAction(self._tooltip().split("\n")[0])
@@ -237,14 +242,19 @@ class Tray:
         hud.setCheckable(True)
         hud.setChecked(bool(ctl.settings.get("hud_when_hidden")))
         hud.triggered.connect(lambda on: ctl.settings.set("hud_when_hidden", on))
-        active = self._state in ("copying", "preparing", "reading", "waiting", "paused")
-        if active:
-            m.addSeparator()
+        m.addSeparator()
+        can_type = bool(self._info.get("can_type"))
+        compose = m.addAction("Type or paste text…", lambda: ctl.open_compose("tray"))
+        compose.setEnabled(can_type)
+        if self._state in ("copying", "preparing", "reading", "waiting", "paused"):
             m.addAction("Resume" if self._state == "paused" else "Pause", ctl.engine.toggle_pause)
             m.addAction("Stop", ctl.engine.stop)
         elif ctl.has_text():
-            m.addSeparator()
             m.addAction("Read again from start", ctl.engine.replay_from_start)
+        if self._info.get("can_clear") or (can_type and ctl.has_draft()):
+            m.addAction("Clear text", ctl.clear_box)
+        if ctl.can_undo_clear():
+            m.addAction("Undo clear", ctl.undo_clear)
         m.addSeparator()
         speed_menu = m.addMenu("Speed")
         group = QActionGroup(speed_menu)

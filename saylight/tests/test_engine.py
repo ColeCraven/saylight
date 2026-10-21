@@ -2088,6 +2088,578 @@ class SeekRaceTests(unittest.TestCase):
         self.assertEqual(h.info["sentence"], 7)
 
 
+# --- Typed text, Clear and Undo ----------------------------------------------------------------
+
+def typed_text(n: int) -> str:
+    return " ".join(f"Typed {i:03d} one two three four five six." for i in range(n))
+
+
+def _waiting(h: H) -> None:
+    a, _ = h.play()
+    h.end(a)
+
+
+def _stopped(h: H) -> None:
+    a, _ = h.play()
+    h.tick(a, s_start(2) + 100)
+    h.engine.stop()
+
+
+def _finished(h: H) -> None:
+    a, _ = h.play(4)
+    h.end(a)
+
+
+def _empty_click(h: H) -> None:
+    h.engine.read_selection_click(1)
+    h.copied("", "empty", token=h.input.copy_requests[-1][0])
+
+
+def _overlay_over_stopped(h: H) -> None:
+    _stopped(h)
+    _empty_click(h)
+
+
+# name -> (setup, internal state it leaves)
+SCENARIOS = {
+    "ready": (lambda h: None, E.READY),
+    "offline": (lambda h: h.engine.set_online(False), E.READY_OFFLINE),
+    "shortcut_unavailable": (lambda h: h.input.registered.emit(E.HK_READ, False), E.SHORTCUT_UNAVAILABLE),
+    "copying_hotkey": (lambda h: h.press(), E.COPYING),
+    "copying_click": (lambda h: h.engine.read_selection_click(1), E.COPYING),
+    "preparing": (lambda h: h.begin(), E.PREPARING),
+    "reading": (lambda h: h.play(), E.READING),
+    "waiting": (_waiting, E.WAITING),
+    "paused": (lambda h: (h.play(), h.engine.toggle_pause()), E.PAUSED),
+    "finished": (_finished, E.FINISHED),
+    "stopped": (_stopped, E.STOPPED),
+    "error_offline": (lambda h: (h.begin(), h.fail(h.req(0)["chunk_id"], "offline")), E.ERROR_OFFLINE),
+    "error_service": (lambda h: (h.begin(), h.fail(h.req(0)["chunk_id"], "service")), E.ERROR_SERVICE),
+    "error_playback": (lambda h: h.player.failed.emit(h.play()[0], "MCI error 263"), E.ERROR_PLAYBACK),
+    "overlay_over_ready": (_empty_click, E.NOTHING_SELECTED),
+    "overlay_over_stopped": (_overlay_over_stopped, E.NOTHING_SELECTED),
+}
+
+
+def reach(test: unittest.TestCase, name: str, h: H | None = None) -> H:
+    """A harness brought to one of SCENARIOS."""
+    h = h or H()
+    setup, state = SCENARIOS[name]
+    setup(h)
+    test.assertEqual(h.state, state, name)
+    return h
+
+
+def counts(h: H) -> tuple:
+    """How much every recorder (and fake worker) has seen so far."""
+    return (len(h.states), len(h.sessions), len(h.positions), len(h.time_left), len(h.speeds), len(h.notices),
+            len(h.media), len(h.beeps), h.toggles, len(h.synth.requests), len(h.synth.cancelled_before),
+            len(h.synth.deleted), len(h.player.cmds), len(h.settings.sets), len(h.input.copy_requests))
+
+
+class TypedTextTests(unittest.TestCase):
+    def test_reads_from_every_state(self):
+        for name in SCENARIOS:
+            with self.subTest(name):
+                h = reach(self, name)
+                notices, sessions, requests = len(h.notices), len(h.sessions), len(h.synth.requests)
+                self.assertTrue(h.engine.read_text(typed_text(6)))
+                doc = h.engine.document
+                self.assertEqual(len(doc.sentences), 6)
+                self.assertEqual(h.sessions[sessions:], [doc])  # never a textless moment in between
+                self.assertEqual((h.state, h.shown), (E.PREPARING, E.PREPARING))
+                self.assertEqual(h.info["sentence"], 0)
+                self.assertTrue(h.info["has_text"])
+                self.assertNotIn("stopped", h.notices[notices:])
+                self.assertTrue(h.synth.requests[requests]["text"].startswith("Typed 000"))
+                self.assertTrue(all(r["gen"] == h.engine._gen for r in h.synth.requests[requests:]))
+
+    def test_a_copy_in_flight_goes_stale(self):
+        h = reach(self, "copying_hotkey")
+        h.engine.read_text(typed_text(6))
+        h.copied(make_text(3))
+        self.assertEqual(len(h.engine.document.sentences), 6)
+        h = reach(self, "copying_click")
+        h.engine.read_text(typed_text(6))
+        h.copied(make_text(3), token=h.input.copy_requests[-1][0])
+        self.assertEqual(len(h.engine.document.sentences), 6)
+        self.assertEqual(h.state, E.PREPARING)
+        h.advance(E.COPY_WATCHDOG_MS + 100)  # the cancelled copy's timers are gone too
+        self.assertEqual(h.state, E.PREPARING)
+        self.assertNotIn(E.COPYING, h.shown_states())
+
+    def test_from_a_visible_copy_it_goes_straight_to_preparing(self):
+        h = reach(self, "finished")
+        h.press()
+        h.advance(E.COPY_SHOW_MS + 1)
+        self.assertEqual(h.shown, E.COPYING)
+        states = len(h.states)
+        h.engine.read_text(typed_text(6))
+        self.assertEqual(h.shown_states()[states:], [E.PREPARING])  # the old Finished never flashes back
+
+    def test_pending_presses_are_ignored(self):
+        h = H()
+        h.play()
+        h.press()                                  # optimistic pause; its copy result is still to come
+        self.assertTrue(h.engine.read_text(typed_text(6)))
+        h.copied(make_text(3))                     # would otherwise replace the typed text
+        self.assertEqual(len(h.engine.document.sentences), 6)
+        self.assertEqual(h.state, E.PREPARING)
+
+        h = H()
+        h.play()
+        h.engine.toggle_pause()
+        h.press()                                  # pressed while paused: an empty result would resume
+        h.engine.read_text(typed_text(6))
+        h.engine.toggle_pause()                    # the user pauses the typed reading
+        h.copied("", "empty")
+        self.assertEqual(h.state, E.PAUSED)
+        self.assertEqual(h.toggles, 0)
+
+    def test_old_audio_is_dropped(self):
+        h = H()
+        a, b = h.play(ready_all=True)
+        h.engine.read_text(typed_text(6))
+        h.pump()
+        self.assertIn(("stop_close",), h.player.cmds)
+        self.assertIn(h.path(a), h.synth.deleted)
+        self.assertIn(h.path(b), h.synth.deleted)
+
+    def test_blank_or_unspeakable_text_changes_nothing(self):
+        for name in ("ready", "reading", "paused", "finished"):
+            with self.subTest(name):
+                h = reach(self, name)
+                doc, before = h.engine.document, counts(h)
+                for text in ("", "   \n\t ", "---", "* * *", "​"):
+                    self.assertFalse(h.engine.read_text(text), repr(text))
+                self.assertEqual(counts(h), before)
+                self.assertIs(h.engine.document, doc)
+                self.assertEqual(h.state, SCENARIOS[name][1])
+
+    def test_reading_goes_on_after_unspeakable_text(self):
+        h = H()
+        a, _ = h.play()
+        self.assertFalse(h.engine.read_text("---"))
+        h.tick(a, s_start(1) + 100)
+        self.assertEqual((h.state, h.info["sentence"]), (E.READING, 1))
+
+    def test_text_over_the_limit_is_cut(self):
+        self.assertEqual(E.MAX_TEXT_CHARS, 100_000)
+        h = H()
+        text = make_text(2000)
+        self.assertGreater(len(text), E.MAX_TEXT_CHARS)
+        real, seen = E.Document.from_raw, []
+
+        def spy(raw, **kw):
+            seen.append(len(raw))
+            return real(raw, **kw)
+
+        with mock.patch.object(E.Document, "from_raw", side_effect=spy):
+            self.assertTrue(h.engine.read_text(text))
+            self.assertTrue(h.engine.read_text(text[:E.MAX_TEXT_CHARS]))
+        self.assertEqual(seen, [E.MAX_TEXT_CHARS, E.MAX_TEXT_CHARS])
+        self.assertLessEqual(len(h.engine.document.text), E.MAX_TEXT_CHARS)
+
+    def test_a_pending_speed_is_used_for_the_typed_reading(self):
+        h = H()
+        h.engine.set_speed(1.25)
+        h.engine.read_text(typed_text(3))
+        self.assertEqual(h.req()["rate"], "+25%")
+        self.assertEqual(h.settings.values["speed"], 1.25)
+
+    def test_the_compose_shortcut_is_not_the_engines(self):
+        from saylight.input_thread import HK_COMPOSE
+        h = reach(self, "reading")
+        before = counts(h)
+        h.press(HK_COMPOSE)
+        self.assertEqual(counts(h), before)
+
+    def test_after_shutdown(self):
+        h = H()
+        h.engine.shutdown()
+        self.assertFalse(h.engine.read_text(typed_text(3)))
+        self.assertIsNone(h.engine.clear())
+
+    def test_logs_counts_never_text(self):
+        with self.assertLogs("saylight.engine", "INFO") as logs:
+            h = H()
+            h.engine.read_text("Private words typed here.")
+            h.engine.read_text("---")
+            token = h.engine.clear()
+            h.engine.restore(token)
+        output = "\n".join(logs.output)
+        self.assertIn("Reading typed text: 25 characters", output)
+        self.assertIn("Cleared (1 sentences)", output)
+        self.assertIn("Clear undone", output)
+        for needle in ("Private", "words typed", "here."):
+            self.assertNotIn(needle, output)
+
+
+class ClearTests(unittest.TestCase):
+    def test_from_every_state(self):
+        idle = {"offline": E.READY_OFFLINE, "shortcut_unavailable": E.SHORTCUT_UNAVAILABLE}
+        for name in SCENARIOS:
+            with self.subTest(name):
+                h = reach(self, name)
+                had_text, notices, beeps = h.engine.document is not None, len(h.notices), len(h.beeps)
+                token = h.engine.clear()
+                expected = idle.get(name, E.READY)
+                self.assertEqual((h.state, h.shown), (expected, expected))
+                self.assertIsNone(h.engine.document)
+                self.assertEqual(token is not None, had_text)
+                self.assertFalse(h.info["has_text"])
+                self.assertEqual((h.info["can_type"], h.info["can_clear"]), (True, False))
+                self.assertEqual(h.info["sentence"], -1)
+                self.assertFalse(h.engine._purge_timer.is_active())
+                self.assertFalse(h.engine._media_on)
+                self.assertEqual(h.notices[notices:], [])
+                self.assertEqual(len(h.beeps), beeps)
+                if had_text:
+                    self.assertIsNone(h.sessions[-1])
+                    self.assertEqual(h.positions[-1][0], -1)
+                    self.assertEqual(h.time_left[-1], -1)
+                before = counts(h)
+                h.advance(E.PURGE_MS + 60_000)  # nothing is left running
+                self.assertEqual(counts(h), before)
+
+    def test_signals(self):
+        h = H()
+        h.play()
+        h.engine.set_speed(1.25)  # a change still waiting to be committed, with its note
+        self.assertTrue(h.engine.pending_note)
+        events = []
+        e = h.engine
+        e.sessionChanged.connect(lambda doc: events.append(("session", doc)))
+        e.position.connect(lambda s, *rest: events.append(("position", s)))
+        e.timeLeft.connect(lambda v: events.append(("time_left", v)))
+        e.speedChanged.connect(lambda v, note: events.append(("speed", v, note)))
+        e.stateChanged.connect(lambda s, info: events.append(("state", s)))
+        e.mediaKeysWanted.connect(lambda on: events.append(("media", on)))
+        e.notice.connect(lambda kind: events.append(("notice", kind)))
+        e.clear()
+        self.assertEqual(sorted(events, key=str), sorted([("session", None), ("position", -1), ("time_left", -1),
+                                                          ("speed", 1.25, ""), ("state", E.READY),
+                                                          ("media", False)], key=str))
+        self.assertLess(events.index(("session", None)), events.index(("state", E.READY)))
+        self.assertEqual(h.input.media[-1], False)
+
+    def test_deletes_the_audio_and_stops_playback_and_synthesis(self):
+        h = H()
+        a, b = h.play(ready_all=True)
+        gen = h.engine._gen
+        h.engine.clear()
+        h.pump()
+        self.assertIn(("stop_close",), h.player.cmds)
+        self.assertGreater(h.synth.cancelled_before[-1], gen)
+        self.assertIn(h.path(a), h.synth.deleted)
+        self.assertIn(h.path(b), h.synth.deleted)
+        h.ready(h.req()["chunk_id"])  # a late result of the old generation is discarded
+        self.assertIsNone(h.player.loaded)
+
+    def test_cancels_a_pending_seek(self):
+        h = H()
+        h.play(ready_all=True)
+        h.engine.next()
+        self.assertTrue(h.engine._seek_timer.is_active())
+        h.engine.clear()
+        self.assertFalse(h.engine._seek_timer.is_active())
+        cmds = len(h.player.cmds)
+        h.advance(1000)
+        self.assertEqual(h.player.cmds[cmds:], [])
+
+    def test_commits_a_pending_speed_and_drops_its_note(self):
+        h = H()
+        h.play()
+        h.engine.set_speed(1.25)
+        h.engine.clear()
+        self.assertEqual(h.settings.values["speed"], 1.25)
+        self.assertEqual(h.speeds[-1], (1.25, ""))
+        self.assertEqual((h.engine.speed_pending, h.engine.pending_note), (False, ""))
+        self.assertEqual((h.info["speed"], h.info["speed_pending"], h.info["pending_note"]), (1.25, False, ""))
+        sets = len(h.settings.sets)
+        h.advance(1000)
+        self.assertEqual(len(h.settings.sets), sets)  # not committed a second time
+
+    def test_drops_a_committed_from_next_reading_note(self):
+        h = H()
+        a, _ = h.play(4)
+        h.tick(a, s_start(3) + 100)
+        h.engine.set_speed(1.25)
+        h.advance(E.SPEED_COMMIT_MS)
+        self.assertEqual(h.engine.pending_note, "1.25× from next reading")
+        h.engine.clear()
+        self.assertEqual(h.engine.pending_note, "")
+        self.assertEqual(h.speeds[-1], (1.25, ""))
+
+    def test_ends_in_the_current_idle_state(self):
+        h = H()
+        h.play()
+        h.engine.set_online(False)
+        h.engine.clear()
+        self.assertEqual(h.shown, E.READY_OFFLINE)
+        h = H()
+        h.play()
+        h.input.registered.emit(E.HK_READ, False)
+        h.engine.clear()
+        self.assertEqual(h.shown, E.SHORTCUT_UNAVAILABLE)
+
+    def test_with_no_text_it_is_a_no_op(self):
+        for name in ("ready", "offline", "shortcut_unavailable"):
+            with self.subTest(name):
+                h = reach(self, name)
+                before = counts(h)
+                self.assertIsNone(h.engine.clear())
+                self.assertEqual(counts(h), before)
+        h = H()
+        h.engine.set_speed(1.25)  # in Ready: committed by its own timer, not by Clear
+        before = counts(h)
+        self.assertIsNone(h.engine.clear())
+        self.assertEqual(counts(h), before)
+        h.advance(E.SPEED_COMMIT_MS)
+        self.assertEqual(h.settings.values["speed"], 1.25)
+
+    def test_clears_the_overlay_over_ready(self):
+        h = reach(self, "overlay_over_ready")
+        states = len(h.states)
+        self.assertIsNone(h.engine.clear())
+        self.assertEqual(h.shown_states()[states:], [E.READY])
+        h.advance(E.NOTHING_SELECTED_MS)
+        self.assertEqual(h.shown_states()[states:], [E.READY])
+
+    def test_cancels_a_copy(self):
+        h = reach(self, "copying_hotkey")
+        self.assertIsNone(h.engine.clear())
+        h.advance(E.COPY_SHOW_MS + 50)
+        h.copied(make_text(3))
+        self.assertEqual((h.state, h.toggles), (E.READY, 0))
+        self.assertNotIn(E.COPYING, h.shown_states())
+        self.assertIsNone(h.engine.document)
+
+        h = reach(self, "copying_click")
+        h.engine.clear()
+        h.copied(make_text(3), token=h.input.copy_requests[-1][0])
+        self.assertEqual(h.state, E.READY)
+        self.assertIsNone(h.engine.document)
+        h.advance(E.COPY_WATCHDOG_MS + 100)
+        self.assertEqual(h.state, E.READY)
+
+        h = reach(self, "finished")
+        h.press()
+        h.advance(E.COPY_SHOW_MS + 1)
+        self.assertEqual(h.shown, E.COPYING)
+        states = len(h.states)
+        token = h.engine.clear()
+        self.assertTrue(token.finished)  # the text copied over was Finished
+        self.assertEqual(h.shown_states()[states:], [E.READY])  # the old Finished never flashes back
+        h.copied(make_text(3))
+        self.assertEqual(h.state, E.READY)
+        self.assertIsNone(h.engine.document)
+
+    def test_token(self):
+        for name, sentence, finished in (("finished", 3, True), ("stopped", 2, False), ("reading", 1, False),
+                                         ("paused", 1, False), ("error_service", 0, False),
+                                         ("overlay_over_stopped", 2, False)):
+            with self.subTest(name):
+                h = H()
+                if name in ("reading", "paused"):
+                    a, _ = h.play()
+                    h.tick(a, s_start(1) + 100)
+                    if name == "paused":
+                        h.engine.toggle_pause()
+                else:
+                    reach(self, name, h)
+                doc = h.engine.document
+                token = h.engine.clear()
+                self.assertIsInstance(token, E.ClearedReading)
+                self.assertEqual((token.doc, token.sentence, token.finished), (doc, sentence, finished))
+        h = reach(self, "overlay_over_ready")
+        self.assertIsNone(h.engine.clear())
+
+    def test_token_is_frozen(self):
+        h = reach(self, "stopped")
+        token = h.engine.clear()
+        with self.assertRaises(AttributeError):
+            token.sentence = 0
+
+
+class RestoreTests(unittest.TestCase):
+    def test_restores_stopped_at_the_sentence(self):
+        h = reach(self, "stopped")
+        doc = h.engine.document
+        token = h.engine.clear()
+        events = []
+        h.engine.sessionChanged.connect(lambda d: events.append("session"))
+        h.engine.stateChanged.connect(lambda s, i: events.append(s))
+        h.engine.position.connect(lambda *p: events.append("position"))
+        h.engine.timeLeft.connect(lambda v: events.append("time_left"))
+        self.assertTrue(h.engine.restore(token))
+        self.assertIs(h.engine.document, doc)
+        self.assertIs(h.sessions[-1], doc)
+        self.assertEqual((h.state, h.shown), (E.STOPPED, E.STOPPED))
+        self.assertEqual(h.info["sentence"], 2)
+        self.assertEqual(h.info["prev_action"], "read_from")
+        self.assertTrue(h.info["can_clear"])
+        self.assertEqual(h.positions[-1][0], 2)
+        self.assertGreaterEqual(h.time_left[-1], 0)
+        self.assertEqual(events, ["session", E.STOPPED, "position", "time_left"])
+        self.assertTrue(h.engine._purge_timer.is_active())
+        self.assertFalse(h.engine._media_on)
+
+    def test_restores_finished(self):
+        h = reach(self, "finished")
+        token = h.engine.clear()
+        self.assertTrue(h.engine.restore(token))
+        self.assertEqual((h.state, h.info["sentence"]), (E.FINISHED, 3))
+        self.assertEqual(h.positions[-1][3], 1.0)
+        self.assertEqual(h.info["prev_action"], "read_last_again")
+        self.assertEqual(h.time_left[-1], 0)
+
+    def test_a_reading_comes_back_stopped(self):
+        h = H()
+        a, _ = h.play()
+        h.tick(a, s_start(1) + 100)
+        token = h.engine.clear()
+        self.assertTrue(h.engine.restore(token))
+        self.assertEqual((h.state, h.info["sentence"]), (E.STOPPED, 1))
+
+    def test_the_restored_text_is_purged_after_ten_minutes(self):
+        h = reach(self, "stopped")
+        h.engine.restore(h.engine.clear())
+        h.advance(E.PURGE_MS - 1)
+        self.assertIsNotNone(h.engine.document)
+        h.advance(2)
+        self.assertIsNone(h.engine.document)
+        self.assertEqual(h.state, E.READY)
+
+    def test_refused(self):
+        h = reach(self, "stopped")
+        token = h.engine.clear()
+        self.assertFalse(h.engine.restore(None))
+        h.begin()                                   # another text is loaded
+        before = counts(h)
+        self.assertFalse(h.engine.restore(token))
+        self.assertEqual(counts(h), before)
+        self.assertEqual(len(h.engine.document.sentences), 12)
+        self.assertIsNot(h.engine.document, token.doc)
+
+        h = reach(self, "stopped")
+        token = h.engine.clear()
+        h.press()                                   # copying
+        before = counts(h)
+        self.assertFalse(h.engine.restore(token))
+        self.assertEqual(counts(h), before)
+
+        h = reach(self, "stopped")
+        token = h.engine.clear()
+        self.assertTrue(h.engine.restore(token))
+        self.assertFalse(h.engine.restore(token))   # already back
+        h.engine.shutdown()
+        self.assertFalse(h.engine.restore(token))
+
+    def test_over_the_nothing_selected_overlay(self):
+        h = reach(self, "stopped")
+        token = h.engine.clear()
+        _empty_click(h)
+        self.assertEqual(h.shown, E.NOTHING_SELECTED)
+        self.assertTrue(h.engine.restore(token))
+        self.assertEqual(h.shown, E.STOPPED)
+        h.advance(E.NOTHING_SELECTED_MS)
+        self.assertEqual(h.shown, E.STOPPED)
+
+    def test_reading_again_synthesises_from_the_stored_sentence(self):
+        h = reach(self, "stopped")
+        requests = len(h.synth.requests)
+        h.engine.restore(h.engine.clear())
+        self.assertEqual(len(h.synth.requests), requests)  # no audio comes back with the text
+        h.engine.prev()                                     # "Read from here"
+        self.assertEqual(h.state, E.PREPARING)
+        first = h.req(requests)["chunk_id"]
+        self.assertEqual(h.first_sentence(first), 2)
+        h.ready(first)
+        h.started(first)
+        self.assertEqual((h.state, h.info["sentence"]), (E.READING, 2))
+        self.assertTrue(h.engine._media_on)
+
+
+class PauseResumeApiTests(unittest.TestCase):
+    def test_pause_per_state(self):
+        for name in SCENARIOS:
+            with self.subTest(name):
+                h = reach(self, name)
+                expected = name in ("preparing", "reading", "waiting")
+                self.assertIs(h.engine.pause(), expected)
+                self.assertEqual(h.state, E.PAUSED if expected else SCENARIOS[name][1])
+
+    def test_resume_per_state(self):
+        for name in SCENARIOS:
+            with self.subTest(name):
+                h = reach(self, name)
+                expected = name == "paused"
+                self.assertIs(h.engine.resume(), expected)
+                self.assertEqual(h.state, E.READING if expected else SCENARIOS[name][1])
+
+    def test_pause_never_resumes_and_resume_never_pauses(self):
+        h = H()
+        h.play()
+        self.assertFalse(h.engine.resume())
+        self.assertEqual(h.state, E.READING)
+        self.assertTrue(h.engine.pause())
+        self.assertEqual(h.cmds("pause"), [("pause",)])
+        self.assertFalse(h.engine.pause())
+        self.assertEqual(h.state, E.PAUSED)
+        self.assertTrue(h.engine.resume())
+        self.assertEqual(h.cmds("resume"), [("resume",)])
+        self.assertEqual(h.state, E.READING)
+        self.assertEqual(h.notices[-2:], ["paused", "resumed"])
+
+    def test_resume_before_any_audio_is_preparing(self):
+        h = H()
+        h.begin()
+        self.assertTrue(h.engine.pause())
+        self.assertTrue(h.engine.resume())
+        self.assertEqual(h.state, E.PREPARING)
+
+    def test_after_shutdown(self):
+        h = reach(self, "reading")
+        h.engine.shutdown()
+        self.assertFalse(h.engine.pause())
+        self.assertFalse(h.engine.resume())
+
+
+class InfoTests(unittest.TestCase):
+    def test_can_type_and_can_clear_per_shown_state(self):
+        expected = {"ready": (True, False), "offline": (True, False), "shortcut_unavailable": (True, False),
+                    "overlay_over_ready": (True, False)}
+        for name in SCENARIOS:
+            with self.subTest(name):
+                h = reach(self, name)
+                h.advance(E.COPY_SHOW_MS + 1)  # long enough for Copying to show
+                info = h.info
+                if h.shown == E.COPYING:
+                    self.assertEqual((info["can_type"], info["can_clear"]), (False, False))
+                else:
+                    self.assertEqual((info["can_type"], info["can_clear"]), expected.get(name, (True, True)))
+
+    def test_copying_from_finished(self):
+        h = reach(self, "finished")
+        states = len(h.states)
+        h.press()
+        h.advance(E.COPY_SHOW_MS - 1)
+        self.assertEqual(len(h.states), states)  # nothing new to show in the first 150 ms
+        self.assertEqual((h.shown, h.info["can_type"], h.info["can_clear"]), (E.FINISHED, True, True))
+        h.advance(2)
+        self.assertEqual(len(h.states), states + 1)
+        self.assertEqual((h.shown, h.info["can_type"], h.info["can_clear"]), (E.COPYING, False, False))
+
+    def test_hidden_copying_in_ready_emits_nothing(self):
+        h = H()
+        states = len(h.states)
+        h.press()
+        h.advance(E.COPY_SHOW_MS - 1)
+        h.copied(make_text(3))
+        self.assertEqual(h.shown_states()[states:], [E.PREPARING])
+
+
 class WiringTests(unittest.TestCase):
     def test_app_also_connecting_the_input_slots_is_not_double_handled(self):
         h = H()

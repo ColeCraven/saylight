@@ -23,6 +23,10 @@ text copied from PDFs usually brings with it.
 **One shortcut for everything.** Highlight text and press <kbd>Ctrl</kbd> + <kbd>`</kbd> to start reading. Press it
 with nothing highlighted to show or hide the panel, or to pause and resume while it's reading.
 
+**Type or paste your own text.** Click ✎ or the empty reading box, type or paste, then press **Read aloud**
+(<kbd>Ctrl</kbd> + <kbd>Enter</kbd>). Highlight part of it and <kbd>Ctrl</kbd> + <kbd>`</kbd> reads just that part.
+The box uses your reading font, size and background, so what you type looks like what you'll hear.
+
 **Follow along as you listen.**
 - A soft band marks the sentence being read, and a highlight follows the current word.
 - Earlier sentences are dimmed slightly. Text you haven't reached is never dimmed, so you can read ahead of the voice.
@@ -45,11 +49,13 @@ spacing, highlight style, and background (Cream, Peach, Soft blue, Soft dark, or
 
 **Simple controls.**
 - Play and pause, previous and next sentence, and stop.
+- **Clear** empties the reading box and anything you typed; Undo appears for 10 seconds.
 - Speed from 0.5× to 2×; changes apply from the next sentence without distorting the voice.
 - Volume control, and a larger reading view when you want more context.
 
 **Unobtrusive by design.**
-- The panel floats on top but never takes keyboard focus, so the app you're reading in stays active.
+- The panel floats on top but never takes keyboard focus, so the app you're reading in stays active. Only the Type
+  or paste box takes the keyboard, and only while it's open; it hands it back when you read or press <kbd>Esc</kbd>.
 - A tray icon and a small status pill show what's happening while the panel is hidden.
 - Follows Windows dark and light mode, high-contrast themes, text scaling and the *Animation effects* setting.
 
@@ -101,6 +107,8 @@ Requires Windows 10 or 11 and Python 3.10 or newer.
 | Text size | <kbd>Ctrl</kbd> + scroll over the text, or the ⚙ Reading display page |
 | Speed | − / + buttons, or scroll over the speed control |
 | Media keys | Play/Pause, Next and Previous work while it's reading |
+| Read your own text | Click ✎ or the empty reading box, type or paste, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> or **Read aloud**. Highlight part of it to hear just that part. <kbd>Esc</kbd> goes back and keeps your text |
+| Clear the text | The eraser button, or *Clear text* in the tray menu. **Undo** appears for 10 seconds |
 
 ## Privacy
 
@@ -108,6 +116,9 @@ The voice is Microsoft's online neural voice (the same voices as Microsoft Edge'
 open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read aloud is sent
 to Microsoft** to be turned into speech, so avoid using it on confidential material. Saylight itself stores no text:
 it's kept in memory only while you're reading, and the log records counts, never content.
+
+Text you type or paste stays in memory until you clear it or quit Saylight. It is never saved, and it is sent to
+Microsoft only when you have it read aloud.
 
 ## Development
 
@@ -121,10 +132,11 @@ saylight/
   input_thread.py        global shortcut and copying the selection
   settings.py, theme.py  saved settings, colours and fonts
   ui/                    the panel, controls, reading view, tray, status pill and tooltips
+  ui/compose.py          the Type or paste box
 scripts/build_release.py builds the installer zip into dist/
 ```
 
-Run the test suite (about 640 tests) from the project folder:
+Run the test suite (about 900 tests) from the project folder:
 
 ```
 python -m unittest discover -s saylight/tests -t .

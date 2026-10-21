@@ -60,6 +60,7 @@ BORDER_NONE: tuple[()] = ()  # pass to dwm_set_border_color() for no border at a
 
 SPI_GETHIGHCONTRAST = 0x0042
 SPI_GETCLIENTAREAANIMATION = 0x1042
+SPI_GETCARETWIDTH = 0x2006
 HCF_HIGHCONTRASTON = 0x00000001
 SM_CXSMICON = 49
 
@@ -230,6 +231,11 @@ def is_app_window(hwnd: int) -> bool:
     return is_window(hwnd) and not is_shell_window(hwnd) and get_window_pid(hwnd) != _OWN_PID
 
 
+def is_own_window(hwnd: int) -> bool:
+    """True for a live window of this process: the panel, the Type or paste box, a menu or a tooltip."""
+    return is_window(hwnd) and get_window_pid(hwnd) == _OWN_PID
+
+
 # --- DWM and window placement -------------------------------------------------
 
 def _dwm_set(hwnd: int, attribute: int, value: int, ctype=wintypes.DWORD) -> bool:
@@ -308,6 +314,15 @@ def animations_enabled() -> bool:
     if not user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(value), 0):
         return True
     return bool(value.value)
+
+
+def caret_width_px() -> int:
+    """The text cursor thickness from Settings > Accessibility > Text cursor (SPI_GETCARETWIDTH), in pixels;
+    1 if it can't be read."""
+    value = wintypes.DWORD(1)
+    if not user32.SystemParametersInfoW(SPI_GETCARETWIDTH, 0, ctypes.byref(value), 0):
+        return 1
+    return max(1, int(value.value))
 
 
 def high_contrast() -> bool:

@@ -73,7 +73,7 @@ class TestDefaults(Base):
 
     def test_default_values(self) -> None:
         s = Settings(self.path)
-        self.assertEqual(s.get("hotkeys"), {"read": "Ctrl+`", "toggle_panel": "", "pause_resume": ""})
+        self.assertEqual(s.get("hotkeys"), {"read": "Ctrl+`", "toggle_panel": "", "pause_resume": "", "compose": ""})
         self.assertEqual(s.get("panel"), {"visible": True, "position": None, "expanded": False})
         expected = {"version": 1, "speed": 0.95, "volume": 100, "hud_when_hidden": True, "media_keys": True,
                     "first_hide_tip_shown": False, "skip_citations": True, "skip_urls": True,
@@ -340,6 +340,30 @@ class TestHotkeys(Base):
         s = Settings(self.path)
         s.set("hotkeys.read", "")
         self.assertEqual(s.get("hotkeys.read"), "")
+
+    def test_compose_shortcut_is_off_by_default_and_validated_like_the_others(self) -> None:
+        s = Settings(self.path)
+        self.assertEqual(s.get("hotkeys.compose"), "")
+        self.assertIs(SCHEMA["hotkeys.compose"][1], SCHEMA["hotkeys.read"][1])
+        keys = self.spy(s)
+        s.set("hotkeys.compose", "alt+ctrl+shift+f23")
+        self.assertEqual(s.get("hotkeys.compose"), "Ctrl+Alt+Shift+F23")
+        with self.assertRaises(ValueError):
+            s.set("hotkeys.compose", "t")
+        self.assertEqual(keys, ["hotkeys.compose"])
+        self.assertTrue(s.flush())
+        self.assertEqual(self.read_json()["hotkeys"]["compose"], "Ctrl+Alt+Shift+F23")
+
+    def test_an_invalid_compose_shortcut_in_the_file_falls_back(self) -> None:
+        self.write_json({"hotkeys": {"compose": "Ctrl+Nope"}})
+        with self.assertLogs("saylight.settings", "WARNING"):
+            s = Settings(self.path)
+        self.assertEqual(s.get("hotkeys.compose"), "")
+
+    def test_nothing_typed_or_about_the_box_is_a_setting(self) -> None:
+        """Typed text and the box's size are never persisted; its shortcut is the only new key."""
+        related = [k for k in SCHEMA if any(w in k for w in ("compose", "draft", "typed", "editor", "text."))]
+        self.assertEqual(related, ["hotkeys.compose"])
 
 
 class TestSet(Base):

@@ -124,7 +124,7 @@ class FakeSystem:
     def __init__(self, *, fg=APP, terminals=(), saved=Saved("prev", False), copied=Copied("sel", False),
                  replies=True, reply_delay=0.04, send_ok=True, held=(), held_for=0.0, set_fg_works=True,
                  restore_ok=True):
-        self.apps = {APP, OTHER, TERMINAL}
+        self.apps, self.own = {APP, OTHER, TERMINAL}, {OWN}
         self.t, self.fg, self.terminals = 0.0, fg, set(terminals)
         self.saved, self.copied, self.replies, self.reply_delay = saved, copied, replies, reply_delay
         self.send_ok, self.held, self.held_for = send_ok, set(held), held_for
@@ -137,6 +137,9 @@ class FakeSystem:
 
     def is_app(self, hwnd):
         return hwnd in self.apps
+
+    def is_own(self, hwnd):
+        return hwnd in self.own
 
     def is_terminal(self, hwnd):
         return hwnd in self.terminals
@@ -249,6 +252,33 @@ class CopyJobTests(unittest.TestCase):
         s = FakeSystem(fg=SHELL, terminals={TERMINAL})
         self.assertEqual(run(s, is_click=True, last_app=TERMINAL, key_vks=()), ("", "console"))
         self.assertEqual(s.sent, [])
+
+    def test_hotkey_with_our_own_window_in_front_sends_nothing(self):
+        s = FakeSystem(fg=OWN, held={BACKTICK, CTRL}, held_for=0.2)
+        self.assertEqual(run(s, last_app=APP), ("", "empty"))
+        self.assertEqual((s.sent, s.calls, s.restored, s.sleeps), ([], [], [], []))  # clipboard never touched
+        self.assertEqual(s.t, 0.0)  # and no waiting for the keys to be let go
+
+    def test_hotkey_with_our_own_window_in_front_leaves_a_late_copy_watch_alone(self):
+        late = clipboard._LateCopy(500, Saved("prev", False), 0.5)
+        clipboard._tls.late = late
+        s = FakeSystem(fg=OWN)
+        self.assertEqual(run(s), ("", "empty"))
+        self.assertIs(clipboard._tls.late, late)  # the input thread's loop still watches it
+        self.assertEqual(s.restored, [])
+
+    def test_click_from_our_own_window_is_unchanged_by_the_hotkey_guard(self):
+        s = FakeSystem(fg=OWN)
+        self.assertEqual(run(s, is_click=True, last_app=APP, key_vks=()), ("sel", "ok"))
+        self.assertEqual(s.calls[0], ("set_foreground", APP))
+        self.assertEqual(s.sent, [[CTRL, C]])
+        self.assertEqual(s.restored, [Saved("prev", False)])
+
+    def test_real_system_recognises_own_windows(self):
+        with mock.patch.object(win32, "is_own_window", side_effect=lambda h: h == OWN) as is_own:
+            self.assertTrue(clipboard._System().is_own(OWN))
+            self.assertFalse(clipboard._System().is_own(APP))
+        self.assertEqual(is_own.call_count, 2)
 
     def test_hotkey_with_the_shell_in_front_does_not_restore(self):
         s = FakeSystem(fg=SHELL)
@@ -734,6 +764,9 @@ class _SandboxSystem(clipboard._System):
 
     def is_app(self, hwnd):
         return hwnd == APP
+
+    def is_own(self, hwnd):
+        return False
 
     def is_terminal(self, hwnd):
         return self.terminal

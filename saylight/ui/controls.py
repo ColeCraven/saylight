@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, Iterable, NamedTuple
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
-from ..theme import READING_PRESETS
+from ..theme import READING_PRESETS, composite
 from .motion import FAST, MEDIUM, SLOW, Clock, Tween, decelerate, mix, with_alpha
 
 # Segoe Fluent Icons code points (all present in the font).
@@ -32,6 +32,10 @@ G_EXPAND = ""     # FullScreen
 G_COLLAPSE = ""   # BackToWindow
 G_BACK = ""
 G_CHECK = ""
+G_TYPE = ""
+G_CLEAR = ""
+G_UNDO = ""
+G_PASTE = ""
 
 TRANSPARENT = QColor(0, 0, 0, 0)
 
@@ -50,8 +54,17 @@ def draw_glyph(p: QPainter, rect: QRectF, glyph: str, font, color: QColor, dx: f
 
 # --- Keycap hints ------------------------------------------------------------------------------
 
-Part = tuple[str, str]  # ("text", "..."), ("key", "Ctrl") or ("glyph", G_PLAY): a round chip with an icon
+Part = tuple[str, str]  # ("text", "..."), ("key", "Ctrl"), ("glyph", G_PLAY): a round chip with an icon,
+#                         or ("action", "type"): a clickable chip from ACTION_PARTS
 CAP_H = {"small": 16, "body": 18, "message": 20}  # keycap and glyph-chip height in DIP for each text role
+ACTION_PARTS = {"type": (G_TYPE, "Type or paste text"), "undo": (G_UNDO, "Undo")}  # key: (glyph, label)
+
+
+class ActionState(NamedTuple):
+    """How an action chip is drawn: hover and press amounts (0-1) and whether it can be clicked."""
+    hover: float = 0.0
+    pressed: float = 0.0
+    enabled: bool = True
 
 
 def _keycap_width(theme, label: str) -> float:
@@ -64,6 +77,8 @@ def _part_width(theme, kind: str, s: str, role: str) -> float:
         return _keycap_width(theme, s)
     if kind == "glyph":
         return float(theme.px(CAP_H.get(role, 18)))
+    if kind == "action":  # glyph at +10, label at +32, 10 of right padding
+        return theme.px(32) + QFontMetricsF(theme.font(role)).horizontalAdvance(ACTION_PARTS[s][1]) + theme.px(10)
     return QFontMetricsF(theme.font(role)).horizontalAdvance(s)
 
 
@@ -77,10 +92,14 @@ def measure_parts(theme, parts: list[Part], *, role: str = "body") -> float:
 
 
 def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, parts: list[Part],
-                color: QColor, *, role: str = "body", caps: tuple[QColor, QColor, QColor] | None = None) -> float:
-    """Paint text with inline keycaps and glyph chips on one line; returns the x after the last part.
+                color: QColor, *, role: str = "body", caps: tuple[QColor, QColor, QColor] | None = None,
+                actions: dict[str, ActionState] | None = None, disabled: QColor | None = None,
+                hits: dict[str, QRectF] | None = None) -> float:
+    """Paint text with inline keycaps and chips on one line; returns the x after the last part.
 
-    `caps` is (fill, stroke, ink) for the keycaps and chips; the app-theme keycap tokens by default."""
+    `caps` is (fill, stroke, ink) for the keycaps and chips; the app-theme keycap tokens by default.
+    `actions` gives each action chip's state, `disabled` the ink of a disabled one (TextDisabled by default),
+    and `hits`, when given, receives each action chip's rect by key."""
     font = theme.font(role)
     fm = QFontMetricsF(font)
     baseline = line_top + (line_h - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
@@ -93,6 +112,13 @@ def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, pa
             p.setFont(font)
             p.setPen(color)
             p.drawText(QPointF(x, baseline), s)
+        elif kind == "action":
+            state = (actions or {}).get(s, ActionState())
+            r = QRectF(x, mid - (cap_h + theme.px(4)) / 2, w, cap_h + theme.px(4))
+            _paint_action(p, theme, r, baseline, s, state, (fill, stroke, ink), font,
+                          disabled or theme.color("TextDisabled"))
+            if hits is not None:
+                hits[s] = r
         else:
             r = QRectF(x, mid - cap_h / 2, w, cap_h)
             p.setPen(QPen(stroke, 0))
@@ -118,6 +144,40 @@ def paint_parts(p: QPainter, theme, x: float, line_top: float, line_h: float, pa
     return x
 
 
+def _paint_action(p: QPainter, t, r: QRectF, baseline: float, key: str, state: ActionState,
+                  caps: tuple[QColor, QColor, QColor], font, disabled_ink: QColor) -> None:
+    """An action chip: keycap colours, a 16 DIP glyph and the label on the line's baseline."""
+    fill, stroke, ink = caps
+    glyph, label = ACTION_PARTS[key]
+    hover, pressed = (state.hover, state.pressed) if state.enabled else (0.0, 0.0)
+    face = fill
+    if not t.high_contrast:
+        face = mix(mix(fill, composite(ink, 0.06, fill), hover), composite(ink, 0.10, fill), pressed)
+    p.setPen(QPen(stroke, 0))
+    p.setBrush(face)
+    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), t.px(4), t.px(4))
+    hc_outline(p, t, r, t.px(4), max(hover, pressed))
+    color = ink if state.enabled else disabled_ink
+    draw_glyph(p, QRectF(r.left() + t.px(10), r.center().y() - t.px(8), t.px(16), t.px(16)), glyph,
+               t.font("icon16"), color)
+    p.setFont(font)
+    p.setPen(color)
+    p.drawText(QPointF(r.left() + t.px(32), baseline), label)
+
+
+def paint_focus_ring(p: QPainter, theme, rect: QRectF, radius: float) -> None:
+    """The keyboard focus ring around a control's `rect` (corner `radius`): a 1 DIP Surface gap, then 2 DIP of
+    TextPrimary, so the outer edge sits 3 DIP out with radius + 3."""
+    k = theme.k
+    p.save()
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(theme.color("Surface"), k))
+    p.drawRoundedRect(rect.adjusted(-k / 2, -k / 2, k / 2, k / 2), radius + k / 2, radius + k / 2)
+    p.setPen(QPen(theme.color("TextPrimary"), 2 * k))
+    p.drawRoundedRect(rect.adjusted(-2 * k, -2 * k, 2 * k, 2 * k), radius + 2 * k, radius + 2 * k)
+    p.restore()
+
+
 def hc_outline(p: QPainter, t, rect: QRectF, radius: float, amount: float, token: str = "HoverOutline") -> None:
     """In high contrast, hover (or `token`) is a 1 px outline instead of a fill."""
     if t.high_contrast and amount > 0.5:
@@ -130,22 +190,69 @@ def hc_outline(p: QPainter, t, rect: QRectF, radius: float, amount: float, token
 
 # --- Base control ------------------------------------------------------------------------------
 
+FOCUS_PAD = 3  # DIP around a focusable control's face: the 1 DIP gap and the 2 DIP focus ring
+
+
 class Control(QWidget):
-    """Hover/press tracking, tooltips and accessibility shared by every control. Never takes focus."""
+    """Hover/press tracking, tooltips and accessibility shared by every control.
+
+    Never takes focus, unless `focusable` (only in a window that may take focus): then Tab reaches it, Space or
+    Enter clicks it, and keyboard focus draws a ring in the FOCUS_PAD kept around the control's face."""
 
     clicked = Signal()
 
-    def __init__(self, theme, tips, parent: QWidget | None = None, tooltip: str | Callable[[], str] = ""):
+    def __init__(self, theme, tips, parent: QWidget | None = None, tooltip: str | Callable[[], str] = "", *,
+                 focusable: bool = False):
         super().__init__(parent)
         self.theme = theme
         self.tips = tips
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.focusable = focusable
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus if focusable else Qt.FocusPolicy.NoFocus)
         self.setMouseTracking(True)
         self.hover = Tween(self, theme, 0.0, FAST)
         self.press = Tween(self, theme, 0.0, FAST)
         self._pressed = False
+        self._ring = False
         self._tooltip = tooltip
         theme.changed.connect(self.update)
+
+    # A focusable control's widget is FOCUS_PAD larger on every side than the face it paints.
+    def pad(self) -> int:
+        return self.theme.px(FOCUS_PAD) if self.focusable else 0
+
+    def face(self) -> QRectF:
+        m = self.pad()
+        return QRectF(self.rect()).adjusted(m, m, -m, -m)
+
+    def place(self, rect: QRect) -> None:
+        """Put the control's face at `rect` (parent coordinates)."""
+        m = self.pad()
+        self.setGeometry(rect.adjusted(-m, -m, m, m))
+
+    def focus_ring_shown(self) -> bool:
+        return self._ring and self.hasFocus()
+
+    def focusInEvent(self, event) -> None:
+        self._ring = event.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason)
+        self.update()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        self._ring = False
+        self.update()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        plain = event.modifiers() in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier)
+        keys = (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        if self.focusable and plain and event.key() in keys and self.isEnabled():
+            if not event.isAutoRepeat():
+                self.press.snap(1.0)
+                self.press.to(0.0)
+                self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # Tooltip text is re-evaluated each time so it always reflects the current state.
     def set_tooltip(self, tooltip: str | Callable[[], str]) -> None:
@@ -178,6 +285,7 @@ class Control(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
             self._pressed = True
+            self._ring = False  # the ring is for keyboard use only
             self.press.to(1.0)
             self.tips.press(self)
             event.accept()
@@ -188,7 +296,7 @@ class Control(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._pressed:
             self._pressed = False
             self.press.to(0.0)
-            if self.rect().contains(event.position().toPoint()) and self.isEnabled():
+            if self.face().contains(event.position()) and self.isEnabled():
                 self.clicked.emit()
             event.accept()
             return
@@ -203,8 +311,9 @@ class IconButton(Control):
     """Subtle 32/36 DIP button: radius-4 plate on hover, glyph in TextPrimary."""
 
     def __init__(self, theme, tips, glyph: str, *, size: int = 36, small_glyph: bool = False,
-                 parent: QWidget | None = None, tooltip: str | Callable[[], str] = "", name: str = ""):
-        super().__init__(theme, tips, parent, tooltip)
+                 parent: QWidget | None = None, tooltip: str | Callable[[], str] = "", name: str = "",
+                 focusable: bool = False):
+        super().__init__(theme, tips, parent, tooltip, focusable=focusable)
         self.glyph = glyph
         self.size_dip = size
         self.small_glyph = small_glyph
@@ -215,7 +324,8 @@ class IconButton(Control):
         self.relayout()
 
     def relayout(self) -> None:
-        self.setFixedSize(self.theme.px(self.size_dip), self.theme.px(self.size_dip))
+        side = self.theme.px(self.size_dip) + 2 * self.pad()
+        self.setFixedSize(side, side)
 
     def set_glyph(self, glyph: str) -> None:
         if glyph != self.glyph:
@@ -239,7 +349,7 @@ class IconButton(Control):
         t = self.theme
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect())
+        r = self.face()
         base = t.color("SubtleSelected") if self.selected else TRANSPARENT
         fill = mix(mix(base, t.color("SubtleHover"), self.hover.value), t.color("SubtlePressed"), self.press.value)
         if self.selected and self.hover.value == 0 and self.press.value == 0:
@@ -258,6 +368,8 @@ class IconButton(Control):
             self.painter_glyph(p, r, color)
         else:
             draw_glyph(p, r, self.glyph, t.font("icon12" if self.small_glyph else "icon16"), color)
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, r, t.px(4))
 
 
 def paint_stop_square(theme):
@@ -386,6 +498,165 @@ class PlayButton(Control):
             super().mousePressEvent(event)
         else:
             event.ignore()
+
+
+# --- Buttons for the Type or paste box (focusable) ---------------------------------------------
+
+class PillButton(Control):
+    """Read aloud: Play's accent fill grown into a 40 DIP pill with a glyph and a label."""
+
+    def __init__(self, theme, tips, glyph: str, label: str, parent: QWidget | None = None,
+                 tooltip: str | Callable[[], str] = "", name: str = ""):
+        super().__init__(theme, tips, parent, tooltip, focusable=True)
+        self.glyph = glyph
+        self.label = label
+        self.label_opacity = 1.0
+        self.on = Tween(self, theme, 1.0, FAST)  # enabled amount
+        self.setAccessibleName(name or label)
+
+    def natural_size(self) -> QSize:
+        """The face: glyph at +10, label at +34 and 16 of right padding, 40 tall."""
+        t = self.theme
+        label_w = QFontMetricsF(t.font("status")).horizontalAdvance(self.label)
+        return QSize(math.ceil(t.px(34) + label_w + t.px(16)), t.px(40))
+
+    def set_label_opacity(self, v: float) -> None:
+        """Fade the label alone, while the pill grows out of the Play circle."""
+        self.label_opacity = max(0.0, min(1.0, v))
+        self.update()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == event.Type.EnabledChange:
+            self.on.to(1.0 if self.isEnabled() else 0.0)
+        super().changeEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        t = self.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.face()
+        radius = r.height() / 2
+        live = mix(mix(t.color("Accent"), t.color("AccentHover"), self.hover.value), t.color("AccentPressed"),
+                   self.press.value)
+        live_ink = mix(t.color("OnAccent"), t.color("OnAccentPressed"), self.press.value)
+        fill = mix(t.color("AccentDisabled"), live, self.on.value)
+        ink = mix(t.color("TextDisabled"), live_ink, self.on.value)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(r, radius, radius)
+        if t.high_contrast and self.isEnabled():  # hover rings the Highlight fill 1 DIP outside it
+            hc_outline(p, t, r.adjusted(-t.k, -t.k, t.k, t.k), radius + t.k, self.hover.value)
+        elif t.high_contrast:  # disabled is a GrayText outline, not Window on Window
+            p.setPen(QPen(t.color("DisabledOutline"), 0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius - 0.5, radius - 0.5)
+
+        shape = QPainterPath()
+        shape.addRoundedRect(r, radius, radius)
+        p.save()
+        p.setClipPath(shape)
+        # The glyph moves from the circle's centre to its +10 column as the pill grows to its full width.
+        g = t.px(16)
+        full = self.natural_size().width()
+        grown = max(0.0, min(1.0, (r.width() - r.height()) / max(1.0, full - r.height())))
+        gx = (r.width() - g) / 2 * (1.0 - grown) + t.px(10) * grown
+        draw_glyph(p, QRectF(r.left() + gx, r.center().y() - g / 2, g, g), self.glyph, t.font("icon16"), ink,
+                   t.k if self.glyph == G_PLAY else 0.0)
+        if self.label_opacity > 0:
+            font = t.font("status")
+            fm = QFontMetricsF(font)
+            p.setOpacity(self.label_opacity)
+            p.setFont(font)
+            p.setPen(ink)
+            baseline = r.top() + (r.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
+            p.drawText(QPointF(r.left() + t.px(34), baseline), self.label)
+        p.restore()
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, r, radius)
+
+
+def text_button_size(theme, labels: Iterable[str]) -> QSize:
+    """A TextButton face wide enough for the longest label: glyph at +12, label at +36, 14 of right padding."""
+    fm = QFontMetricsF(theme.font("body"))
+    widest = max((fm.horizontalAdvance(s) for s in labels), default=0.0)
+    return QSize(math.ceil(theme.px(36) + widest + theme.px(14)), theme.px(32))
+
+
+class TextButton(Control):
+    """A 32 DIP button with a glyph and a label; a change of content crossfades in 120 ms.
+
+    "standard" uses the control fill and stroke (Clear / Undo in the box's footer); "chip" uses the reading
+    tint's keycap colours (Paste, inside the well)."""
+
+    def __init__(self, theme, tips, glyph: str, label: str, *, style: str = "standard",
+                 parent: QWidget | None = None, tooltip: str | Callable[[], str] = "", name: str = ""):
+        super().__init__(theme, tips, parent, tooltip, focusable=True)
+        self.style = style
+        self.glyph = glyph
+        self.label = label
+        self._prev: tuple[str, str] | None = None
+        self.swap = Tween(self, theme, 1.0, 120)
+        self.setAccessibleName(name or label)
+
+    def set_content(self, glyph: str, label: str, name: str = "") -> None:
+        if (glyph, label) != (self.glyph, self.label):
+            self._prev = (self.glyph, self.label)
+            self.glyph, self.label = glyph, label
+            self.swap.snap(0.0)
+            self.swap.to(1.0)
+        self.setAccessibleName(name or label)
+
+    def natural_size(self) -> QSize:
+        return text_button_size(self.theme, (self.label,))
+
+    def _colors(self) -> tuple[QColor, QColor, QColor, QColor]:
+        """(fill, stroke, ink, disabled ink) at the current hover and press."""
+        t = self.theme
+        hv, pr = self.hover.value, self.press.value
+        if self.style == "chip":
+            c = t.reading_colors()
+            base, ink = c["keycap_fill"], c["keycap_text"]
+            fill = base if t.high_contrast else mix(mix(base, composite(ink, 0.06, base), hv),
+                                                    composite(ink, 0.10, base), pr)
+            return fill, c["keycap_stroke"], ink, t.color("TextDisabled") if t.high_contrast else c["secondary"]
+        fill = mix(mix(t.color("ControlFill"), t.color("StepperHover"), hv), t.color("StepperPressed"), pr)
+        ink = mix(t.color("TextPrimary"), t.color("TextSecondary"), pr)
+        return fill, t.color("ControlStroke"), ink, t.color("TextDisabled")
+
+    def _paint_content(self, p: QPainter, r: QRectF, glyph: str, label: str, color: QColor) -> None:
+        t = self.theme
+        draw_glyph(p, QRectF(r.left() + t.px(12), r.center().y() - t.px(8), t.px(16), t.px(16)), glyph,
+                   t.font("icon16"), color)
+        font = t.font("body")
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        p.setPen(color)
+        baseline = r.top() + (r.height() - (fm.ascent() + fm.descent())) / 2 + fm.ascent()
+        p.drawText(QPointF(r.left() + t.px(36), baseline), label)
+
+    def paintEvent(self, _event) -> None:
+        t = self.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.face()
+        radius = t.px(4)
+        fill, stroke, ink, disabled_ink = self._colors()
+        if t.high_contrast and not self.isEnabled():
+            stroke = t.color("DisabledOutline")
+        p.setPen(QPen(stroke, 0))
+        p.setBrush(fill)
+        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+        hc_outline(p, t, r, radius, max(self.hover.value, self.press.value))
+        color = ink if self.isEnabled() else disabled_ink
+        s = self.swap.value
+        if s < 1.0 and self._prev:
+            p.setOpacity(1.0 - s)
+            self._paint_content(p, r, *self._prev, color)
+        p.setOpacity(s)
+        self._paint_content(p, r, self.glyph, self.label, color)
+        p.setOpacity(1.0)
+        if self.focus_ring_shown():
+            paint_focus_ring(p, t, r, radius)
 
 
 # --- Speed stepper -----------------------------------------------------------------------------

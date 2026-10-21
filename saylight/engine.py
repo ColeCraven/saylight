@@ -2,7 +2,8 @@
 
 Covers the reading states, the controls and copy path, seeking, speed changes, and timing, progress
 and privacy. There is one shortcut: Ctrl+` pauses at once, then reads the new selection, resumes, or
-toggles the panel.
+toggles the panel. Text typed or pasted into Saylight is read through read_text(); clear() forgets the
+text and hands back a token that restore() can bring it back from.
 
 The synth, player, input thread and settings are duck-typed. The engine connects to their signals
 itself; if the app also connects input_thread.hotkeyPressed / copied to the on_hotkey / on_copied
@@ -75,6 +76,7 @@ PREFETCH = 2                  # at most this many unplayed chunks requested or r
 MAX_CACHED_CHUNKS = 24        # ready chunks kept for Previous / jumps (bounded temp disk use)
 DEFAULT_MS_PER_CHAR = 65.0    # length estimate at 1.0x before anything has been measured
 MPC_ALPHA = 0.3               # EMA weight of a new ms-per-character measurement
+MAX_TEXT_CHARS = 100_000      # typed or pasted text beyond this is not read
 
 
 def snap_speed(v: float) -> float:
@@ -136,6 +138,14 @@ class _Chunk:
 
     def contains(self, sentence: int) -> bool:
         return self.plan.first <= sentence <= self.plan.last
+
+
+@dataclass(frozen=True)
+class ClearedReading:
+    """What clear() took away, so restore() can bring it back. Memory only; the app drops it after 10 s."""
+    doc: Document
+    sentence: int
+    finished: bool
 
 
 @dataclass
@@ -442,14 +452,15 @@ class Engine(QObject):
         self._copy_press = None
         self._state = self._copy_prev
 
-    def _cancel_copy(self) -> None:
-        """Stop (or the watchdog) in Copying: the pending result goes stale."""
+    def _cancel_copy(self, *, publish: bool = True) -> None:
+        """Stop, the watchdog, typed text or Clear in Copying: the pending result goes stale."""
         if self._copy_source == "click":
             self._copy_token += 1
         elif self._copy_press is not None:
             self._copy_press.ignored = True
         self._end_copy()
-        self._publish()
+        if publish:
+            self._publish()
 
     def _on_copy_show(self) -> None:
         if self._state == COPYING:
@@ -481,6 +492,72 @@ class Engine(QObject):
     def _underlying(self) -> str:
         return self._rest if self._state == NOTHING_SELECTED else self._state
 
+    # --- Input: typed text, Clear and Undo -----------------------------------------------------
+
+    @Slot(str, result=bool)
+    def read_text(self, text: str) -> bool:
+        """Read text handed over directly (Type or paste), the same way as a successful copy.
+
+        Returns False, changing nothing, when there is nothing to read; a reading in progress goes on.
+        """
+        if self._shut or not text or not text.strip():
+            return False
+        text = text[:MAX_TEXT_CHARS]
+        doc = self._make_doc(text)
+        if not doc.sentences:
+            log.info("Nothing to read in %d typed characters", len(text))
+            return False
+        for press in self._presses:  # a Ctrl+` copy still running must not replace this reading
+            press.ignored = True
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        log.info("Reading typed text: %d characters", len(text))
+        return self._new_session(text, doc)
+
+    def clear(self) -> ClearedReading | None:
+        """Clear: stop, forget the text and its audio, and go back to Ready (or Offline / Shortcut unavailable).
+
+        Returns a token for restore(), or None when there was no text. With nothing to clear it does nothing.
+        """
+        if self._shut:
+            return None
+        for press in self._presses:  # a Ctrl+` copy still running must not start a reading after Clear
+            press.ignored = True
+        if self._doc is None and self._state in IDLE:
+            return None
+        if self._state == COPYING:
+            self._cancel_copy(publish=False)
+        self._clear_overlay()
+        doc = self._doc
+        token = ClearedReading(doc, self._cur, self._state == FINISHED) if doc is not None else None
+        self._settle_speed()  # commit a waiting change now; its note no longer applies
+        self._purge()
+        self._mid_session = self._back_online = False
+        self._reason = ""
+        self._set_state(self._base_idle())
+        if token is not None:
+            log.info("Cleared (%d sentences)", len(token.doc.sentences))
+        return token
+
+    def restore(self, token: ClearedReading | None) -> bool:
+        """Undo a Clear: the text comes back Stopped at the same sentence, or Finished, with no audio.
+
+        Refused (False) once another text is loaded, while copying, or for no token.
+        """
+        if self._shut or token is None or self._doc is not None or self._underlying() not in IDLE:
+            return False
+        self._clear_overlay()
+        self._doc, self._time_left_value = token.doc, None
+        self.sessionChanged.emit(self._doc)
+        self._cur = self._floor = _clamp(token.sentence, 0, len(self._doc.sentences) - 1)
+        self._played_any = False
+        self._set_state(FINISHED if token.finished else STOPPED)  # also starts the privacy purge timer
+        self._emit_position()
+        self._emit_time_left(force=True)
+        log.info("Clear undone")
+        return True
+
     # --- Input: transport ----------------------------------------------------------------------
 
     @Slot()
@@ -495,6 +572,22 @@ class Engine(QObject):
             self._resume()
         elif state in ERRORS:
             self.retry()
+
+    @Slot(result=bool)
+    def pause(self) -> bool:
+        """Pause a reading that is preparing, playing or waiting; never resumes. True if it paused."""
+        if self._shut or self._underlying() not in (PREPARING, READING, WAITING):
+            return False
+        self._pause()
+        return True
+
+    @Slot(result=bool)
+    def resume(self) -> bool:
+        """Resume a paused reading; never pauses. True if it resumed."""
+        if self._shut or self._underlying() != PAUSED:
+            return False
+        self._resume()
+        return True
 
     def _pause(self) -> None:
         if self._loaded is not None:
@@ -855,9 +948,13 @@ class Engine(QObject):
 
     # --- Sessions and the chunk pipeline -------------------------------------------------------
 
-    def _new_session(self, text: str) -> bool:
-        doc = Document.from_raw(text, skip_citations=bool(self._get("skip_citations", True)),
-                                skip_urls=bool(self._get("skip_urls", True)))
+    def _make_doc(self, text: str) -> Document:
+        return Document.from_raw(text, skip_citations=bool(self._get("skip_citations", True)),
+                                 skip_urls=bool(self._get("skip_urls", True)))
+
+    def _new_session(self, text: str, doc: Document | None = None) -> bool:
+        """Start reading text (or its already-built document) from the first sentence; False if unspeakable."""
+        doc = doc if doc is not None else self._make_doc(text)
         if not doc.sentences:
             log.info("Nothing to read after normalizing %d characters", len(text))
             return False
@@ -1280,6 +1377,8 @@ class Engine(QObject):
             "can_next": base in (READING, WAITING, PAUSED) and has_text and self._cur < n - 1,
             "can_stop": base in ACTIVE or base in ERRORS,
             "can_seek": base in (READING, WAITING, PAUSED, FINISHED, STOPPED) and has_text,
+            "can_type": shown != COPYING,
+            "can_clear": has_text and shown != COPYING,
         }
 
     def _emit_position(self) -> None:

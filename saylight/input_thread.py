@@ -18,7 +18,7 @@ from .clipboard import LATE_COPY_POLL_S, ClipboardOwner, copy_selection, watch_l
 
 log = logging.getLogger("saylight.input_thread")
 
-HK_READ, HK_PANEL, HK_PAUSE = 1, 2, 3
+HK_READ, HK_PANEL, HK_PAUSE, HK_COMPOSE = 1, 2, 3, 4
 HK_MEDIA_PLAY_PAUSE, HK_MEDIA_STOP, HK_MEDIA_NEXT, HK_MEDIA_PREV = 10, 11, 12, 13
 MEDIA_KEYS = {HK_MEDIA_PLAY_PAUSE: win32.VK_MEDIA_PLAY_PAUSE, HK_MEDIA_STOP: win32.VK_MEDIA_STOP,
               HK_MEDIA_NEXT: win32.VK_MEDIA_NEXT_TRACK, HK_MEDIA_PREV: win32.VK_MEDIA_PREV_TRACK}
@@ -34,14 +34,16 @@ AUTO_COPY_TOKEN = 0
 class InputThread(QObject):
     """Hotkeys, the --quit event and the copy job, on one Win32 thread with its own message loop.
 
-    hotkeys maps an hk_id to a shortcut such as "Ctrl+`" (see win32.parse_hotkey). "" disables that id; it
-    is unregistered and not reported. Ids 10–13 are reserved for the media keys (set_media_keys).
+    hotkeys maps an hk_id (HK_READ … HK_COMPOSE) to a shortcut such as "Ctrl+`" (see win32.parse_hotkey).
+    "" disables that id; it is unregistered and not reported. Ids 10–13 are reserved for the media keys
+    (set_media_keys).
     """
 
     ready = Signal()
     registered = Signal(int, bool)          # hk_id, ok: after start() and each set_hotkeys/set_media_keys
     hotkeyPressed = Signal(int)             # hk_id; for HK_READ this comes before its automatic copy
     copied = Signal(int, str, str)          # token (0 = automatic copy after HK_READ), text, reason
+    composeReadPressed = Signal()           # HK_READ while the Type or paste box is in front: no copy at all
     quitRequested = Signal()                # the quit event was set (e.g. by --quit)
 
     def __init__(self, quit_event_handle: int, hotkeys: dict[int, str], parent=None):
@@ -49,6 +51,7 @@ class InputThread(QObject):
         self._quit_event = quit_event_handle or 0
         self._hotkeys = dict(hotkeys)
         self._pending: dict[int, str] | None = None
+        self._compose_open = False  # written on the GUI thread, read on the input thread
         self._lock = threading.Lock()
         self._active: dict[int, tuple[int, int]] = {}  # hk_id -> (modifiers, vk); input thread only
         self._thread_id = 0
@@ -78,6 +81,11 @@ class InputThread(QObject):
 
     def set_media_keys(self, on: bool) -> None:
         self._post(WM_APP_MEDIA, 1 if on else 0, 0)
+
+    def set_compose_open(self, on: bool) -> None:
+        """While the Type or paste box is open, a Read press with one of Saylight's windows in front emits
+        composeReadPressed instead of hotkeyPressed, and nothing is copied. A plain attribute write."""
+        self._compose_open = bool(on)
 
     def set_hotkeys(self, hotkeys: dict[int, str]) -> None:
         """Re-register with new specs. Unchanged ones stay registered; failed ones are retried."""
@@ -179,6 +187,10 @@ class InputThread(QObject):
     def _on_hotkey(self, hk_id: int) -> None:
         if hk_id not in self._active:
             return  # queued before that hotkey was unregistered
+        if hk_id == HK_READ and self._compose_open and win32.is_own_window(win32.get_foreground_window()):
+            log.info("Read shortcut routed to the Type or paste box")
+            self.composeReadPressed.emit()  # no Ctrl+C is sent, so the clipboard is left alone
+            return
         self.hotkeyPressed.emit(hk_id)
         if hk_id == HK_READ:
             self._copy(AUTO_COPY_TOKEN, False, 0, [self._active[HK_READ][1]])

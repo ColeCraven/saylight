@@ -1,13 +1,14 @@
 """ForegroundTracker: remembers the last app the user worked in, so focus can go back to it.
 
 Clicking the tray icon or opening its menu puts the taskbar (or Saylight) in front; restore_foreground()
-then hands the foreground back to that app, and the panel's Play path copies from it.
+then hands the foreground back to that app, and the panel's Play path copies from it. appActivated tells
+the Type or paste box that the user has gone to another app.
 GUI thread only: the WinEvent hook is out-of-context, so Windows calls it from this thread's message loop.
 """
 
 import logging
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Signal
 
 from . import win32
 
@@ -16,6 +17,8 @@ log = logging.getLogger("saylight.foreground")
 
 class ForegroundTracker(QObject):
     """Tracks EVENT_SYSTEM_FOREGROUND for every process except ours, ignoring shell windows."""
+
+    appActivated = Signal(int)  # hwnd: another app's window came to the front (not the shell, not the seed)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,10 +69,15 @@ class ForegroundTracker(QObject):
     def _on_event(self, hook, event, hwnd, id_object, id_child, thread_id, time_ms) -> None:
         try:  # an exception must never escape a ctypes callback
             if event == win32.EVENT_SYSTEM_FOREGROUND:
-                self._consider(hwnd or 0)
+                hwnd = hwnd or 0
+                if self._consider(hwnd):
+                    self.appActivated.emit(hwnd)
         except Exception:
             log.exception("Foreground event failed")
 
-    def _consider(self, hwnd: int) -> None:
+    def _consider(self, hwnd: int) -> bool:
+        """Remember hwnd if it is another app's window; True if it was."""
         if win32.is_app_window(hwnd):
             self._last = hwnd
+            return True
+        return False

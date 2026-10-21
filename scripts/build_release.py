@@ -130,6 +130,9 @@ they are spoken. Made with dyslexic readers in mind.</p>
  <b>pause and resume</b> while it is reading.</li>
 <li>In the panel: go back or forward a sentence, change the speed, or click any sentence to read from there.
  Scroll over the text to look back; <kbd>Ctrl</kbd>+scroll changes the text size.</li>
+<li>Click &#9998; (or the empty reading box) to <b>type or paste your own text</b>, then press <b>Read aloud</b> or
+ <kbd>Ctrl</kbd> <kbd>Enter</kbd>. <kbd>Esc</kbd> goes back and keeps your text.</li>
+<li>The eraser button <b>clears</b> the reading box. <b>Undo</b> appears for 10 seconds if you change your mind.</li>
 <li>The gear button opens <b>Reading display</b>: text size, font, spacing, highlight style and background colour,
  and options to skip citations and web links in academic papers.</li>
 <li>The tray icon (near the clock) shows when it is reading. Right-click it for more options, including Quit.</li>

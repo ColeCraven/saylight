@@ -168,6 +168,62 @@ class FakeHookTests(unittest.TestCase):
         self.assertEqual(self.desk.set_fg_calls, [])
 
 
+class AppActivatedTests(unittest.TestCase):
+    def setUp(self):
+        self.desk = FakeDesktop()
+        for p in self.desk.patches():
+            p.start()
+            self.addCleanup(p.stop)
+        self.tracker = ForegroundTracker()
+        self.addCleanup(self.tracker.stop)
+        self.activated: list[int] = []
+        self.tracker.appActivated.connect(self.activated.append)
+
+    def test_not_emitted_for_the_start_up_seed(self):
+        self.tracker.start()
+        self.assertEqual(self.tracker.last_app(), APP)
+        self.assertEqual(self.activated, [])
+
+    def test_emitted_for_app_windows(self):
+        self.tracker.start()
+        self.desk.switch_to(APP2)
+        self.desk.switch_to(APP)
+        self.assertEqual(self.activated, [APP2, APP])
+
+    def test_emitted_again_when_the_same_app_comes_back(self):
+        """Saylight's own windows raise no event, so going back to the app you came from must still count."""
+        self.tracker.start()
+        self.desk.switch_to(APP)
+        self.desk.switch_to(APP)
+        self.assertEqual(self.activated, [APP, APP])
+
+    def test_not_emitted_for_the_shell_our_own_windows_or_no_window(self):
+        self.tracker.start()
+        for hwnd in (SHELL, OURS, 0, None, 0x9999):
+            self.desk.switch_to(hwnd)
+        for i, cls in enumerate(sorted(win32.SHELL_CLASSES)):
+            self.desk.windows[0x5000 + i] = (cls, OTHER_PID)
+            self.desk.switch_to(0x5000 + i)
+        self.assertEqual(self.activated, [])
+
+    def test_other_events_do_not_emit(self):
+        self.tracker.start()
+        self.desk.hooks[-1][2](0xBEEF, 0x8005, APP2, 0, 0, 0, 0)  # EVENT_OBJECT_FOCUS
+        self.assertEqual(self.activated, [])
+
+    def test_a_failing_receiver_is_contained(self):
+        self.tracker.start()
+
+        def boom(hwnd):
+            raise RuntimeError("boom")
+
+        self.tracker.appActivated.connect(boom)
+        with mock.patch("sys.excepthook"):  # Qt reports a receiver's exception through the excepthook
+            self.desk.switch_to(APP2)
+        self.assertEqual(self.tracker.last_app(), APP2)
+        self.assertEqual(self.activated, [APP2])
+
+
 class RealHookTests(unittest.TestCase):
     def test_real_install_and_uninstall(self):
         before = win32.get_foreground_window()

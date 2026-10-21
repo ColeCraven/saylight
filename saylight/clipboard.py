@@ -307,6 +307,9 @@ class _System:
     def is_app(self, hwnd: int) -> bool:
         return win32.is_app_window(hwnd)
 
+    def is_own(self, hwnd: int) -> bool:
+        return win32.is_own_window(hwnd)
+
     def is_terminal(self, hwnd: int) -> bool:
         return win32.is_terminal_window(hwnd)
 
@@ -396,6 +399,8 @@ def watch_late_copy() -> float | None:
 
 def _copy(system: _System, *, is_click: bool, last_app: int, key_vks: Sequence[int],
           timeout_s: float) -> tuple[str, str]:
+    if not is_click and system.is_own(system.foreground()):
+        return "", "empty"    # Saylight itself is in front: never send Ctrl+C into its own windows
     _check_late_copy(system)  # undo the previous job's late copy before this job saves the clipboard
     _tls.late = None          # from here on, this job's own save and restore cover the clipboard
     fg = system.foreground()
@@ -434,8 +439,9 @@ def copy_selection(*, is_click: bool, last_app: int, key_vks: list[int], timeout
     """Copy the foreground app's selection and return (text, reason); see REASONS.
 
     Call it on the input thread, which owns a ClipboardOwner. is_click: the panel's Play button (refuses
-    terminals; restores last_app when the shell or Saylight is in front). key_vks: the hotkey's keys,
-    which are waited on (with every modifier) before sending Ctrl+C.
+    terminals; restores last_app when the shell or Saylight is in front). Otherwise (the hotkey) nothing
+    is sent while one of Saylight's own windows is in front. key_vks: the hotkey's keys, which are waited
+    on (with every modifier) before sending Ctrl+C.
     """
     start = time.monotonic()
     text, reason = _copy(_System(), is_click=is_click, last_app=last_app, key_vks=key_vks, timeout_s=timeout_s)

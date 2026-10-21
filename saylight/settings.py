@@ -157,6 +157,7 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "hotkeys.read": ("Ctrl+`", _hotkey),
     "hotkeys.toggle_panel": ("", _hotkey),
     "hotkeys.pause_resume": ("", _hotkey),
+    "hotkeys.compose": ("", _hotkey),
     "first_hide_tip_shown": (False, _bool),
     "skip_citations": (True, _bool),
     "skip_urls": (True, _bool),
