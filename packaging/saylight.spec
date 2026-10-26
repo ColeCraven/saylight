@@ -88,7 +88,8 @@ subprocess.run([sys.executable, os.path.join(HERE, "make_icon.py"), ICON, "--src
 # installed), and Qt modules it doesn't import.
 # Pillow is a dev tool only, even though pypdf imports it when it is installed. cryptography (AES-encrypted PDFs)
 # is left out too: it would add more than 10 MB, so those PDFs get the "This PDF is protected" notice instead.
-EXCLUDES = ["tkinter", "_tkinter", "PIL", "numpy", "cryptography", "Crypto", "Cryptodome",
+# lxml and fontTools are optional extras of other packages that Saylight never needs.
+EXCLUDES = ["tkinter", "_tkinter", "PIL", "numpy", "cryptography", "Crypto", "Cryptodome", "lxml", "fontTools",
             "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtOpenGL", "PySide6.QtSvg", "PySide6.QtPdf",
             "PySide6.QtDBus", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtConcurrent", "PySide6.QtPrintSupport",
             "PySide6.QtXml", "PySide6.QtHelp", "PySide6.QtOpenGLWidgets", "PySide6.QtUiTools",

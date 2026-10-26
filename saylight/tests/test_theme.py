@@ -217,6 +217,8 @@ class TestTokens(unittest.TestCase):
         self.assertEqual(set(T._HC), set(T.TOKENS))
         clear = {"HoverOutline", "TrackOutline", "DisabledOutline", "ModeFrame"}
         see_through = {"Scrim": 0x66, "SelectionHalo": 0x80}  # the selection overlay's scrim and ring halo
+        lit = {True: {"SurfaceSheen": 0x0F, "SurfaceEdge": 0x1F},   # the panel's light from above
+               False: {"SurfaceSheen": 0xB3, "SurfaceEdge": 0xFF}}
         for overrides in ({}, {"scheme_dark": False}, {"hc": True}):
             hc = bool(overrides.get("hc"))
             theme = make(**overrides)
@@ -224,9 +226,9 @@ class TestTokens(unittest.TestCase):
                 color = theme.color(token)
                 self.assertTrue(color.isValid(), (overrides, token))
                 if hc:
-                    alpha = 0 if token == "Scrim" else 255
+                    alpha = 0 if token in ("Scrim", "SurfaceSheen", "SurfaceEdge") else 255
                 else:
-                    alpha = 0 if token in clear else see_through.get(token, 255)
+                    alpha = 0 if token in clear else {**see_through, **lit[theme.dark]}.get(token, 255)
                 self.assertEqual(color.alpha(), alpha, (overrides, token))
 
     def test_derived_tokens(self) -> None:

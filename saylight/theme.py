@@ -47,6 +47,7 @@ _DARK = {
     "SegmentTrack": "#232323", "SegmentSelected": "#454545", "ProgressInactive": "#9A9A9A",
     "Caution": "#FCE100", "Critical": "#FF99A4",
     "Scrim": "#66000000", "SelectionEdge": "#FFFFFF", "SelectionHalo": "#80000000", "ModeFrame": "transparent",
+    "SurfaceSheen": "#0FFFFFFF", "SurfaceEdge": "#1FFFFFFF",
 }
 _LIGHT = {
     "Surface": "#F9F9F9", "TextPrimary": "#1A1A1A", "TextSecondary": "#5F5F5F", "TextDisabled": "#9F9F9F",
@@ -58,10 +59,13 @@ _LIGHT = {
     "SegmentTrack": "#F3F3F3", "SegmentSelected": "#FFFFFF", "ProgressInactive": "#7A7A7A",
     "Caution": "#9D5D00", "Critical": "#C42B1C",
     "Scrim": "#66000000", "SelectionEdge": "#FFFFFF", "SelectionHalo": "#80000000", "ModeFrame": "transparent",
+    "SurfaceSheen": "#B3FFFFFF", "SurfaceEdge": "#FFFFFFFF",
 }
 # Scrim, SelectionHalo and ModeFrame are the screen-selection overlay's: the 40% scrim over every screen, the dark
 # halo either side of the white selection ring (so it shows on white, black and the scrim), and the frame high
 # contrast draws along each screen edge instead of a scrim.
+# SurfaceSheen and SurfaceEdge light the panel from above, like Windows 11's cards: a faint wash fading down
+# over the header and a hairline along the top edge. High contrast has neither.
 # Derived from the accent. WordHighlightText is the current word's text colour, and the *Outline tokens
 # are transparent except in high contrast, which draws 1 px outlines.
 _DERIVED = ("Accent", "AccentHover", "AccentPressed", "OnAccent", "OnAccentPressed", "WordHighlight",
@@ -82,6 +86,7 @@ _HC = {
     "Caution": "windowtext", "Critical": "windowtext",
     "HoverOutline": "highlight", "TrackOutline": "windowtext", "DisabledOutline": "graytext",
     "Scrim": "transparent", "SelectionEdge": "highlight", "SelectionHalo": "window", "ModeFrame": "highlight",
+    "SurfaceSheen": "transparent", "SurfaceEdge": "transparent",
 }
 SYS_COLOR_NAMES = ("window", "windowtext", "highlight", "highlighttext", "graytext")
 HC_TRANSPARENT = "transparent"  # the one _HC name that isn't a system colour

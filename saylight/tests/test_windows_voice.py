@@ -491,20 +491,22 @@ class RegistrationTests(unittest.TestCase):
         router.synthesize(1, 0, "Hi.", ZIRA, 1.0)
         self.assertEqual((edge.requests, windows.requests), ([], [(1, 0, ZIRA)]))
 
-    def test_the_online_voice_never_falls_back_to_it_by_itself(self):
-        for settings in (Settings(voice="edge:en-US-AvaNeural"), None):
-            with self.subTest(settings=settings):
-                router, edge, windows, failed = self.router(settings)
-                router.set_reachable(False)
-                router.synthesize(1, 0, "Hi.", "edge:en-US-AvaNeural", 1.0)
-                edge.chunkFailed.emit(1, 0, "offline", "ClientConnectorError")
-                QCoreApplication.processEvents()
-                self.assertEqual(len(edge.requests), 1)
-                self.assertEqual(windows.requests, [])
-                self.assertEqual(failed, [(1, 0, "offline", "ClientConnectorError")])
+    def test_the_online_voice_falls_back_to_it_unless_switched_off(self):
+        router, edge, windows, failed = self.router(Settings(voice="edge:en-US-AvaNeural"))
+        router.synthesize(1, 0, "Hi.", "edge:en-US-AvaNeural", 1.0)
+        with self.assertLogs("saylight.voices.router", "INFO"):
+            edge.chunkFailed.emit(1, 0, "offline", "ClientConnectorError")
+        self.assertEqual((len(windows.requests), failed), (1, []))
+
+        router, edge, windows, failed = self.router(Settings(**{"offline.fallback": False}))
+        router.synthesize(1, 0, "Hi.", "edge:en-US-AvaNeural", 1.0)
+        edge.chunkFailed.emit(1, 0, "offline", "ClientConnectorError")
+        QCoreApplication.processEvents()
+        self.assertEqual(windows.requests, [])
+        self.assertEqual(failed, [(1, 0, "offline", "ClientConnectorError")])
 
     def test_a_fallback_switch_in_the_settings_is_obeyed(self):
-        router, edge, windows, failed = self.router(Settings(**{"voice.offline_fallback": True}))
+        router, edge, windows, failed = self.router(Settings(**{"offline.fallback": True}))
         router.synthesize(1, 0, "Hi.", "edge:en-US-AvaNeural", 1.0)
         with self.assertLogs("saylight.voices.router", "INFO"):
             edge.chunkFailed.emit(1, 0, "offline", "ClientConnectorError")

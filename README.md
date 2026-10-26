@@ -1,10 +1,18 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.png">
+  <img src="docs/images/hero-light.png" alt="Saylight: highlight it, and it says it. A read-aloud app for Windows, made with dyslexic readers in mind.">
+</picture>
+
 <p align="center">
-  <img src="docs/images/icon.png" alt="" width="96">
+  <a href="https://github.com/ColeCraven/saylight/releases/latest"><img src="https://img.shields.io/badge/Download-Saylight%20for%20Windows-4836C4?style=for-the-badge&logo=windows&logoColor=white" alt="Download Saylight for Windows"></a>
 </p>
 
-<h1 align="center">Saylight</h1>
-
-<p align="center"><b>Highlight it, and it says it.</b></p>
+<p align="center">
+  <a href="https://github.com/ColeCraven/saylight/releases/latest"><img src="https://img.shields.io/github/v/release/ColeCraven/saylight?style=flat-square&color=5B6CF2&label=latest" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-4836C4?style=flat-square" alt="Windows 10 and 11">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2B1F7A?style=flat-square" alt="MIT licence"></a>
+  <a href="https://github.com/ColeCraven/saylight/releases"><img src="https://img.shields.io/github/downloads/ColeCraven/saylight/total?style=flat-square&color=6E5BD6" alt="Downloads"></a>
+</p>
 
 Highlight text anywhere on Windows, press <kbd>Ctrl</kbd> + <kbd>`</kbd>, and Saylight reads it in a natural voice
 while each word lights up as it's spoken.
@@ -14,9 +22,56 @@ the way until you need it, follows along with the voice so you never lose your p
 text copied from PDFs usually brings with it.
 
 <p align="center">
-  <img src="docs/images/reading-light.png" alt="Saylight reading a paragraph, with the current sentence and word highlighted" width="49%">
-  <img src="docs/images/reading-dark.png" alt="The same panel in dark mode" width="49%">
+  <img src="docs/images/demo.gif" alt="The panel reading a sentence aloud, with a highlight moving from word to word" width="640">
 </p>
+
+## At a glance
+
+<table>
+  <tr>
+    <td width="33%" valign="top">🔊 <b>One shortcut</b><br>Highlight text in any app, press <kbd>Ctrl</kbd> + <kbd>`</kbd>, and listen.</td>
+    <td width="33%" valign="top">📄 <b>Papers and PDFs</b><br>Open PDF, Word and text files. Citations stay on screen, dimmed, and aren't read.</td>
+    <td width="33%" valign="top">🖼️ <b>Read from screen</b><br>Drag over text in an image, a video or a scanned page.</td>
+  </tr>
+  <tr>
+    <td valign="top">✍️ <b>Type or paste</b><br>Drop in your own text and hear it, in the same reading view.</td>
+    <td valign="top">📏 <b>Reading ruler</b><br>Dims everything but the line you're on.</td>
+    <td valign="top">🗣️ <b>Pick a voice</b><br>Ava by default, or any of Microsoft's natural English voices.</td>
+  </tr>
+  <tr>
+    <td valign="top">🔒 <b>Private when you want it</b><br>Windows' own voices keep your text on your PC, and take over if you go offline.</td>
+    <td valign="top">🎧 <b>Save as audio</b><br>Turn a paper into an MP3 for the bus or the gym.</td>
+    <td valign="top">🌗 <b>Easy on the eyes</b><br>Cream backgrounds, roomy spacing, dark mode and high contrast.</td>
+  </tr>
+</table>
+
+## What PDF clean-up looks like
+
+Text copied out of a PDF is usually a mess. This is what Saylight does with a typical bit of it:
+
+<table>
+  <tr><th width="50%">Copied from a PDF</th><th width="50%">What Saylight reads</th></tr>
+  <tr>
+    <td valign="top"><pre>Working memory capacity pre-
+dicts reading compre-
+hension in adults with dys-
+lexia (Smith et al., 2019; Jones
+&amp; Lee, 2020a). Perfor-
+mance improved, as Fig. 3 shows.
+12</pre></td>
+    <td valign="top">Working memory capacity predicts reading comprehension in adults with dyslexia. Performance improved,
+    as Figure 3 shows.<br><br><sub>The split words are joined back up, the citation stays on screen (dimmed) but isn't read, the stray
+    page number is dropped, and "Fig." is said as "Figure".</sub></td>
+  </tr>
+</table>
+
+## What's new in 1.5
+
+- **Keeps reading when you're offline.** If the internet drops mid-reading, Saylight carries on with one of
+  Windows' own voices for the rest of that reading, and says so in the panel.
+- **Keep my text on this PC**, a new switch in **Settings → General**, uses only Windows' voices, so nothing you
+  read is ever sent online.
+- A new icon, and a softer, lit-from-above look for the panel.
 
 ## Features
 
@@ -75,12 +130,30 @@ by accent (US, UK, Australian, Canadian, Irish, Indian, New Zealand and South Af
 to hear a short sample sentence first. **Show all languages** loads the full list of voices in every language.
 A few voices don't report word timing; they're marked *sentence highlight only*, and only the sentence is
 highlighted while they read. Windows' own voices (David, Mark and Zira on most PCs, plus any you've added) are
-listed after the online ones. They work offline and your text stays on your PC, but they sound more robotic.
+listed after the online ones. They work offline and your text stays on your PC, but they sound more robotic. If
+your connection drops while it's reading, Saylight switches to a Windows voice for the rest of that reading and
+notes it in the header, and **Keep my text on this PC** in **Settings → General** uses them all the time.
 
-<p align="center">
-  <img src="docs/images/settings.png" alt="The Reading display settings page" width="49%">
-  <img src="docs/images/expanded.png" alt="The larger reading view" width="49%">
-</p>
+### A closer look
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/reading-light.png" alt="The panel reading, in light mode"><br><sub>Reading, with the sentence band and word highlight</sub></td>
+    <td width="50%"><img src="docs/images/reading-dark.png" alt="The panel reading, in dark mode"><br><sub>The same in dark mode</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pdf-citations.png" alt="A PDF open in Saylight with its citations dimmed"><br><sub>A paper, with its citations dimmed and skipped</sub></td>
+    <td><img src="docs/images/type-or-paste.png" alt="The Type or paste box with an email draft in it"><br><sub>Type or paste your own text</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/read-from-screen.png" alt="Choosing an area of the screen to read"><br><sub>Read from screen: drag over any text</sub></td>
+    <td><img src="docs/images/ruler.png" alt="The reading ruler over a page of text"><br><sub>The reading ruler</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/voices.png" alt="The Voice settings tab with voices grouped by accent"><br><sub>Voices, grouped by accent, with previews</sub></td>
+    <td><img src="docs/images/settings.png" alt="The Reading display settings tab"><br><sub>Reading display: size, font, spacing and background</sub></td>
+  </tr>
+</table>
 
 **Simple controls.**
 - Play and pause, previous and next sentence, and stop.
@@ -223,8 +296,9 @@ Saylight-Python.zip uses looser versions that suit Python 3.10 or newer.
 The default voices are Microsoft's online neural voices (the same voices as Microsoft Edge's Read Aloud), accessed
 through the open-source [edge-tts](https://github.com/rany2/edge-tts) library. That means **the text you have read
 aloud is sent to Microsoft** to be turned into speech, so avoid using them on confidential material. Windows' own
-voices, listed after the online ones, run on your PC and send nothing. A voice preview sends only its fixed sample
-sentence, never your text.
+voices, listed after the online ones, run on your PC and send nothing. Switch on **Keep my text on this PC** in
+**Settings → General** and Saylight only ever uses those. A voice preview sends only its fixed sample sentence,
+never your text.
 
 Read from screen and scanned PDFs work on your PC: the picture of the screen or page stays in memory and is
 dropped as soon as the text is found. Nothing is saved.
@@ -252,6 +326,53 @@ Saylight goes online for only these things:
 Everything Saylight saves is in `%LOCALAPPDATA%\Saylight`: your settings, a log, and the pronunciation list and
 saved places if you use them. The log records counts and error types only, never text, file names or window
 titles. Uninstalling asks whether to delete your settings.
+
+## FAQ
+
+<details>
+<summary><b>Windows says "Windows protected your PC". Is it safe?</b></summary>
+
+Saylight isn't code-signed (signing costs money every year), so Windows doesn't recognise it yet. Choose
+**More info**, then **Run anyway**. You can check your download against the `.sha256` file on the release page
+(see [Checking the download](#checking-the-download)), and the whole source is right here.
+</details>
+
+<details>
+<summary><b>Smart App Control blocked it and there's no "Run anyway".</b></summary>
+
+Smart App Control blocks unsigned apps outright. Use **Saylight-Python.zip** from the same release instead: it
+runs through Python, which Windows already trusts, and it works the same way.
+</details>
+
+<details>
+<summary><b>Does it work offline?</b></summary>
+
+Mostly. Read from screen, scanned PDFs and Windows' own voices all run on your PC. The natural online voices, Ava
+included, need the internet, and if the connection drops while it's reading, Saylight carries on with a Windows
+voice.
+</details>
+
+<details>
+<summary><b>Is my text private?</b></summary>
+
+Saylight never saves your text. With an online voice, the text being read is sent to Microsoft to be spoken; with
+**Keep my text on this PC** switched on, nothing leaves your PC at all. The [Privacy](#privacy) section has the
+details.
+</details>
+
+<details>
+<summary><b>Which files can it open?</b></summary>
+
+PDF (including scanned ones), Word (.docx), plain text and Markdown. Older .doc files aren't supported; save them
+as .docx first.
+</details>
+
+<details>
+<summary><b>How do I uninstall it?</b></summary>
+
+**Settings → Apps → Installed apps**, find Saylight and choose **Uninstall**. For the Python version, run
+*Uninstall Saylight.cmd* from the zip.
+</details>
 
 ## Development
 
@@ -285,6 +406,7 @@ saylight/
   ui/reading_ruler.py    the reading ruler
 packaging/               the PyInstaller spec, the installer script, the licence gate and the build tests
 scripts/build_release.py builds dist/Saylight-Setup.exe and its .sha256 file
+scripts/build_python_zip.py builds dist/Saylight-Python.zip
 ```
 
 Run the test suite (about 1,850 tests) from the project folder:

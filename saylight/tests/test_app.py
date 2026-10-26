@@ -742,11 +742,17 @@ ONLINE_VOICE = VoiceInfo("edge:en-US-AvaNeural", "edge", "Ava", "en-US", "Female
 LOCAL_VOICE = VoiceInfo("windows:David", "windows", "David", "en-US", "Male", True)
 
 
+class _RouterSignals(QObject):
+    backendChanged = Signal(str, str)
+
+
 class FakeRouter:
     """The engine's synth, as the App sees it."""
 
     def __init__(self, *, settings=None, parent=None, temp_root=None) -> None:
         self.settings, self.parent, self.reachable = settings, parent, []
+        self._signals = _RouterSignals()
+        self.backendChanged = self._signals.backendChanged
 
     def voices(self) -> list:
         return [ONLINE_VOICE, LOCAL_VOICE]
@@ -1065,7 +1071,7 @@ class SettingsPagesTests(AppTest):
     def test_the_pages_get_the_voices_updates_and_version(self) -> None:
         app = self.app
         self.assertEqual(app.version, saylight.__version__)
-        self.assertEqual(saylight.__version__, "1.4.0")
+        self.assertEqual(saylight.__version__, "1.5.0")
         self.assertIsInstance(app.router, FakeRouter)
         self.assertIs(app.router.settings, app.settings)
         self.assertIs(app.router.parent, app)
@@ -1114,6 +1120,18 @@ class SettingsPagesTests(AppTest):
         self.assertTrue(online())
         self.assertEqual(engine_online, [True, False, True])
         self.assertEqual(self.app.router.reachable, [True, False, True])
+
+    def test_a_reading_that_falls_back_to_a_windows_voice_says_so(self) -> None:
+        with mock.patch.object(FakeNetwork, "current", FakeNetwork()), \
+                mock.patch("PySide6.QtNetwork.QNetworkInformation", FakeNetwork):
+            self.app.start()
+        with mock.patch.object(self.app.panel, "show_note") as note:
+            self.app.router.backendChanged.emit("edge", "chosen")
+            note.assert_not_called()
+            self.app.router.backendChanged.emit("windows", "offline_fallback")
+            note.assert_called_once_with("Offline · Windows voice", "Caution")
+            self.app.router.backendChanged.emit("windows", "service_fallback")
+            self.assertEqual(note.call_args.args[0], "Voice service down · Windows voice")
 
     def test_setup_starting_quits_the_app(self) -> None:
         quits = []

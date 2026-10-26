@@ -330,7 +330,7 @@ class FallbackTests(RouterTestBase):
 
     def test_fallback_can_be_switched_off(self):
         windows = FakeBackend("windows")
-        r = self.router(windows, settings=FakeSettings(**{"voice.offline_fallback": False}))
+        r = self.router(windows, settings=FakeSettings(**{"offline.fallback": False}))
         r.set_reachable(False)
         r.synthesize(1, 0, "a", "en-US-AvaNeural", 1.0)
         self.edge.fail(kind="offline")
@@ -362,7 +362,7 @@ class FallbackTests(RouterTestBase):
 
     def test_private_only_and_the_chosen_offline_voice(self):
         windows = FakeBackend("windows")
-        settings = FakeSettings(**{"voice.private_only": True, "voice.offline_voice": "windows:Mark"})
+        settings = FakeSettings(**{"offline.private_only": True, "offline.voice": "windows:Mark"})
         r = self.router(windows, settings=settings)
         with self.assertLogs("saylight.voices.router", "INFO"):
             r.synthesize(1, 0, "a", "en-US-AvaNeural", 1.0)
@@ -371,7 +371,7 @@ class FallbackTests(RouterTestBase):
         self.assertEqual(self.changes, [("windows", "chosen")])        # the person's choice, not "no internet"
 
     def test_private_only_never_sends_the_text_online(self):
-        settings = FakeSettings(**{"voice.private_only": True})
+        settings = FakeSettings(**{"offline.private_only": True})
         for extra in ((), (FakeBackend("windows", ready=False),)):
             with self.subTest(offline=[b.kind for b in extra]):
                 self.edge = FakeBackend("edge")

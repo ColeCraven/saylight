@@ -107,6 +107,9 @@ class GeneralPage(SettingsPage):
         self._forgot_timer.setSingleShot(True)
         self._forgot_timer.timeout.connect(lambda: self.row_resume.set_detail(RESUME_DETAIL))
         self.updates_line = LinkText(t, tips, host, role="body", color_token="TextSecondary")
+        self.row_private = ToggleRow(t, tips, "Keep my text on this PC", host,
+                                     tooltip="Only use the voices built into Windows, so your text is never sent to "
+                                             "Microsoft's online voices. They sound more robotic.")
         self.row_notices = NavRow(t, tips, "Privacy and licences", host, glyph=G_OPEN,
                                   tooltip="Saylight doesn't keep your text or audio. This opens the licences of "
                                           "Saylight and the parts it's built from.")
@@ -118,18 +121,19 @@ class GeneralPage(SettingsPage):
         self.row_notices.setEnabled(hasattr(ctl, "open_notices"))
         self.row_start.toggled.connect(self._set_start)
         self.row_resume.toggled.connect(self._set_resume)
+        self.row_private.toggled.connect(lambda on: self.settings.set("offline.private_only", on))
         self.row_notices.clicked.connect(lambda: ctl.open_notices())
         self.updates_line.linkClicked.connect(self._toggle_checks)
         self.version_line.linkClicked.connect(self._check_now)
         if self.updates is not None and hasattr(self.updates, "checked"):
             self.updates.checked.connect(self._on_checked)
+        synced = ("updates.check", "resume.enabled", "offline.private_only")
         self.settings.changed.connect(
-            lambda key: self.sync() if key in ("updates.check", "resume.enabled") or key.startswith("hotkeys")
-            else None)
+            lambda key: self.sync() if key in synced or key.startswith("hotkeys") else None)
 
     def widgets(self) -> list[QWidget]:
         return [self.row_start, self.lbl_shortcut, self.val_shortcut, self.lbl_files, self.row_resume,
-                self.updates_line, self.row_notices, self.version_line, self.lbl_shortcuts,
+                self.updates_line, self.row_private, self.row_notices, self.version_line, self.lbl_shortcuts,
                 *self.shortcut_rows.values()]
 
     def layout(self, x: int, y: int, w: int, fill: int = 0) -> int:
@@ -154,6 +158,8 @@ class GeneralPage(SettingsPage):
         y += px(9)
         self.updates_line.setGeometry(x + px(OPTICAL), y + px(10), text_w, px(20))
         y += px(PITCH)
+        self.row_private.setGeometry(x + px(EDGE), y, row_w, px(40))
+        y += px(PITCH)
         self.row_notices.setGeometry(x + px(EDGE), y, row_w, px(40))
         y += px(PITCH)
         self.version_line.setGeometry(x + px(OPTICAL), y + px(10), text_w, px(20))
@@ -171,6 +177,7 @@ class GeneralPage(SettingsPage):
         start = getattr(self.ctl, "start_with_windows", None)
         self.row_start.set_checked(bool(start()) if callable(start) else False)
         self.row_resume.set_checked(bool(self.settings.get("resume.enabled")))
+        self.row_private.set_checked(bool(self.settings.get("offline.private_only")))
         self._fit_shortcut()
         hotkeys = self.settings.get("hotkeys") or {}
         failed = getattr(self.ctl, "shortcut_failed", lambda _key: False)

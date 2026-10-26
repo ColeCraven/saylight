@@ -19,7 +19,7 @@ import time
 from ctypes import wintypes
 
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QFontMetricsF, QGuiApplication, QPainter, QPen
+from PySide6.QtGui import QFontMetricsF, QGuiApplication, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 from .. import win32
@@ -1804,6 +1804,14 @@ class Panel(QWidget):
         t = self.theme
         p = QPainter(self)
         p.fillRect(self.rect(), t.color("Surface"))
+        sheen = t.color("SurfaceSheen")
+        if sheen.alpha():  # light from above: a wash fading out over the header, and a hairline on the top edge
+            w, depth = float(self.width()), float(t.px(56))
+            wash = QLinearGradient(0, 0, 0, depth)
+            wash.setColorAt(0, sheen)
+            wash.setColorAt(1, with_alpha(sheen, 0.0))
+            p.fillRect(QRectF(0, 0, w, depth), wash)
+            p.fillRect(QRectF(0, 0, w, max(1.0, t.k)), t.color("SurfaceEdge"))
 
 
 class _FlyoutPresses(QObject):

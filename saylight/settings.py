@@ -18,7 +18,7 @@ from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 
-from .voices.base import BACKENDS, DEFAULT_VOICE_ID, make_voice_id, parse_voice_id
+from .voices.base import BACKENDS, DEFAULT_VOICE_ID, WINDOWS, make_voice_id, parse_voice_id
 
 log = logging.getLogger("saylight.settings")
 
@@ -108,6 +108,16 @@ def _voice(value: Any) -> str:
     return make_voice_id(backend, name)
 
 
+def _offline_voice(value: Any) -> str:
+    """"" (automatic: the first voice Windows lists) or a Windows voice ID."""
+    if isinstance(value, str) and not value.strip():
+        return ""
+    voice = _voice(value)
+    if parse_voice_id(voice)[0] != WINDOWS:
+        raise ValueError("expected a Windows voice ID")
+    return voice
+
+
 def _timestamp(value: Any) -> float:
     """Seconds since 1970; 0.0 for never."""
     return max(0.0, _number(value))
@@ -174,6 +184,9 @@ SCHEMA: dict[str, tuple[Any, Callable[[Any], Any]]] = {
     "speed": (0.95, _speed),
     "volume": (100, _int_range(0, 100)),
     "voice": (DEFAULT_VOICE, _voice),
+    "offline.fallback": (True, _bool),        # no internet: carry on with a Windows voice for that reading
+    "offline.private_only": (False, _bool),   # only voices on this PC, so the text never leaves it
+    "offline.voice": ("", _offline_voice),
     "panel.visible": (True, _bool),
     "panel.position": (None, _position),
     "panel.expanded": (False, _bool),

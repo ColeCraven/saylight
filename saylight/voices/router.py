@@ -196,17 +196,17 @@ class SynthRouter(QObject):
 
     def _offline_voice(self, kind: str) -> str:
         """The voice an offline backend reads with when it stands in for the online voice."""
-        chosen = self._setting("voice.offline_voice", "")
+        chosen = self._setting("offline.voice", "")
         if chosen and parse_voice_id(chosen)[0] == kind:
             return chosen
         voices = self._backends[kind].voices()
         return voices[0].id if voices else make_voice_id(kind, "")
 
     def _auto(self) -> bool:
-        return bool(self._setting("voice.offline_fallback", True))
+        return bool(self._setting("offline.fallback", True))
 
     def _private_only(self) -> bool:
-        return bool(self._setting("voice.private_only", False))
+        return bool(self._setting("offline.private_only", False))
 
     def _setting(self, key: str, default: Any) -> Any:
         if self._settings is None:

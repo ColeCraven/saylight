@@ -42,6 +42,8 @@ NOTICES_NAME = "THIRD_PARTY_NOTICES.txt"   # written next to Saylight.exe by the
 QUIT_WAIT_S = 1.5                           # time a copy asked to quit gets to save its settings and exit
 UNDO_MS = 10_000                            # how long Undo is offered after a Clear
 AWAY_SETTLE_MS = 50                         # how long light dismiss lets the foreground settle (as the box does)
+FALLBACK_NOTES = {"offline_fallback": "Offline · Windows voice",          # the header note when a reading
+                  "service_fallback": "Voice service down · Windows voice"}  # carries on with a Windows voice
 
 # The same app under its earlier name. --install replaces that install, --uninstall and --quit reach it too,
 # and paths.migrate_legacy_data() carries its settings file over.
@@ -145,37 +147,66 @@ def start() -> None:
     print("Saylight is running. Highlight text and press Ctrl+` to hear it.")
 
 
+ICON_BARS = ((58, 72), (102, 132), (146, 104), (190, 52))  # (centre x, height) at 256 px; the tray's shape
+
+
+def paint_icon(size: int = 256):
+    """The app icon as a QImage: white voice bars on an indigo tile, lit from behind by a soft warm glow."""
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import (QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
+                               QRadialGradient)
+
+    img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(size / 256, size / 256)
+    tile = QPainterPath()
+    tile.addRoundedRect(QRectF(8, 8, 240, 240), 60, 60)
+    body = QLinearGradient(QPointF(32, 8), QPointF(224, 248))
+    body.setColorAt(0, QColor("#5B6CF2"))
+    body.setColorAt(0.55, QColor("#4836C4"))
+    body.setColorAt(1, QColor("#2B1F7A"))
+    p.fillPath(tile, body)
+    p.setClipPath(tile)
+    glow = QRadialGradient(QPointF(118, 112), 128)  # the light behind the tallest bar
+    glow.setColorAt(0, QColor(255, 212, 140, 200))
+    glow.setColorAt(0.4, QColor(255, 168, 118, 92))
+    glow.setColorAt(1, QColor(255, 170, 120, 0))
+    p.fillRect(QRectF(0, 0, 256, 256), glow)
+    sheen = QLinearGradient(QPointF(0, 8), QPointF(0, 120))
+    sheen.setColorAt(0, QColor(255, 255, 255, 46))
+    sheen.setColorAt(1, QColor(255, 255, 255, 0))
+    p.fillRect(QRectF(0, 0, 256, 128), sheen)
+    p.setClipping(False)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(24, 12, 72, 70))  # a soft shadow lifts the bars off the tile
+    for x, h in ICON_BARS:
+        p.drawRoundedRect(QRectF(x - 13, (256 - h) / 2 + 5, 26, h), 13, 13)
+    p.setBrush(QColor("#FFFFFF"))
+    for x, h in ICON_BARS:
+        p.drawRoundedRect(QRectF(x - 13, (256 - h) / 2, 26, h), 13, 13)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor(255, 255, 255, 40), 2))
+    p.drawRoundedRect(QRectF(9, 9, 238, 238), 59, 59)
+    p.end()
+    return img.convertToFormat(QImage.Format.Format_ARGB32)
+
+
 def make_icon(path: str) -> bool:
-    """Render the app icon (white voice bars on a deep-blue rounded square) to an .ico file."""
+    """Render the app icon (see paint_icon) to an .ico file."""
     try:
-        from PySide6.QtCore import QRectF, Qt
-        from PySide6.QtGui import QColor, QGuiApplication, QImage, QLinearGradient, QPainter
+        from PySide6.QtGui import QGuiApplication
 
         _app = QGuiApplication.instance() or QGuiApplication(["icon"])
-        size = 256
-        img = QImage(size, size, QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        g = QLinearGradient(0, 0, 0, size)
-        g.setColorAt(0, QColor("#3A66B0"))
-        g.setColorAt(1, QColor("#24467F"))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(g)
-        p.drawRoundedRect(QRectF(8, 8, size - 16, size - 16), 56, 56)
-        p.setBrush(QColor("#FFFFFF"))
-        for x, h in zip((58, 102, 146, 190), (72, 132, 104, 52)):
-            p.drawRoundedRect(QRectF(x - 13, (size - h) / 2, 26, h), 13, 13)
-        p.end()
-        return img.save(path, "ICO")
+        return paint_icon().save(path, "ICO")
     except Exception:
         return False
 
 
 def create_shortcut() -> None:
     """A Start menu entry for a source install, so Saylight can be started again after quitting it."""
-    if not os.path.exists(ICON_PATH):
-        make_icon(ICON_PATH)
+    make_icon(ICON_PATH)  # every install redraws it, so an update brings the current icon
     pythonw, script = paths.launch_command()
     script_ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RA_LNK); "
                  "$s.TargetPath = $env:RA_EXE; $s.Arguments = '\"' + $env:RA_SCRIPT + '\"'; "
@@ -624,6 +655,7 @@ def _build_app_class():
             self.ocr.start()  # so the OCR languages are known by the time the shortcut is pressed
             self.input.start()
             self.foreground.start()
+            self.router.backendChanged.connect(self._on_backend_changed)
             self._start_network_monitor()
             self.updates.start()
             self.server.listen()
@@ -633,6 +665,11 @@ def _build_app_class():
                 self.panel.show_animated()
                 self._fullscreen_timer.start()
             self._refresh_continue()
+
+        def _on_backend_changed(self, _kind: str, reason: str) -> None:
+            """The online voice couldn't be reached, so this reading carries on with a Windows voice."""
+            if reason in FALLBACK_NOTES:
+                self.panel.show_note(FALLBACK_NOTES[reason], "Caution")
 
         def _start_network_monitor(self) -> None:
             try:

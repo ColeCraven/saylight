@@ -40,22 +40,4 @@ def make_router(*, temp_root: str | None = None, settings: Any = None, parent: Q
     from ..audio_cache import AudioCache
     from .router import SynthRouter
     backends = {kind: backend for kind in BACKENDS if (backend := make_backend(kind)) is not None}
-    return SynthRouter(backends, AudioCache(temp_root), settings=_ChosenVoicesOnly(settings), parent=parent)
-
-
-class _ChosenVoicesOnly:
-    """The settings as the router reads them. A Windows voice speaks only when the person chooses one: until
-    the settings have a "voice.offline_fallback" switch, the online voice never falls back to it by itself."""
-
-    def __init__(self, settings: Any):
-        self._settings = settings
-
-    def get(self, key: str) -> Any:
-        try:
-            if self._settings is None:
-                raise KeyError(key)
-            return self._settings.get(key)
-        except KeyError:
-            if key == "voice.offline_fallback":
-                return False
-            raise
+    return SynthRouter(backends, AudioCache(temp_root), settings=settings, parent=parent)

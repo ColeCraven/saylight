@@ -238,6 +238,14 @@ class GeneralPageTests(ServicesCase):
         self.assertIn(("set_start_with_windows", True), self.ctl.calls)
         self.assertTrue(self.page.row_start.checked)
 
+    def test_keep_my_text_on_this_pc(self) -> None:
+        self.assertFalse(self.page.row_private.checked)
+        self.page.row_private.clicked.emit()
+        self.assertTrue(self.settings.get("offline.private_only"))
+        self.assertTrue(self.page.row_private.checked)
+        self.settings.set("offline.private_only", False)
+        self.assertFalse(self.page.row_private.checked)
+
     def test_shortcut_row(self) -> None:
         parts = self.page.val_shortcut.parts
         self.assertEqual(parts[:2], [("key", "Ctrl"), ("key", "`")])
